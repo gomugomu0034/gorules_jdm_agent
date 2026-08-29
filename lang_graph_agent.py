@@ -35,8 +35,8 @@ from tools.zen_evaluator import check_jdm_format, evaluate_against_zen
 # ==========================================
 load_dotenv()
 
-# Select the active provider: "gemini", "litellm", or "huggingface"
-ACTIVE_PROVIDER = os.getenv("LLM_PROVIDER", "litellm").lower()
+# Select the active provider: "gemini" or "litellm" or "huggingface"
+ACTIVE_PROVIDER = os.getenv("LLM_PROVIDER", "huggingface").lower()
 
 # Gemini Config
 GOOGLE_API_KEY = os.getenv("GOOGLE_AI_API_KEY")
