@@ -3,6 +3,7 @@ import re
 import os
 from typing import TypedDict, Annotated
 from dotenv import load_dotenv
+import requests
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -35,7 +36,7 @@ from tools.zen_evaluator import check_jdm_format, evaluate_against_zen
 # ==========================================
 load_dotenv()
 
-# Select the active provider: "gemini" or "litellm" or "huggingface"
+# Select the active provider: "gemini", "litellm", "huggingface", or "openrouter"
 ACTIVE_PROVIDER = os.getenv("LLM_PROVIDER", "huggingface").lower()
 
 # Gemini Config
@@ -52,7 +53,24 @@ LITELLM_MODEL_NAME = os.getenv("LITELLM_MODEL_NAME")
 HUGGINGFACE_API_KEY = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_KEY")
 HUGGINGFACE_MODEL_NAME = os.getenv("HF_MODEL_NAME") or os.getenv("HUGGINGFACE_MODEL_NAME")
 HUGGINGFACE_INFERENCE_PROVIDER = os.getenv("HF_INFERENCE_PROVIDER", "together")
-HUGGINGFACE_BASE_URL = os.getenv("HUGGINGFACE_BASE_URL", "https://router.huggingface.co/v1")
+HUGGINGFACE_BASE_URL = (
+    os.getenv("HF_BASE_URL")
+    or os.getenv("HUGGINGFACE_BASE_URL")
+    or "https://router.huggingface.co/v1"
+)
+
+# OpenRouter config
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL_NAME = os.getenv("OPENROUTER_MODEL_NAME") or os.getenv("OPENROUTER_MODEL")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_REASONING_ENABLED = os.getenv("OPENROUTER_REASONING_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME")
 
 # Initialize Clients Conditionally (so it doesn't crash if one key is missing)
 gemini_client = None
@@ -68,6 +86,8 @@ elif ACTIVE_PROVIDER == "huggingface":
         base_url=HUGGINGFACE_BASE_URL,
         api_key=HUGGINGFACE_API_KEY,
     )
+elif ACTIVE_PROVIDER == "openrouter":
+    pass
 else:
     raise ValueError(f"Unsupported LLM_PROVIDER: {ACTIVE_PROVIDER}")
 
@@ -75,6 +95,41 @@ else:
 # ==========================================
 # 2. UNIFIED LLM WRAPPER
 # ==========================================
+
+
+class LLMResponse(str):
+    """String-like LLM output that can carry provider metadata alongside content."""
+
+    def __new__(cls, content: str, reasoning_details=None):
+        obj = str.__new__(cls, content)
+        obj.reasoning_details = reasoning_details
+        return obj
+
+
+def _assistant_message_from_llm(response: str, content: str | None = None) -> AIMessage:
+    reasoning_details = getattr(response, "reasoning_details", None)
+    message_content = str(response) if content is None else content
+    if reasoning_details is not None:
+        return AIMessage(
+            content=message_content,
+            additional_kwargs={"reasoning_details": reasoning_details},
+        )
+    return AIMessage(content=message_content)
+
+
+def _format_chat_messages(sys_prompt: str, messages: list, include_reasoning_details: bool = False) -> list:
+    formatted = [{"role": "system", "content": sys_prompt}]
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            formatted.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            assistant_message = {"role": "assistant", "content": msg.content}
+            if include_reasoning_details:
+                reasoning_details = getattr(msg, "additional_kwargs", {}).get("reasoning_details")
+                if reasoning_details is not None:
+                    assistant_message["reasoning_details"] = reasoning_details
+            formatted.append(assistant_message)
+    return formatted
 
 def _call_gemini(sys_prompt: str, messages: list) -> str:
     gemini_messages = []
@@ -92,13 +147,7 @@ def _call_gemini(sys_prompt: str, messages: list) -> str:
 
 
 def _call_litellm(sys_prompt: str, messages: list) -> str:
-    formatted = [{"role": "system", "content": sys_prompt}]
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
-            formatted.append({"role": "user", "content": msg.content})
-        elif isinstance(msg, AIMessage):
-            formatted.append({"role": "assistant", "content": msg.content})
-
+    formatted = _format_chat_messages(sys_prompt, messages)
     response = litellm_client.chat.completions.create(
         model=LITELLM_MODEL_NAME, messages=formatted,
         # temperature=0.0
@@ -114,12 +163,7 @@ def _call_huggingface(sys_prompt: str, messages: list) -> str:
             "LLM_PROVIDER=huggingface."
         )
 
-    formatted = [{"role": "system", "content": sys_prompt}]
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
-            formatted.append({"role": "user", "content": msg.content})
-        elif isinstance(msg, AIMessage):
-            formatted.append({"role": "assistant", "content": msg.content})
+    formatted = _format_chat_messages(sys_prompt, messages)
 
     # Hugging Face selects a specific inference provider with the ':provider'
     # suffix. Preserve it if the configured model already includes one.
@@ -134,6 +178,49 @@ def _call_huggingface(sys_prompt: str, messages: list) -> str:
     return response.choices[0].message.content
 
 
+def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
+    """Call OpenRouter using its chat completions API."""
+    if not OPENROUTER_API_KEY:
+        raise ValueError("OPENROUTER_API_KEY must be set when LLM_PROVIDER=openrouter.")
+    if not OPENROUTER_MODEL_NAME:
+        raise ValueError(
+            "OPENROUTER_MODEL_NAME (or OPENROUTER_MODEL) must be set when "
+            "LLM_PROVIDER=openrouter."
+        )
+
+    formatted = _format_chat_messages(sys_prompt, messages, include_reasoning_details=True)
+    payload = {
+        "model": OPENROUTER_MODEL_NAME,
+        "messages": formatted,
+    }
+    if OPENROUTER_REASONING_ENABLED:
+        payload["reasoning"] = {"enabled": True}
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+    if OPENROUTER_APP_NAME:
+        headers["X-Title"] = OPENROUTER_APP_NAME
+
+    response = requests.post(
+        url=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    response_json = response.json()
+    message = response_json["choices"][0]["message"]
+    return LLMResponse(
+        message.get("content", ""),
+        reasoning_details=message.get("reasoning_details"),
+    )
+
+
 def call_llm(sys_prompt: str, messages: list) -> str:
     """Routes the request to the active LLM provider and returns the string response."""
     if ACTIVE_PROVIDER == "gemini":
@@ -142,6 +229,9 @@ def call_llm(sys_prompt: str, messages: list) -> str:
         return _call_litellm(sys_prompt, messages)
     elif ACTIVE_PROVIDER == "huggingface":
         return _call_huggingface(sys_prompt, messages)
+    elif ACTIVE_PROVIDER == "openrouter":
+        return _call_openrouter(sys_prompt, messages)
+    raise ValueError(f"Unsupported LLM_PROVIDER: {ACTIVE_PROVIDER}")
 
 
 # ==========================================
@@ -251,13 +341,13 @@ def welcome_node(state: AgentState):
                 "mode": "EXISTING",
                 "selected_file": response_text,
                 "existing_jdm_json": file_content,
-                "messages": [AIMessage(content=f"You selected to work on `{response_text}`.")]
+                "messages": [_assistant_message_from_llm(f"You selected to work on `{response_text}`.")]
             }
         except Exception as e:
             return {
                 "mode": "NEW",
-                "messages": [AIMessage(
-                    content=f"❌ Error loading file: {str(e)}\n\nLet's create a new policy instead. What are your requirements?")]
+                "messages": [_assistant_message_from_llm(
+                    f"❌ Error loading file: {str(e)}\n\nLet's create a new policy instead. What are your requirements?")]
             }
     else:
         # Fallback: if they ignored the chips and typed a custom prompt directly
@@ -303,7 +393,7 @@ def explain_node(state: AgentState):
     # Save the explanation to the chat history so the user can read it
     # right before the action chips appear.
     return {
-        "messages": [AIMessage(content=ui_message)]
+        "messages": [_assistant_message_from_llm(ui_message)]
     }
 
 
@@ -329,7 +419,8 @@ def action_selection_node(state: AgentState):
 
     return {
         "action_type": action_type,
-        "messages": [AIMessage(content=f"You chose to {response_text.replace('✏️ ','').replace('🧪 ', '')}.")]
+        "messages": [_assistant_message_from_llm(
+            f"You chose to {response_text.replace('✏️ ','').replace('🧪 ', '')}.")]
     }
 
 
@@ -347,7 +438,7 @@ def input_new_policy_node(state: AgentState):
 
     return {
         "messages": [
-            AIMessage(content="✨ **What kind of policy would you like to create?**"),
+            _assistant_message_from_llm("✨ **What kind of policy would you like to create?**"),
             HumanMessage(content=response_text)
         ]
     }
@@ -366,7 +457,7 @@ def modify_input_node(state: AgentState):
 
     return {
         "messages": [
-            AIMessage(content="📝 **What specific changes would you like to make to this policy?**"),
+            _assistant_message_from_llm("📝 **What specific changes would you like to make to this policy?**"),
             HumanMessage(content=response_text)
         ]
     }
@@ -400,7 +491,7 @@ def modify_triage_node(state: AgentState):
             "triage_message": triage_msg,
             "triage_options": options,
             # Save the AI's triage question to the chat history
-            "messages": [AIMessage(content=triage_msg)]
+            "messages": [_assistant_message_from_llm(response_text, triage_msg)]
         }
     except json.JSONDecodeError:
         error_msg = "Could you clarify how these changes should be applied?"
@@ -408,7 +499,7 @@ def modify_triage_node(state: AgentState):
             "triage_status": "NEEDS_INFO",
             "triage_message": error_msg,
             "triage_options": ["Custom clarification"],
-            "messages": [AIMessage(content=error_msg)]
+            "messages": [_assistant_message_from_llm(error_msg)]
         }
 
 
@@ -476,7 +567,7 @@ def test_node(state: AgentState):
     """
 
     return {
-        "messages": [AIMessage(content=ui_message)]
+        "messages": [_assistant_message_from_llm(ui_message)]
     }
 
 
@@ -506,7 +597,7 @@ def triage_node(state: AgentState):
             "triage_message": triage_msg,
             "triage_options": options,
             # CRITICAL FIX: Save the AI's question to the permanent chat history!
-            "messages": [AIMessage(content=triage_msg)]
+            "messages": [_assistant_message_from_llm(response_text, triage_msg)]
         }
     except json.JSONDecodeError:
         error_msg = "Could you clarify the logic rules?"
@@ -515,7 +606,7 @@ def triage_node(state: AgentState):
             "triage_message": error_msg,
             "triage_options": ["Custom clarification"],
             # CRITICAL FIX: Save the AI's error to the permanent chat history!
-            "messages": [AIMessage(content=error_msg)]
+            "messages": [_assistant_message_from_llm(error_msg)]
         }
 
 
@@ -620,8 +711,8 @@ def builder_node(state: AgentState):
             print(f"  --> [Attempt {attempt}]: Calling LLM to fix errors...")
 
             content = call_llm(PROMPT_BUILDER, context)
-            new_messages.append(AIMessage(content=content))
-            context.append(AIMessage(content=content))
+            new_messages.append(_assistant_message_from_llm(content))
+            context.append(_assistant_message_from_llm(content))
 
             # 1. Extract using the robust markers
             dsl_content = _extract_bounded_text(content, "---DSL STARTS---", "---DSL ENDS---", strip_lang="markdown")
@@ -730,7 +821,7 @@ def output_node(state: AgentState):
         
         </details>
         """
-    return {"messages": [AIMessage(content=final_output)]}
+    return {"messages": [_assistant_message_from_llm(final_output)]}
 
 
 # Step 5: Human Final Approval
@@ -812,7 +903,7 @@ def save_files_node(state: AgentState):
         final_message = f"❌ Error saving files: {str(e)}"
 
     print(final_message)
-    return {"messages": [AIMessage(content=final_message)]}
+    return {"messages": [_assistant_message_from_llm(final_message)]}
 
 
 # ==========================================
