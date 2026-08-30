@@ -3,3 +3,6 @@
 .env.*
 !.env.example
 
+
+# ignore venv related files
+.venv/*
