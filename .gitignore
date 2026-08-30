@@ -1,0 +1,8 @@
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+
+
+# ignore venv related files
+.venv/*

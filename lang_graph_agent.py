@@ -35,8 +35,8 @@ from tools.zen_evaluator import check_jdm_format, evaluate_against_zen
 # ==========================================
 load_dotenv()
 
-# Select the active provider: "gemini" or "litellm"
-ACTIVE_PROVIDER = os.getenv("LLM_PROVIDER", "litellm").lower()
+# Select the active provider: "gemini" or "litellm" or "huggingface"
+ACTIVE_PROVIDER = os.getenv("LLM_PROVIDER", "huggingface").lower()
 
 # Gemini Config
 GOOGLE_API_KEY = os.getenv("GOOGLE_AI_API_KEY")
@@ -47,14 +47,27 @@ LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL")
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY")
 LITELLM_MODEL_NAME = os.getenv("LITELLM_MODEL_NAME")
 
+# Hugging Face Inference Providers config. Together is used through Hugging Face
+# Routing, so this must be a Hugging Face token (not a Together API key).
+HUGGINGFACE_API_KEY = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_KEY")
+HUGGINGFACE_MODEL_NAME = os.getenv("HF_MODEL_NAME") or os.getenv("HUGGINGFACE_MODEL_NAME")
+HUGGINGFACE_INFERENCE_PROVIDER = os.getenv("HF_INFERENCE_PROVIDER", "together")
+HUGGINGFACE_BASE_URL = os.getenv("HUGGINGFACE_BASE_URL", "https://router.huggingface.co/v1")
+
 # Initialize Clients Conditionally (so it doesn't crash if one key is missing)
 gemini_client = None
 litellm_client = None
+huggingface_client = None
 
 if ACTIVE_PROVIDER == "gemini":
     gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
 elif ACTIVE_PROVIDER == "litellm":
     litellm_client = openai.OpenAI(base_url=LITELLM_BASE_URL, api_key=LITELLM_API_KEY)
+elif ACTIVE_PROVIDER == "huggingface":
+    huggingface_client = openai.OpenAI(
+        base_url=HUGGINGFACE_BASE_URL,
+        api_key=HUGGINGFACE_API_KEY,
+    )
 else:
     raise ValueError(f"Unsupported LLM_PROVIDER: {ACTIVE_PROVIDER}")
 
@@ -93,12 +106,42 @@ def _call_litellm(sys_prompt: str, messages: list) -> str:
     return response.choices[0].message.content
 
 
+def _call_huggingface(sys_prompt: str, messages: list) -> str:
+    """Call Hugging Face Inference Providers through its OpenAI-compatible router."""
+    if not HUGGINGFACE_MODEL_NAME:
+        raise ValueError(
+            "HF_MODEL_NAME (or HUGGINGFACE_MODEL_NAME) must be set when "
+            "LLM_PROVIDER=huggingface."
+        )
+
+    formatted = [{"role": "system", "content": sys_prompt}]
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            formatted.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            formatted.append({"role": "assistant", "content": msg.content})
+
+    # Hugging Face selects a specific inference provider with the ':provider'
+    # suffix. Preserve it if the configured model already includes one.
+    model = HUGGINGFACE_MODEL_NAME
+    if ":" not in model:
+        model = f"{model}:{HUGGINGFACE_INFERENCE_PROVIDER}"
+
+    response = huggingface_client.chat.completions.create(
+        model=model,
+        messages=formatted,
+    )
+    return response.choices[0].message.content
+
+
 def call_llm(sys_prompt: str, messages: list) -> str:
     """Routes the request to the active LLM provider and returns the string response."""
     if ACTIVE_PROVIDER == "gemini":
         return _call_gemini(sys_prompt, messages)
     elif ACTIVE_PROVIDER == "litellm":
         return _call_litellm(sys_prompt, messages)
+    elif ACTIVE_PROVIDER == "huggingface":
+        return _call_huggingface(sys_prompt, messages)
 
 
 # ==========================================
