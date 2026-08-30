@@ -4,7 +4,7 @@ from langgraph.types import Command
 import uuid
 
 # Import your compiled graph from agent.py
-from lang_graph_agent import graph
+from backend.lang_graph_agent import graph
 
 st.set_page_config(page_title="Zen Engine Agent", page_icon="⚙️", layout="wide")
 st.title("⚙️ GoRules Zen AI")

@@ -1,0 +1,137 @@
+{
+  "contentType": "application/vnd.gorules.decision",
+  "nodes": [
+    {
+      "id": "ac386687-c3e1-490b-9866-6a1cbea94f7e",
+      "name": "Application",
+      "type": "inputNode",
+      "content": {
+        "schema": ""
+      },
+      "position": {
+        "x": 100,
+        "y": 200
+      }
+    },
+    {
+      "id": "f6b28dc1-b041-4c30-8a2c-1acbac2ad06a",
+      "name": "LoanDecision",
+      "type": "decisionTableNode",
+      "content": {
+        "hitPolicy": "first",
+        "passThrough": true,
+        "inputs": [
+          {
+            "id": "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a",
+            "name": "creditScore",
+            "field": "creditScore"
+          },
+          {
+            "id": "8dd6606d-e09c-4234-bc61-4d4d52cd50fa",
+            "name": "dti",
+            "field": "dti"
+          },
+          {
+            "id": "bebbcaee-eb8f-4210-9d9d-5cabc372adf2",
+            "name": "ltv",
+            "field": "ltv"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18",
+            "name": "decision",
+            "field": "decision"
+          },
+          {
+            "id": "8989971c-e233-423d-91f0-0dd7dc76766f",
+            "name": "riskTier",
+            "field": "riskTier"
+          },
+          {
+            "id": "679e2bfa-1ddd-4493-9aca-13d687e40e49",
+            "name": "interestRate",
+            "field": "interestRate"
+          }
+        ],
+        "rules": [
+          {
+            "_id": "870e87cc-a22c-4508-bcba-e78da222a311",
+            "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": "< 580",
+            "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "",
+            "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Denied",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "Subprime",
+            "679e2bfa-1ddd-4493-9aca-13d687e40e49": ""
+          },
+          {
+            "_id": "58027b4b-7f7f-4dda-a183-19a1615eb8fd",
+            "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": "",
+            "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "> 50",
+            "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Denied",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "Subprime",
+            "679e2bfa-1ddd-4493-9aca-13d687e40e49": ""
+          },
+          {
+            "_id": "34ec4deb-4e0a-410c-b7d3-43aadb7da7a2",
+            "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": "",
+            "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "",
+            "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "> 95",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Denied",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "Subprime",
+            "679e2bfa-1ddd-4493-9aca-13d687e40e49": ""
+          },
+          {
+            "_id": "73acbb9d-720f-40b1-975c-60531eb1d2bc",
+            "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": ">= 720",
+            "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "<= 35",
+            "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "<= 80",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Approved",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "Prime",
+            "679e2bfa-1ddd-4493-9aca-13d687e40e49": "0.065"
+          },
+          {
+            "_id": "31982759-4de2-4b5b-926f-24dd0918faa6",
+            "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": "",
+            "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "",
+            "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Manual Review",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "Near-Prime",
+            "679e2bfa-1ddd-4493-9aca-13d687e40e49": ""
+          }
+        ]
+      },
+      "position": {
+        "x": 400,
+        "y": 200
+      }
+    },
+    {
+      "id": "203d3e2c-d42e-427d-84ae-32bd348e3454",
+      "name": "Output",
+      "type": "outputNode",
+      "content": {
+        "schema": ""
+      },
+      "position": {
+        "x": 700,
+        "y": 200
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "da61a494-0d5b-47d7-b2e3-3901e62b9373",
+      "sourceId": "ac386687-c3e1-490b-9866-6a1cbea94f7e",
+      "targetId": "f6b28dc1-b041-4c30-8a2c-1acbac2ad06a",
+      "type": "edge"
+    },
+    {
+      "id": "74de1640-edea-416a-ae3b-742a6b526350",
+      "sourceId": "f6b28dc1-b041-4c30-8a2c-1acbac2ad06a",
+      "targetId": "203d3e2c-d42e-427d-84ae-32bd348e3454",
+      "type": "edge"
+    }
+  ]
+}

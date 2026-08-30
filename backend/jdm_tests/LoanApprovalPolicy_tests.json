@@ -1,0 +1,169 @@
+[
+  {
+    "name": "Denied - Credit score below 580",
+    "input": {
+      "creditScore": 570,
+      "dti": 30,
+      "ltv": 70
+    },
+    "expectedOutput": {
+      "creditScore": 570,
+      "dti": 30,
+      "ltv": 70,
+      "decision": "Denied",
+      "riskTier": "Subprime"
+    }
+  },
+  {
+    "name": "Approved - Prime borrower",
+    "input": {
+      "creditScore": 750,
+      "dti": 30,
+      "ltv": 70
+    },
+    "expectedOutput": {
+      "creditScore": 750,
+      "dti": 30,
+      "ltv": 70,
+      "decision": "Approved",
+      "riskTier": "Prime",
+      "interestRate": 0.065
+    }
+  },
+  {
+    "name": "Manual Review - Mid-tier application",
+    "input": {
+      "creditScore": 680,
+      "dti": 40,
+      "ltv": 85
+    },
+    "expectedOutput": {
+      "creditScore": 680,
+      "dti": 40,
+      "ltv": 85,
+      "decision": "Manual Review",
+      "riskTier": "Near-Prime"
+    }
+  },
+  {
+    "name": "Denied - DTI above 50%",
+    "input": {
+      "creditScore": 720,
+      "dti": 55,
+      "ltv": 70
+    },
+    "expectedOutput": {
+      "creditScore": 720,
+      "dti": 55,
+      "ltv": 70,
+      "decision": "Denied",
+      "riskTier": "Subprime"
+    }
+  },
+  {
+    "name": "Denied - LTV above 95%",
+    "input": {
+      "creditScore": 720,
+      "dti": 30,
+      "ltv": 98
+    },
+    "expectedOutput": {
+      "creditScore": 720,
+      "dti": 30,
+      "ltv": 98,
+      "decision": "Denied",
+      "riskTier": "Subprime"
+    }
+  },
+  {
+    "name": "Approved - Boundary conditions exactly met",
+    "input": {
+      "creditScore": 720,
+      "dti": 35,
+      "ltv": 80
+    },
+    "expectedOutput": {
+      "creditScore": 720,
+      "dti": 35,
+      "ltv": 80,
+      "decision": "Approved",
+      "riskTier": "Prime",
+      "interestRate": 0.065
+    }
+  },
+  {
+    "name": "Manual Review - DTI exactly at reject boundary",
+    "input": {
+      "creditScore": 680,
+      "dti": 50,
+      "ltv": 70
+    },
+    "expectedOutput": {
+      "creditScore": 680,
+      "dti": 50,
+      "ltv": 70,
+      "decision": "Manual Review",
+      "riskTier": "Near-Prime"
+    }
+  },
+  {
+    "name": "Manual Review - Credit score exactly at reject boundary",
+    "input": {
+      "creditScore": 580,
+      "dti": 30,
+      "ltv": 70
+    },
+    "expectedOutput": {
+      "creditScore": 580,
+      "dti": 30,
+      "ltv": 70,
+      "decision": "Manual Review",
+      "riskTier": "Near-Prime"
+    }
+  },
+  {
+    "name": "Manual Review - LTV exactly at reject boundary",
+    "input": {
+      "creditScore": 680,
+      "dti": 30,
+      "ltv": 95
+    },
+    "expectedOutput": {
+      "creditScore": 680,
+      "dti": 30,
+      "ltv": 95,
+      "decision": "Manual Review",
+      "riskTier": "Near-Prime"
+    }
+  },
+  {
+    "name": "Manual Review - Credit score just below approval threshold",
+    "input": {
+      "creditScore": 719,
+      "dti": 35,
+      "ltv": 80
+    },
+    "expectedOutput": {
+      "creditScore": 719,
+      "dti": 35,
+      "ltv": 80,
+      "decision": "Manual Review",
+      "riskTier": "Near-Prime"
+    }
+  },
+  {
+    "name": "Denied - Multiple reject conditions present",
+    "input": {
+      "creditScore": 500,
+      "dti": 60,
+      "ltv": 99
+    },
+    "expectedOutput": {
+      "creditScore": 500,
+      "dti": 60,
+      "ltv": 99,
+      "decision": "Denied",
+      "riskTier": "Subprime"
+    }
+  }
+]

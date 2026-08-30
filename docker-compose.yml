@@ -1,0 +1,38 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gorules_backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mounts your local backend folder to the container for live-reloading
+      - ./backend:/app
+    env_file:
+      # Automatically loads your HuggingFace/OpenAI tokens from a .env file
+      - ./backend/.env
+    # Uvicorn's --reload flag watches for Python file changes
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: gorules_frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mounts your local frontend folder to the container
+      - ./frontend:/app
+      # CRITICAL FOR MAC: Creates an isolated anonymous volume for node_modules.
+      # This prevents your Mac's local node_modules from overwriting the
+      # Linux-compiled node_modules inside the container.
+      - /app/node_modules
+    environment:
+      # Tells Next.js where to send requests
+      - BACKEND_URL=http://backend:8000
+    # Runs the Next.js development server with hot-reloading
+    command: npm run dev
+    depends_on:
+      - backend

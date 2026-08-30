@@ -1,0 +1,488 @@
+[
+  {
+    "name": "Rule 1 - Gift card (non-refundable)",
+    "input": {
+      "productType": "giftCard",
+      "condition": "new",
+      "daysSincePurchase": 5,
+      "discountPercentage": 0,
+      "amount": 50,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "giftCard",
+      "condition": "new",
+      "daysSincePurchase": 5,
+      "discountPercentage": 0,
+      "amount": 50,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "rejected",
+      "refundPercentage": 0,
+      "reason": "Non-refundable item type",
+      "refundMethod": "N/A",
+      "processingTime": "N/A",
+      "eligible": false
+    }
+  },
+  {
+    "name": "Rule 1 - Customized product (non-refundable)",
+    "input": {
+      "productType": "customized",
+      "condition": "new",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 200,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "paypal"
+    },
+    "expectedOutput": {
+      "productType": "customized",
+      "condition": "new",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 200,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "paypal",
+      "refundType": "rejected",
+      "refundPercentage": 0,
+      "reason": "Non-refundable item type",
+      "refundMethod": "N/A",
+      "processingTime": "N/A",
+      "eligible": false
+    }
+  },
+  {
+    "name": "Rule 1 - Perishable (non-refundable)",
+    "input": {
+      "productType": "perishable",
+      "condition": "new",
+      "daysSincePurchase": 2,
+      "discountPercentage": 0,
+      "amount": 30,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "debit_card"
+    },
+    "expectedOutput": {
+      "productType": "perishable",
+      "condition": "new",
+      "daysSincePurchase": 2,
+      "discountPercentage": 0,
+      "amount": 30,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "debit_card",
+      "refundType": "rejected",
+      "refundPercentage": 0,
+      "reason": "Non-refundable item type",
+      "refundMethod": "N/A",
+      "processingTime": "N/A",
+      "eligible": false
+    }
+  },
+  {
+    "name": "Rule 2 - Past 30-day window",
+    "input": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 45,
+      "discountPercentage": 0,
+      "amount": 120,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 45,
+      "discountPercentage": 0,
+      "amount": 120,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "rejected",
+      "refundPercentage": 0,
+      "reason": "Past 30-day refund window",
+      "refundMethod": "N/A",
+      "processingTime": "N/A",
+      "eligible": false
+    }
+  },
+  {
+    "name": "Rule 2 - Boundary: exactly 30 days (eligible)",
+    "input": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 30,
+      "discountPercentage": 0,
+      "amount": 100,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 30,
+      "discountPercentage": 0,
+      "amount": 100,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "full",
+      "refundPercentage": 100,
+      "reason": "Full refund - item in original condition",
+      "refundMethod": "credit_card",
+      "processingTime": "5-10 business days",
+      "eligible": true
+    }
+  },
+  {
+    "name": "Rule 3 - Fraud: excessive refund requests",
+    "input": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 80,
+      "refundRequestsThisYear": 5,
+      "originalPaymentMethod": "paypal"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 80,
+      "refundRequestsThisYear": 5,
+      "originalPaymentMethod": "paypal",
+      "refundType": "manualReview",
+      "refundPercentage": 0,
+      "reason": "Flagged for manual review - excessive refund requests",
+      "refundMethod": "paypal",
+      "processingTime": "5-10 business days",
+      "eligible": false
+    }
+  },
+  {
+    "name": "Rule 3 - Boundary: exactly 3 requests (not fraud)",
+    "input": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 80,
+      "refundRequestsThisYear": 3,
+      "originalPaymentMethod": "paypal"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 80,
+      "refundRequestsThisYear": 3,
+      "originalPaymentMethod": "paypal",
+      "refundType": "full",
+      "refundPercentage": 100,
+      "reason": "Full refund - item in original condition",
+      "refundMethod": "paypal",
+      "processingTime": "5-10 business days",
+      "eligible": true
+    }
+  },
+  {
+    "name": "Rule 4 - Store credit: 30% discount",
+    "input": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 15,
+      "discountPercentage": 30,
+      "amount": 150,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 15,
+      "discountPercentage": 30,
+      "amount": 150,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "storeCredit",
+      "refundPercentage": 100,
+      "reason": "Store credit - discounted item",
+      "refundMethod": "storeCredit",
+      "processingTime": "5-10 business days",
+      "eligible": true
+    }
+  },
+  {
+    "name": "Rule 4 - Store credit: 50% discount",
+    "input": {
+      "productType": "digital",
+      "condition": "new",
+      "daysSincePurchase": 5,
+      "discountPercentage": 50,
+      "amount": 40,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "digital",
+      "condition": "new",
+      "daysSincePurchase": 5,
+      "discountPercentage": 50,
+      "amount": 40,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "storeCredit",
+      "refundPercentage": 100,
+      "reason": "Store credit - discounted item",
+      "refundMethod": "storeCredit",
+      "processingTime": "5-10 business days",
+      "eligible": true
+    }
+  },
+  {
+    "name": "Rule 4 - Boundary: 29% discount (not sale)",
+    "input": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 10,
+      "discountPercentage": 29,
+      "amount": 100,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 10,
+      "discountPercentage": 29,
+      "amount": 100,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "full",
+      "refundPercentage": 100,
+      "reason": "Full refund - item in original condition",
+      "refundMethod": "credit_card",
+      "processingTime": "5-10 business days",
+      "eligible": true
+    }
+  },
+  {
+    "name": "Rule 5 - Digital product returned used",
+    "input": {
+      "productType": "digital",
+      "condition": "used",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 25,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "digital",
+      "condition": "used",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 25,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "rejected",
+      "refundPercentage": 0,
+      "reason": "Digital product must be unused for refund",
+      "refundMethod": "N/A",
+      "processingTime": "N/A",
+      "eligible": false
+    }
+  },
+  {
+    "name": "Rule 5 - Digital product damaged",
+    "input": {
+      "productType": "digital",
+      "condition": "damaged",
+      "daysSincePurchase": 3,
+      "discountPercentage": 0,
+      "amount": 25,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "digital",
+      "condition": "damaged",
+      "daysSincePurchase": 3,
+      "discountPercentage": 0,
+      "amount": 25,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "rejected",
+      "refundPercentage": 0,
+      "reason": "Digital product must be unused for refund",
+      "refundMethod": "N/A",
+      "processingTime": "N/A",
+      "eligible": false
+    }
+  },
+  {
+    "name": "Rule 6 - Full refund: physical new",
+    "input": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 7,
+      "discountPercentage": 0,
+      "amount": 100,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 7,
+      "discountPercentage": 0,
+      "amount": 100,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "full",
+      "refundPercentage": 100,
+      "reason": "Full refund - item in original condition",
+      "refundMethod": "credit_card",
+      "processingTime": "5-10 business days",
+      "eligible": true
+    }
+  },
+  {
+    "name": "Rule 6 - Full refund: digital new (unused)",
+    "input": {
+      "productType": "digital",
+      "condition": "new",
+      "daysSincePurchase": 14,
+      "discountPercentage": 0,
+      "amount": 50,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "paypal"
+    },
+    "expectedOutput": {
+      "productType": "digital",
+      "condition": "new",
+      "daysSincePurchase": 14,
+      "discountPercentage": 0,
+      "amount": 50,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "paypal",
+      "refundType": "full",
+      "refundPercentage": 100,
+      "reason": "Full refund - item in original condition",
+      "refundMethod": "paypal",
+      "processingTime": "5-10 business days",
+      "eligible": true
+    }
+  },
+  {
+    "name": "Rule 7 - Partial refund: physical used",
+    "input": {
+      "productType": "physical",
+      "condition": "used",
+      "daysSincePurchase": 20,
+      "discountPercentage": 0,
+      "amount": 200,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "used",
+      "daysSincePurchase": 20,
+      "discountPercentage": 0,
+      "amount": 200,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "partial",
+      "refundPercentage": 80,
+      "reason": "Partial refund - item shows signs of use",
+      "refundMethod": "credit_card",
+      "processingTime": "5-10 business days",
+      "eligible": true
+    }
+  },
+  {
+    "name": "Rule 7 - Partial refund: physical damaged",
+    "input": {
+      "productType": "physical",
+      "condition": "damaged",
+      "daysSincePurchase": 25,
+      "discountPercentage": 10,
+      "amount": 150,
+      "refundRequestsThisYear": 1,
+      "originalPaymentMethod": "debit_card"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "damaged",
+      "daysSincePurchase": 25,
+      "discountPercentage": 10,
+      "amount": 150,
+      "refundRequestsThisYear": 1,
+      "originalPaymentMethod": "debit_card",
+      "refundType": "partial",
+      "refundPercentage": 80,
+      "reason": "Partial refund - item shows signs of use",
+      "refundMethod": "debit_card",
+      "processingTime": "5-10 business days",
+      "eligible": true
+    }
+  },
+  {
+    "name": "Rule 8 - Catch-all: unknown condition",
+    "input": {
+      "productType": "physical",
+      "condition": "unknown",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 75,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "unknown",
+      "daysSincePurchase": 10,
+      "discountPercentage": 0,
+      "amount": 75,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "rejected",
+      "refundPercentage": 0,
+      "reason": "Refund not eligible",
+      "refundMethod": "N/A",
+      "processingTime": "N/A",
+      "eligible": false
+    }
+  },
+  {
+    "name": "Boundary: daysSincePurchase = 31 (just past window)",
+    "input": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 31,
+      "discountPercentage": 0,
+      "amount": 100,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card"
+    },
+    "expectedOutput": {
+      "productType": "physical",
+      "condition": "new",
+      "daysSincePurchase": 31,
+      "discountPercentage": 0,
+      "amount": 100,
+      "refundRequestsThisYear": 0,
+      "originalPaymentMethod": "credit_card",
+      "refundType": "rejected",
+      "refundPercentage": 0,
+      "reason": "Past 30-day refund window",
+      "refundMethod": "N/A",
+      "processingTime": "N/A",
+      "eligible": false
+    }
+  }
+]
