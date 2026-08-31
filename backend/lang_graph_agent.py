@@ -24,8 +24,8 @@ from backend.prompts.modify_triage_node_prompt import PROMPT_MODIFY_TRIAGE
 from backend.prompts.explain_node_prompt import PROMPT_EXPLAIN, PROMPT_EXPLAIN_USER
 from backend.prompts.test_node_prompt import PROMPT_TEST, PROMPT_TEST_USER, PROMPT_TEST_REPORT
 
-from tools.markdown_dsl_parser import parse_markdown_dsl
-from tools.zen_evaluator import check_jdm_format, evaluate_against_zen
+from backend.tools.markdown_dsl_parser import parse_markdown_dsl
+from backend.tools.zen_evaluator import check_jdm_format, evaluate_against_zen
 
 
 

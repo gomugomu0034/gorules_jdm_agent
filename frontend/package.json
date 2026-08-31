@@ -10,18 +10,17 @@
   },
   "dependencies": {
     "@gorules/jdm-editor": "^1.52.0",
-    "next": "16.3.3",
-    "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "next": "15.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4",
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "eslint": "^9",
-    "eslint-config-next": "16.3.3",
-    "tailwindcss": "^4",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "postcss": "^8",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5"
   }
 }

@@ -1,19 +1,19 @@
 services:
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: gorules_backend
     ports:
       - "8000:8000"
     volumes:
-      # Mounts your local backend folder to the container for live-reloading
-      - ./backend:/app
+      # Mounts the repository root so backend package imports resolve correctly
+      - .:/app
     env_file:
       # Automatically loads your HuggingFace/OpenAI tokens from a .env file
       - ./backend/.env
     # Uvicorn's --reload flag watches for Python file changes
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:
     build:
