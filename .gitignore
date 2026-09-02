@@ -25,6 +25,9 @@ backend/.env
 .idea/
 *.swp
 
+# Per-machine agent permissions
+.claude/settings.local.json
+
 # =========================
 # Backend (Python / FastAPI)
 # =========================
@@ -66,3 +69,10 @@ build/
 # =========================
 # Ignore local data volumes if you add databases (like Postgres/MinIO) later
 *_data/
+# =========================
+# Local database
+# =========================
+data/
+*.db
+*.db-wal
+*.db-shm

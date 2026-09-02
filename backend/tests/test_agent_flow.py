@@ -1,0 +1,252 @@
+"""End-to-end tests for the refactored agent graph.
+
+The LLM is stubbed, so these run offline and assert the wiring: intent routing,
+the interrupt/resume protocol, and the builder's self-healing loop.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+
+import pytest
+from langchain_core.messages import HumanMessage
+from langgraph.types import Command
+
+from backend import lang_graph_agent as agent
+
+GOOD_DSL = """# Structure
+
+```mermaid
+flowchart LR
+  Request --> Fee
+  Fee --> Response
+```
+
+# Nodes
+
+## Request
+type: input
+
+## Fee
+type: expression
+
+```expressions
+shippingFee = orderTotal > 50 ? 0 : 6
+```
+
+## Response
+type: output
+"""
+
+# Same graph, but the threshold is wrong so the suite fails on the first pass.
+BROKEN_DSL = GOOD_DSL.replace("orderTotal > 50 ? 0 : 6", "orderTotal > 500 ? 0 : 6")
+
+TESTS = [
+    {"name": "free over 50", "input": {"orderTotal": 80}, "expectedOutput": {"shippingFee": 0}},
+    {"name": "paid under 50", "input": {"orderTotal": 20}, "expectedOutput": {"shippingFee": 6}},
+]
+
+
+def planner_payload(dsl: str) -> str:
+    return (
+        "---USECASE NAME STARTS---\nShipping Fees\n---USECASE NAME ENDS---\n"
+        f"---DSL STARTS---\n{dsl}\n---DSL ENDS---\n"
+        f"---TESTS STARTS---\n{json.dumps(TESTS)}\n---TESTS ENDS---\n"
+    )
+
+
+class FakeLLM:
+    """Dispatches on the system prompt, and records what was asked."""
+
+    def __init__(self, dsl_sequence: list[str]):
+        self.dsl_sequence = list(dsl_sequence)
+        self.calls: list[str] = []
+
+    def __call__(self, sys_prompt: str, messages: list) -> str:
+        # Match on prompt identity; substring sniffing is too fragile because
+        # these prompts share a lot of vocabulary.
+        if sys_prompt is agent.PROMPT_INTENT:
+            self.calls.append("intent")
+            return '{"intent": "MODIFY", "confidence": 0.9}'
+
+        if sys_prompt in (agent.PROMPT_PLANNER, agent.PROMPT_BUILDER):
+            self.calls.append("planner/builder")
+            dsl = self.dsl_sequence.pop(0) if self.dsl_sequence else GOOD_DSL
+            return planner_payload(dsl)
+
+        if sys_prompt is agent.PROMPT_TEST:
+            self.calls.append("test-gen")
+            return f"---TESTS STARTS---\n{json.dumps(TESTS)}\n---TESTS ENDS---"
+
+        self.calls.append("triage")
+        return json.dumps(
+            {
+                "status": "READY_FOR_APPROVAL",
+                "message": "Understood: free shipping over $50, otherwise $6.",
+                "options": ["Approve with above understanding & assumptions", "Custom clarification"],
+            }
+        )
+
+
+@pytest.fixture
+def stub_llm(monkeypatch):
+    def install(dsl_sequence: list[str]) -> FakeLLM:
+        fake = FakeLLM(dsl_sequence)
+        monkeypatch.setattr(agent, "call_llm", fake)
+        return fake
+
+    return install
+
+
+def new_thread() -> dict:
+    return {"configurable": {"thread_id": str(uuid.uuid4())}}
+
+
+def drain(graph, payload, config) -> None:
+    for _ in graph.stream(payload, config=config):
+        pass
+
+
+def pending_interrupt(graph, config) -> dict | None:
+    state = graph.get_state(config)
+    if state.tasks and getattr(state.tasks[0], "interrupts", None):
+        return state.tasks[0].interrupts[0].value
+    return None
+
+
+# --------------------------------------------------------------------------
+
+def test_create_flow_reaches_save(stub_llm, tmp_path, monkeypatch):
+    """CREATE -> triage -> approve -> planner -> builder -> approve -> save."""
+    stub_llm([GOOD_DSL])
+    monkeypatch.setattr(agent, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(agent, "_repo_path", lambda *p: tmp_path.joinpath(*p))
+
+    graph = agent.build_graph()
+    config = new_thread()
+
+    drain(
+        graph,
+        {
+            "messages": [HumanMessage(content="Create a shipping policy: free over $50, else $6.")],
+            "canvas_jdm_json": "",
+        },
+        config,
+    )
+
+    # Triage pauses for approval.
+    payload = pending_interrupt(graph, config)
+    assert payload is not None
+    assert "Approve with above understanding & assumptions" in payload["options"]
+    assert graph.get_state(config).values["intent"] == "CREATE"
+
+    drain(graph, Command(resume="Approve with above understanding & assumptions"), config)
+
+    # Second gate: the built graph is offered for final approval.
+    payload = pending_interrupt(graph, config)
+    assert payload is not None
+    assert "Approve & Save" in payload["options"]
+
+    values = graph.get_state(config).values
+    assert values["build_status"] == "SUCCESS"
+    assert json.loads(values["jdm_json"])["nodes"]
+
+    drain(graph, Command(resume="Approve & Save"), config)
+
+    saved = tmp_path / "backend" / "jdm_graphs" / "Shipping_Fees_jdm.json"
+    assert saved.is_file(), "save_files_node must write under the repo root, not the cwd"
+    assert (tmp_path / "backend" / "jdm_tests" / "Shipping_Fees_tests.json").is_file()
+
+
+def test_builder_self_heals_failing_tests(stub_llm, tmp_path, monkeypatch):
+    """A graph that compiles but fails its assertions must be retried, not accepted."""
+    fake = stub_llm([BROKEN_DSL, GOOD_DSL])
+    monkeypatch.setattr(agent, "_repo_path", lambda *p: tmp_path.joinpath(*p))
+
+    graph = agent.build_graph()
+    config = new_thread()
+
+    drain(
+        graph,
+        {"messages": [HumanMessage(content="Create a shipping policy.")], "canvas_jdm_json": ""},
+        config,
+    )
+    drain(graph, Command(resume="Approve with above understanding & assumptions"), config)
+
+    values = graph.get_state(config).values
+    assert values["build_status"] == "SUCCESS"
+    # The first DSL compiled fine but failed its expectations; the loop had to
+    # call the LLM again to fix it.
+    assert fake.calls.count("planner/builder") >= 2
+
+
+def test_modify_intent_routes_to_modify_triage(stub_llm):
+    """A request against a populated canvas goes to modify_triage, not triage."""
+    stub_llm([GOOD_DSL])
+    canvas = open("backend/jdm_graphs/RefundPolicy_jdm.json", encoding="utf-8").read()
+
+    graph = agent.build_graph()
+    config = new_thread()
+
+    drain(
+        graph,
+        {
+            "messages": [HumanMessage(content="add a rule for VIP customers")],
+            "canvas_jdm_json": canvas,
+            "canvas_graph_name": "Refund Policy",
+        },
+        config,
+    )
+
+    values = graph.get_state(config).values
+    assert values["intent"] == "MODIFY"
+    assert values["mode"] == "EXISTING"
+    # The canvas is what downstream prompts see.
+    assert values["existing_jdm_json"] == canvas
+    assert pending_interrupt(graph, config) is not None
+
+
+def test_test_intent_runs_saved_suite(stub_llm):
+    """TEST runs the supplied suite and reports a deterministic verdict."""
+    stub_llm([])
+    canvas = open("backend/jdm_graphs/LoanApprovalPolicy_jdm.json", encoding="utf-8").read()
+    tests = open("backend/jdm_tests/LoanApprovalPolicy_tests.json", encoding="utf-8").read()
+
+    graph = agent.build_graph()
+    config = new_thread()
+
+    drain(
+        graph,
+        {
+            "messages": [HumanMessage(content="run the tests")],
+            "canvas_jdm_json": canvas,
+            "canvas_graph_name": "Loan Approval Policy",
+            "test_suite_json": tests,
+        },
+        config,
+    )
+
+    values = graph.get_state(config).values
+    assert values["intent"] == "TEST"
+    summary = json.loads(values["evaluation_feedback"])
+    # This graph genuinely does not emit its declared outputs.
+    assert summary["failed"] == summary["total"] > 0
+
+    report = values["messages"][-1].content
+    assert "tests passed" in report and "❌" in report
+
+
+def test_intent_router_never_interrupts(stub_llm):
+    """The entry node must do work immediately rather than pausing for input."""
+    stub_llm([GOOD_DSL])
+    graph = agent.build_graph()
+    config = new_thread()
+
+    drain(graph, {"messages": [HumanMessage(content="Create a policy")], "canvas_jdm_json": ""}, config)
+
+    payload = pending_interrupt(graph, config)
+    # The first pause belongs to triage, not to a welcome or action-selection chip.
+    assert payload is not None
+    assert "Welcome" not in payload["prompt"]
+    assert graph.get_state(config).next != ("intent_router_node",)
