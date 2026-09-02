@@ -19,6 +19,9 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      # Use the dependency stage for `next dev`. The final Dockerfile stage is
+      # a production-only standalone image and does not include node_modules.
+      target: deps
     container_name: gorules_frontend
     ports:
       - "3000:3000"
