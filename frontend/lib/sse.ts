@@ -27,6 +27,9 @@ export function createEventStream({ threadId, fromSeq, onEvent, onError }: Optio
 
     source = new EventSource(
       apiUrl(`/api/chat/threads/${threadId}/stream?from_seq=${lastSeq}`),
+      // The stream is owner-scoped like every other route, and EventSource
+      // cannot set headers - which is exactly why the session is a cookie.
+      { withCredentials: true },
     );
 
     source.onopen = () => {

@@ -155,3 +155,24 @@ export type ChatEvent =
       type: 'done';
       status: 'awaiting_input' | 'completed' | 'error' | 'cancelled';
     };
+
+
+/** Who the browser is acting as. `login_enabled` is false with no admin configured. */
+export type Session = {
+  mode: 'guest' | 'admin';
+  email?: string | null;
+  login_enabled: boolean;
+};
+
+/**
+ * Accepting a proposal either writes a version (`draft: false`) or hands back
+ * an unsaved graph for the canvas (`draft: true`).
+ */
+export type AcceptProposalResult = {
+  graph_id: string | null;
+  version: number | null;
+  draft: boolean;
+  name?: string;
+  content?: DecisionGraphType;
+  tests?: TestCase[];
+};

@@ -5,22 +5,42 @@ import {
   ChevronDown,
   Download,
   History,
+  LogIn,
+  LogOut,
   MessageSquare,
   Moon,
   PanelLeft,
   Save,
   Sun,
 } from 'lucide-react';
+import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
 
 import { downloadGraph } from '../../lib/download';
 import { useGraphStore } from '../../stores/useGraphStore';
+import { useSessionStore } from '../../stores/useSessionStore';
 import { useUiStore } from '../../stores/useUiStore';
 import { Badge, Button, IconButton, Spinner, cx } from '../ui';
 
-export function TopBar({ onOpenHistory }: { onOpenHistory: () => void }) {
-  const { graph, dirty, saving, rename, save } = useGraphStore();
+export function TopBar({
+  onOpenHistory,
+  onSaveDraft,
+}: {
+  onOpenHistory: () => void;
+  /** Opens the name dialog; only reachable while editing an unsaved draft. */
+  onSaveDraft?: () => void;
+}) {
+  const { graph, content, dirty, saving, isDraft, draftName: draftPolicyName, rename, save } =
+    useGraphStore();
+  // The starting skeleton is just an input and an output; there is nothing
+  // worth saving until the user or the assistant has added to it.
+  const worthSaving = (content?.nodes?.length ?? 0) > 2 || dirty;
   const { theme, toggleTheme, toggleSidebar, toggleChat, chatOpen } = useUiStore();
+  const { session, hydrate, logout } = useSessionStore();
+
+  useEffect(() => {
+    void hydrate();
+  }, [hydrate]);
 
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState('');
@@ -57,7 +77,15 @@ export function TopBar({ onOpenHistory }: { onOpenHistory: () => void }) {
 
       <div className="mx-1 h-5 w-px bg-border" />
 
-      {graph ? (
+      {isDraft ? (
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate px-1.5 py-1 text-sm font-medium text-fg">
+            {draftPolicyName ?? 'Untitled policy'}
+          </span>
+          <Badge tone="warning">Draft</Badge>
+          <span className="text-2xs text-fg-subtle">Not saved yet</span>
+        </div>
+      ) : graph ? (
         <div className="flex min-w-0 items-center gap-2">
           {editing ? (
             <input
@@ -106,7 +134,19 @@ export function TopBar({ onOpenHistory }: { onOpenHistory: () => void }) {
 
       <div className="flex-1" />
 
-      {graph ? (
+      {isDraft ? (
+        <Button
+          size="sm"
+          variant="primary"
+          icon={<Save size={13} />}
+          onClick={onSaveDraft}
+          loading={saving}
+          disabled={!worthSaving}
+          title={worthSaving ? undefined : 'Add a node, or ask the assistant, first'}
+        >
+          Save policy
+        </Button>
+      ) : graph ? (
         <>
           <Button
             size="sm"
@@ -172,6 +212,27 @@ export function TopBar({ onOpenHistory }: { onOpenHistory: () => void }) {
       >
         {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
       </IconButton>
+
+      {session?.mode === 'admin' ? (
+        <div className="flex items-center gap-1.5 pl-1">
+          <span
+            className="max-w-[10rem] truncate text-2xs text-fg-muted"
+            title={session.email ?? undefined}
+          >
+            {session.email}
+          </span>
+          <IconButton label="Sign out" onClick={() => void logout()}>
+            <LogOut size={15} />
+          </IconButton>
+        </div>
+      ) : session?.login_enabled ? (
+        <Link
+          href="/login"
+          className="ml-1 inline-flex h-7 items-center gap-1.5 rounded border border-border px-2.5 text-xs font-medium hover:bg-bg-subtle focus-ring"
+        >
+          <LogIn size={13} /> Sign in
+        </Link>
+      ) : null}
     </header>
   );
 }

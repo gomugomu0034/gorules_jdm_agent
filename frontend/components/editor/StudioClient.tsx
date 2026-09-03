@@ -5,6 +5,7 @@
 // which touches `window` at module scope and 500s on a direct page load.
 import type { DecisionGraphType, Simulation } from '@gorules/jdm-editor';
 import dynamic from 'next/dynamic';
+import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Group, Panel, Separator, useDefaultLayout } from 'react-resizable-panels';
 
@@ -15,6 +16,8 @@ import { useUiStore } from '../../stores/useUiStore';
 import { ChatPane } from '../chat/ChatPane';
 import { Sidebar } from '../shell/Sidebar';
 import { TopBar } from '../shell/TopBar';
+import { SaveGraphDialog } from '../shell/SaveGraphDialog';
+import { UnsavedGuard } from '../shell/UnsavedGuard';
 import { VersionHistory } from '../shell/VersionHistory';
 import { Spinner } from '../ui';
 import { DiffReviewBar } from './DiffReviewBar';
@@ -53,12 +56,25 @@ const layoutStorage = {
   },
 };
 
-export function StudioClient({ graphId }: { graphId: string }) {
-  const { graph, content, loading, load, setContent, applyProposed } = useGraphStore();
+/**
+ * The studio, in one of two modes.
+ *
+ * With a `graphId` it edits a stored policy. With `null` it is a *draft*: an
+ * empty canvas beside the chat, which is where a visitor starts. A draft has
+ * no row in the database until it is named and saved, so there is no autosave
+ * and no version history until then.
+ */
+export function StudioClient({ graphId }: { graphId: string | null }) {
+  const {
+    graph, content, loading, isDraft, draftName,
+    load, setContent, applyProposed, beginDraft, saveDraftAs, reset,
+  } = useGraphStore();
   const { sidebarOpen, chatOpen } = useUiStore();
   const chat = useChatStore();
+  const router = useRouter();
 
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [saveOpen, setSaveOpen] = useState(false);
   const [simulation, setSimulation] = useState<Simulation | undefined>();
   const [simulating, setSimulating] = useState(false);
   const [sidebarToken, setSidebarToken] = useState(0);
@@ -70,14 +86,16 @@ export function StudioClient({ graphId }: { graphId: string }) {
   const openedThread = useRef<string | null>(null);
 
   useEffect(() => {
-    void load(graphId);
-  }, [graphId, load]);
+    if (graphId) void load(graphId);
+    else reset();
+  }, [graphId, load, reset]);
 
   useEffect(() => {
     // Guarded because React's StrictMode runs effects twice in development,
     // which would otherwise create two chat threads per page load.
-    if (openedThread.current === graphId) return;
-    openedThread.current = graphId;
+    const key = graphId ?? '__draft__';
+    if (openedThread.current === key) return;
+    openedThread.current = key;
     void chat.open(graphId);
     return () => {
       openedThread.current = null;
@@ -114,7 +132,17 @@ export function StudioClient({ graphId }: { graphId: string }) {
   const accept = async () => {
     if (!chat.threadId || !proposal) return;
     const jdm = proposal.jdm;
-    await api.acceptProposal(chat.threadId, graphId, proposal.usecase_name);
+
+    if (!graphId) {
+      // Nothing to write into yet: keep it on the canvas as a draft so it can
+      // be reviewed and tested before the visitor commits to a name.
+      const result = await api.acceptProposal(chat.threadId, null, proposal.usecase_name);
+      beginDraft(result.content ?? jdm, result.name ?? proposal.usecase_name, result.tests ?? []);
+      chat.clearProposal();
+      return;
+    }
+
+    await api.acceptProposal(chat.threadId, graphId, proposal.usecase_name, true);
     applyProposed(jdm);
     chat.clearProposal();
     await load(graphId);
@@ -126,13 +154,29 @@ export function StudioClient({ graphId }: { graphId: string }) {
     await api.rejectProposal(chat.threadId, reason);
     chat.clearProposal();
     if (reason.trim()) {
-      void chat.send(reason, { content, graph_id: graphId, name: graph?.name ?? null });
+      void chat.send(reason, {
+        content,
+        graph_id: graphId,
+        name: graph?.name ?? draftName ?? null,
+      });
+    }
+  };
+
+  const saveDraft = async (name: string) => {
+    const id = await saveDraftAs(name);
+    setSaveOpen(false);
+    if (id) {
+      setSidebarToken((t) => t + 1);
+      router.push(`/graphs/${id}`);
     }
   };
 
   return (
     <div className="flex h-full flex-col">
-      <TopBar onOpenHistory={() => setHistoryOpen(true)} />
+      <TopBar
+        onOpenHistory={() => setHistoryOpen(true)}
+        onSaveDraft={() => setSaveOpen(true)}
+      />
 
       <Group orientation="horizontal" className="flex min-h-0 flex-1" {...layout}>
         {sidebarOpen ? (
@@ -168,7 +212,7 @@ export function StudioClient({ graphId }: { graphId: string }) {
                   // which is where the editor's own diff helpers can be loaded.
                   proposed={proposal?.jdm}
                   onChange={setContent}
-                  name={graph?.name}
+                  name={graph?.name ?? draftName ?? undefined}
                   disabled={inDiffMode}
                   simulation={simulation}
                   simulating={simulating}
@@ -184,13 +228,24 @@ export function StudioClient({ graphId }: { graphId: string }) {
           <>
             <ResizeHandle />
             <Panel id="chat" defaultSize="26%" minSize="320px" maxSize="45%">
-              <ChatPane canvas={content} graphId={graphId} graphName={graph?.name ?? null} />
+              <ChatPane
+                canvas={content}
+                graphId={graphId}
+                graphName={graph?.name ?? draftName ?? null}
+              />
             </Panel>
           </>
         ) : null}
       </Group>
 
       <VersionHistory open={historyOpen} onClose={() => setHistoryOpen(false)} />
+      <SaveGraphDialog
+        open={saveOpen}
+        defaultName={draftName ?? 'Untitled policy'}
+        onClose={() => setSaveOpen(false)}
+        onSave={saveDraft}
+      />
+      <UnsavedGuard />
     </div>
   );
 }

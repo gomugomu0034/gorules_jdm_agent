@@ -13,6 +13,8 @@ from backend.db import connection, dao
 logger = logging.getLogger(__name__)
 
 BOOTSTRAP_KEY = "bootstrap_v1"
+SCHEMA_V2_KEY = "schema_v2_owners"
+ADMIN_ID = "user:admin"
 SCHEMA_FILE = Path(__file__).resolve().parent / "schema.sql"
 
 
@@ -28,6 +30,100 @@ async def apply_schema() -> None:
     await connection.script(SCHEMA_FILE.read_text(encoding="utf-8"))
 
 
+async def _column_names(table: str) -> set[str]:
+    async with connection.read() as conn:
+        cur = await conn.execute(f"PRAGMA table_info({table})")
+        return {row["name"] for row in await cur.fetchall()}
+
+
+async def migrate_owners() -> None:
+    """Add owner columns to a database created before multi-user support.
+
+    Everything that predates ownership belongs to the admin, which is what the
+    DEFAULT backfills. `graphs` needs a full table rebuild rather than a plain
+    ADD COLUMN because its `slug` carried a *global* UNIQUE constraint, and
+    uniqueness must now be per owner - otherwise the second guest to save a
+    "Refund Policy" collides with the first.
+    """
+    if await dao.get_meta(SCHEMA_V2_KEY):
+        return
+
+    if "owner_id" not in await _column_names("chat_threads"):
+        async with connection.write() as conn:
+            await conn.execute(
+                "ALTER TABLE chat_threads ADD COLUMN owner_id TEXT NOT NULL"
+                f" DEFAULT '{ADMIN_ID}'"
+            )
+
+    if "owner_id" not in await _column_names("graphs"):
+        # SQLite cannot drop a column constraint, so rebuild the table. Foreign
+        # keys are disabled for the swap: `graph_versions`, `test_cases` and
+        # `test_runs` all cascade from graphs(id), and dropping the old table
+        # with them enforced would delete every version and test in the file.
+        await connection.script(
+            """
+            PRAGMA foreign_keys=OFF;
+            BEGIN;
+            CREATE TABLE graphs_v2 (
+              id              TEXT PRIMARY KEY,
+              owner_id        TEXT NOT NULL DEFAULT 'user:admin',
+              name            TEXT NOT NULL,
+              slug            TEXT NOT NULL,
+              description     TEXT NOT NULL DEFAULT '',
+              current_version INTEGER NOT NULL DEFAULT 0,
+              created_at      TEXT NOT NULL,
+              updated_at      TEXT NOT NULL,
+              archived_at     TEXT
+            );
+            INSERT INTO graphs_v2 (id, owner_id, name, slug, description,
+                                   current_version, created_at, updated_at, archived_at)
+              SELECT id, 'user:admin', name, slug, description,
+                     current_version, created_at, updated_at, archived_at
+                FROM graphs;
+            DROP TABLE graphs;
+            ALTER TABLE graphs_v2 RENAME TO graphs;
+            CREATE INDEX IF NOT EXISTS idx_graphs_owner
+              ON graphs(owner_id, updated_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_graphs_owner_slug
+              ON graphs(owner_id, slug);
+            COMMIT;
+            PRAGMA foreign_keys=ON;
+            """
+        )
+        logger.info("Migrated `graphs` to per-owner ownership.")
+
+    # Deferred from schema.sql, which runs before the column is guaranteed.
+    await connection.script(
+        "CREATE INDEX IF NOT EXISTS idx_graphs_owner"
+        " ON graphs(owner_id, updated_at DESC);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_graphs_owner_slug"
+        " ON graphs(owner_id, slug);"
+    )
+    await dao.set_meta(SCHEMA_V2_KEY, "done")
+
+
+async def seed_admin() -> None:
+    """Create or update the admin from the environment.
+
+    The password is never stored in the repository: it comes from
+    ADMIN_PASSWORD in backend/.env. With it unset, no admin row exists and
+    login is refused, leaving the guest flow fully usable.
+    """
+    if not settings.admin_password:
+        logger.info("ADMIN_PASSWORD is not set; admin login is disabled.")
+        return
+    await dao.upsert_user(ADMIN_ID, settings.admin_email, settings.admin_password)
+    logger.info("Admin user ready (%s).", settings.admin_email)
+
+
+async def sweep_guests() -> int:
+    """Delete guest data untouched for `guest_ttl_days`; cascades to children."""
+    removed = await dao.delete_stale_guests(settings.guest_ttl_days)
+    if removed:
+        logger.info("Swept %s stale guest graph(s).", removed)
+    return removed
+
+
 async def import_legacy_graphs() -> int:
     """Import backend/jdm_graphs/*.json and their matching test suites."""
     graphs_dir = Path(settings.legacy_graphs_dir)
@@ -38,7 +134,7 @@ async def import_legacy_graphs() -> int:
     imported = 0
     for path in sorted(graphs_dir.glob("*_jdm.json")):
         name = humanise(path.stem)
-        if await dao.find_graph_by_name(name):
+        if await dao.find_graph_by_name(name, owner=ADMIN_ID):
             continue
 
         try:
@@ -48,6 +144,7 @@ async def import_legacy_graphs() -> int:
             continue
 
         graph = await dao.create_graph(
+            owner=ADMIN_ID,
             name=name,
             content=content,
             description=f"Imported from {path.name}",
@@ -98,8 +195,10 @@ def _warn_if_failing(name: str, content: dict, tests: list) -> None:
 
 async def bootstrap() -> None:
     await apply_schema()
-    if await dao.get_meta(BOOTSTRAP_KEY):
-        return
-    count = await import_legacy_graphs()
-    await dao.set_meta(BOOTSTRAP_KEY, "done")
-    logger.info("Bootstrap complete; imported %s legacy graph(s).", count)
+    await migrate_owners()
+    await seed_admin()
+    if not await dao.get_meta(BOOTSTRAP_KEY):
+        count = await import_legacy_graphs()
+        await dao.set_meta(BOOTSTRAP_KEY, "done")
+        logger.info("Bootstrap complete; imported %s legacy graph(s).", count)
+    await sweep_guests()

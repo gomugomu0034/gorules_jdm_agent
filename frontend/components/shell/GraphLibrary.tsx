@@ -28,16 +28,9 @@ export function GraphLibrary() {
       .finally(() => setLoading(false));
   }, []);
 
-  const create = async () => {
-    setBusy(true);
-    try {
-      const graph = await api.createGraph(`Untitled policy ${graphs.length + 1}`);
-      router.push(`/graphs/${graph.id}`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not create a policy.');
-      setBusy(false);
-    }
-  };
+  // A new policy starts as a draft on the chat-first screen: nothing is stored
+  // until it has content and a name worth storing.
+  const create = () => router.push('/');
 
   const importFile = async (file: File) => {
     setBusy(true);
@@ -110,7 +103,7 @@ export function GraphLibrary() {
               <EmptyState
                 icon={<FileJson size={24} />}
                 title="No policies yet"
-                description="Create your first decision policy, or import an existing JDM file."
+                description="Describe one to the assistant, or import an existing JDM file."
                 action={
                   <Button variant="primary" icon={<Plus size={14} />} onClick={create}>
                     New policy

@@ -8,6 +8,31 @@ import type { GraphDetail, TestCase, TestRunReport, VersionSummary } from '../li
 
 const AUTOSAVE_DELAY = 3000;
 
+/**
+ * The skeleton a new policy starts from, matching what the API creates for an
+ * empty graph so a hand-drawn policy and a generated one look the same.
+ */
+const BLANK_GRAPH = {
+  contentType: 'application/vnd.gorules.decision',
+  nodes: [
+    {
+      id: 'input-node',
+      name: 'Request',
+      type: 'inputNode',
+      position: { x: 120, y: 200 },
+      content: { schema: '' },
+    },
+    {
+      id: 'output-node',
+      name: 'Response',
+      type: 'outputNode',
+      position: { x: 620, y: 200 },
+      content: { schema: '' },
+    },
+  ],
+  edges: [],
+} as unknown as DecisionGraphType;
+
 type GraphState = {
   graph: GraphDetail | null;
   content: DecisionGraphType;
@@ -16,6 +41,11 @@ type GraphState = {
   testReport: TestRunReport | null;
   dirty: boolean;
   saving: boolean;
+  /** A graph that exists only on the canvas: created by the agent or by
+   *  "New policy", but not yet saved under a name. */
+  isDraft: boolean;
+  draftName: string | null;
+  draftTests: TestCase[];
   loading: boolean;
   error: string | null;
   lastSavedAt: string | null;
@@ -30,6 +60,11 @@ type GraphState = {
   saveTests: (tests: TestCase[]) => Promise<void>;
   runTests: () => Promise<TestRunReport | null>;
   applyProposed: (content: DecisionGraphType) => void;
+  /** Hold an agent proposal on the canvas without persisting it. */
+  beginDraft: (content: DecisionGraphType, name: string, tests?: TestCase[]) => void;
+  /** Persist the draft as a real graph under `name`; returns its id. */
+  saveDraftAs: (name: string) => Promise<string | null>;
+  reset: () => void;
   clearError: () => void;
 };
 
@@ -57,6 +92,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   testReport: null,
   dirty: false,
   saving: false,
+  isDraft: false,
+  draftName: null,
+  draftTests: [],
   loading: false,
   error: null,
   lastSavedAt: null,
@@ -74,6 +112,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         dirty: false,
         loading: false,
         testReport: null,
+        isDraft: false,
+        draftName: null,
+        draftTests: [],
       });
       await Promise.all([get().refreshVersions(), get().loadTests()]);
     } catch (e) {
@@ -99,8 +140,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     // minute, so dragging a node around does not create a version per frame.
     if (autosaveTimer) clearTimeout(autosaveTimer);
     autosaveTimer = setTimeout(() => {
-      const { graph, dirty } = get();
-      if (graph && dirty) void get().save();
+      const { graph, dirty, isDraft } = get();
+      // A draft has no row to autosave into; it is kept until the user names it.
+      if (graph && dirty && !isDraft) void get().save();
     }, AUTOSAVE_DELAY);
   },
 
@@ -172,8 +214,12 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   },
 
   saveTests: async (tests) => {
-    const { graph } = get();
-    if (!graph) return;
+    const { graph, isDraft } = get();
+    if (isDraft || !graph) {
+      // Held until the draft is named and saved, which writes them in one go.
+      set({ tests, draftTests: tests });
+      return;
+    }
     try {
       const saved = await api.replaceTests(graph.id, tests);
       set({ tests: saved.tests });
@@ -183,17 +229,87 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   },
 
   runTests: async () => {
-    const { graph, content } = get();
-    if (!graph) return null;
+    const { graph, content, isDraft, tests } = get();
     try {
-      // Send the live canvas so unsaved edits are what actually gets tested.
-      const report = await api.runTests(graph.id, content);
-      set({ testReport: report });
+      // A draft has no stored suite to run against, so its tests are posted
+      // with the content to the stateless endpoint. Either way the *live*
+      // canvas is what gets tested, so unsaved edits are covered.
+      const report = isDraft || !graph
+        ? tests.length
+          ? await api.runAdhocTests(content, tests)
+          : null
+        : await api.runTests(graph.id, content);
+      if (report) set({ testReport: report });
       return report;
     } catch (e) {
       set({ error: describe(e) });
       return null;
     }
+  },
+
+  beginDraft: (content, name, tests = []) => {
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    beginSettling();
+    set({
+      graph: null,
+      content,
+      isDraft: true,
+      draftName: name,
+      draftTests: tests,
+      tests,
+      versions: [],
+      testReport: null,
+      dirty: true,
+      error: null,
+    });
+  },
+
+  saveDraftAs: async (name) => {
+    const { content, draftTests } = get();
+    set({ saving: true, error: null });
+    try {
+      const created = await api.createGraph(name, content);
+      if (draftTests.length) await api.replaceTests(created.id, draftTests);
+      set({
+        graph: created,
+        isDraft: false,
+        draftName: null,
+        draftTests: [],
+        dirty: false,
+        saving: false,
+        lastSavedAt: new Date().toISOString(),
+      });
+      await Promise.all([get().refreshVersions(), get().loadTests()]);
+      return created.id;
+    } catch (e) {
+      set({ saving: false, error: describe(e) });
+      return null;
+    }
+  },
+
+  /**
+   * Start on a blank canvas as a draft.
+   *
+   * Draft mode is on from the outset, not only once the assistant proposes
+   * something: a graph drawn by hand needs the same Save action, and without
+   * this there is no way to keep one.
+   */
+  reset: () => {
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    beginSettling();
+    set({
+      graph: null,
+      content: BLANK_GRAPH,
+      versions: [],
+      tests: [],
+      testReport: null,
+      dirty: false,
+      isDraft: true,
+      draftName: null,
+      draftTests: [],
+      error: null,
+      lastSavedAt: null,
+    });
   },
 
   applyProposed: (content) => {

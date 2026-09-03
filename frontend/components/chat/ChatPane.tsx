@@ -15,7 +15,14 @@ type Props = {
   graphName: string | null;
 };
 
-const SUGGESTIONS = [
+// An empty canvas can only be built on; the rest need a graph to act against.
+const NEW_POLICY_SUGGESTIONS = [
+  'Create a ticket discount policy: students 20% off, seniors 25%, members 10%',
+  'Build a shipping fee policy: free over $50, $6 under, $12 to PO boxes',
+  'Draft a refund policy based on order age and customer tier',
+];
+
+const EXISTING_POLICY_SUGGESTIONS = [
   'Explain what this policy does',
   'Run the test suite',
   'Add a rule for VIP customers',
@@ -30,6 +37,14 @@ export function ChatPane({ canvas, graphId, graphName }: Props) {
   // The live canvas travels with every turn, so the agent reasons about the
   // graph as it stands right now - unsaved edits included.
   const canvasPayload = { content: canvas, graph_id: graphId, name: graphName };
+
+  // With nothing on the canvas the only sensible request is to build something,
+  // which is also how the agent's own intent router reads it. A new policy
+  // starts from an input/output skeleton, so "blank" means nothing beyond that
+  // rather than literally zero nodes.
+  const isBlank = (canvas?.nodes ?? []).every(
+    (node) => node.type === 'inputNode' || node.type === 'outputNode',
+  );
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
@@ -65,15 +80,19 @@ export function ChatPane({ canvas, graphId, graphName }: Props) {
         {messages.length === 0 && !running ? (
           <EmptyState
             icon={<Sparkles size={20} />}
-            title="Ask for a change"
-            description="Describe what this policy should do, and review the proposed graph before accepting it."
+            title={isBlank ? 'Describe a policy' : 'Ask for a change'}
+            description={
+              isBlank
+                ? 'Say what the rules should be. The assistant builds the graph and opens it on the canvas for you to review.'
+                : 'Describe what this policy should do, and review the proposed graph before accepting it.'
+            }
             action={
               <div className="flex flex-col gap-1.5">
-                {SUGGESTIONS.map((s) => (
+                {(isBlank ? NEW_POLICY_SUGGESTIONS : EXISTING_POLICY_SUGGESTIONS).map((s) => (
                   <button
                     key={s}
                     onClick={() => void send(s, canvasPayload)}
-                    className="rounded border border-border px-2.5 py-1.5 text-xs text-fg-muted hover:bg-bg-subtle hover:text-fg"
+                    className="rounded border border-border px-2.5 py-1.5 text-left text-xs text-fg-muted hover:bg-bg-subtle hover:text-fg"
                   >
                     {s}
                   </button>

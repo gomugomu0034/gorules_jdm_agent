@@ -8,8 +8,9 @@ PRAGMA busy_timeout=5000;
 
 CREATE TABLE IF NOT EXISTS graphs (
   id              TEXT PRIMARY KEY,
+  owner_id        TEXT NOT NULL DEFAULT 'user:admin',  -- 'user:<id>' | 'guest:<sid>'
   name            TEXT NOT NULL,
-  slug            TEXT NOT NULL UNIQUE,
+  slug            TEXT NOT NULL,
   description     TEXT NOT NULL DEFAULT '',
   current_version INTEGER NOT NULL DEFAULT 0,
   created_at      TEXT NOT NULL,
@@ -29,6 +30,8 @@ CREATE TABLE IF NOT EXISTS graph_versions (
   PRIMARY KEY (graph_id, version)
 );
 CREATE INDEX IF NOT EXISTS idx_versions_graph ON graph_versions(graph_id, version DESC);
+-- Owner indexes are created by migrate_owners() in bootstrap.py, which runs
+-- after this file and guarantees the column exists on upgraded databases.
 
 CREATE TABLE IF NOT EXISTS test_cases (
   id            TEXT PRIMARY KEY,
@@ -55,6 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_graph ON test_runs(graph_id, created_at DESC
 
 CREATE TABLE IF NOT EXISTS chat_threads (
   id         TEXT PRIMARY KEY,               -- == LangGraph thread_id
+  owner_id   TEXT NOT NULL DEFAULT 'user:admin',
   graph_id   TEXT REFERENCES graphs(id) ON DELETE SET NULL,
   title      TEXT NOT NULL DEFAULT 'New chat',
   status     TEXT NOT NULL DEFAULT 'idle',   -- idle | running | awaiting_input | error
@@ -86,4 +90,12 @@ CREATE TABLE IF NOT EXISTS proposals (
 CREATE TABLE IF NOT EXISTS schema_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  id            TEXT PRIMARY KEY,             -- 'user:admin'
+  email         TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
 );

@@ -130,15 +130,25 @@ class LLMResponse(str):
         return obj
 
 
-def _assistant_message_from_llm(response: str, content: str | None = None) -> AIMessage:
+def _assistant_message_from_llm(
+    response: str, content: str | None = None, internal: bool = False
+) -> AIMessage:
+    """Wrap an LLM reply as a state message.
+
+    `internal=True` marks a reply that exists only as retry context for the
+    model - the builder's DSL dumps - so the chat can drop it without guessing
+    from its content, which is unreliable because the model does not always
+    emit the same markers.
+    """
+    extra: dict = {}
     reasoning_details = getattr(response, "reasoning_details", None)
-    message_content = str(response) if content is None else content
     if reasoning_details is not None:
-        return AIMessage(
-            content=message_content,
-            additional_kwargs={"reasoning_details": reasoning_details},
-        )
-    return AIMessage(content=message_content)
+        extra["reasoning_details"] = reasoning_details
+    if internal:
+        extra["internal"] = True
+    message_content = str(response) if content is None else content
+    return AIMessage(content=message_content, additional_kwargs=extra) if extra \
+        else AIMessage(content=message_content)
 
 
 def _format_chat_messages(sys_prompt: str, messages: list, include_reasoning_details: bool = False) -> list:
@@ -279,6 +289,7 @@ class AgentState(TypedDict):
     test_suite_json: str
     evaluation_feedback: str
     build_status: str
+    build_failed: bool
     final_approval_status: str
     usecase_name: str
     mode: str  # "NEW" or "EXISTING"
@@ -805,7 +816,7 @@ def builder_node(state: AgentState):
             progress("llm", f"Revising the graph after attempt {attempt}")
 
             content = call_llm(PROMPT_BUILDER, context)
-            new_messages.append(_assistant_message_from_llm(content))
+            new_messages.append(_assistant_message_from_llm(content, internal=True))
             context.append(_assistant_message_from_llm(content))
 
             # 1. Extract using the robust markers
@@ -881,44 +892,73 @@ def builder_node(state: AgentState):
 
 # Step 4: Output Success
 def output_node(state: AgentState):
-    print("\n[Step 5: Output]: Compilation and Testing Complete.")
+    status = state.get("build_status", "SUCCESS")
+    print(f"\n[Step 5: Output]: build_status={status}")
 
-    jdm_json = state.get("jdm_json", "{}")
-    test_suite_json = state.get("test_suite_json", "[]")
-
-    # Dump without 'indent' to force a single-line compact JSON string
+    # The graph itself reaches the canvas as a `graph_proposed` event, so the
+    # chat carries a readable summary rather than a wall of JSON.
     try:
-        jdm_compact = json.dumps(json.loads(jdm_json))
-    except Exception:
-        # Fallback: manually strip newlines if parsing fails
-        jdm_compact = jdm_json.replace('\n', '').replace('\r', '')
-
+        jdm = json.loads(state.get("jdm_json", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        jdm = {}
     try:
-        tests_compact = json.dumps(json.loads(test_suite_json))
-    except Exception:
-        tests_compact = test_suite_json.replace('\n', '').replace('\r', '')
+        tests = json.loads(state.get("test_suite_json", "[]"))
+    except (json.JSONDecodeError, TypeError):
+        tests = []
 
-    final_output = f"""✅ **GoRules Zen Graph Successfully Generated and Tested!**
-    
-        <details>
-        <summary><b>📜 Click to expand Generated JDM Graph</b></summary>
-        
-        ```json
-        {jdm_compact}
-        ```
-        
-        </details>
-        
-        <details>
-        <summary><b>🧪 Click to expand Generated Test Cases</b></summary>
-        
-        ```json
-        {tests_compact}
-        ```
-        
-        </details>
-        """
-    return {"messages": [_assistant_message_from_llm(final_output)]}
+    nodes = jdm.get("nodes", []) if isinstance(jdm, dict) else []
+    name = state.get("usecase_name") or "the policy"
+
+    # A failed build must say so. Reporting "all passing" over an empty graph
+    # would be worse than useless: the canvas would stay blank while the chat
+    # claimed success.
+    if status != "SUCCESS" or not nodes:
+        feedback = (state.get("evaluation_feedback") or "").strip()
+        if status == "CANCELLED":
+            body = ["Stopped before the graph was finished. Nothing was changed."]
+        else:
+            body = [
+                f"I could not build a working graph for **{name}**.",
+                "",
+                "Every attempt either failed to compile or did not satisfy its own "
+                "test cases, so there is nothing to put on the canvas.",
+                "",
+                "Try narrowing the rules, or describe the inputs and the expected "
+                "decision for one concrete example.",
+            ]
+            if feedback:
+                body += ["", "Last error:", "", "```", feedback[:600], "```"]
+        return {
+            "messages": [_assistant_message_from_llm("\n".join(body))],
+            "build_failed": True,
+        }
+
+    def _describe(node: dict) -> str:
+        kind = {
+            "decisionTableNode": "decision table",
+            "functionNode": "function",
+            "expressionNode": "expression",
+            "switchNode": "switch",
+            "inputNode": "input",
+            "outputNode": "output",
+        }.get(node.get("type", ""), node.get("type", "node"))
+        return f"**{node.get('name', 'Unnamed')}** ({kind})"
+
+    lines = [
+        f"Built **{name}** - {len(nodes)} "
+        f"{'node' if len(nodes) == 1 else 'nodes'}, "
+        f"{len(tests)} {'test' if len(tests) == 1 else 'tests'}, all passing.",
+        "",
+        "The graph is on the canvas. Review it there, then approve to keep it.",
+    ]
+    if nodes:
+        lines += ["", "Flow:", ""]
+        lines += [f"- {_describe(n)}" for n in nodes]
+
+    return {
+        "messages": [_assistant_message_from_llm("\n".join(lines))],
+        "build_failed": False,
+    }
 
 
 # Step 5: Human Final Approval
@@ -1192,7 +1232,13 @@ workflow.add_edge("planner_node", "builder_node")
 # The builder reports failure through build_status; either way the user sees the
 # result, so this is a plain edge rather than a router with one destination.
 workflow.add_edge("builder_node", "output_node")
-workflow.add_edge("output_node", "human_final_approval_node")
+# Nothing was produced, so there is nothing to approve: end the turn and let
+# the user reply instead of offering "Approve & Save" over an empty canvas.
+workflow.add_conditional_edges(
+    "output_node",
+    lambda state: END if state.get("build_failed") else "human_final_approval_node",
+    {END: END, "human_final_approval_node": "human_final_approval_node"},
+)
 workflow.add_conditional_edges(
     "human_final_approval_node",
     route_after_final_approval,

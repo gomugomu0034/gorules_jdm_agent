@@ -143,7 +143,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  clearProposal: () => set({ proposal: null }),
+  /**
+   * Resolve the proposal, and with it the approval gate that offered it.
+   *
+   * Accepting or rejecting on the canvas *is* the answer to the agent's
+   * "Approve & Save" question, so leaving the chips up would both duplicate a
+   * decision already made and keep the composer disabled - blocking the very
+   * follow-up ("now add a rule for...") the flow is built around.
+   */
+  clearProposal: () =>
+    set((s) => ({
+      proposal: null,
+      pending: s.pending?.kind === 'choice' ? null : s.pending,
+    })),
 }));
 
 type Setter = (partial: Partial<ChatState> | ((s: ChatState) => Partial<ChatState>)) => void;

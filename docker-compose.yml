@@ -41,6 +41,11 @@ services:
       - ./frontend:/app
       # Keep the Linux-built node_modules from being shadowed by the host's.
       - /app/node_modules
+      # Likewise .next: the container runs `next dev` while the host may run
+      # `npm run build`, and sharing this directory means a host build
+      # overwrites the dev server's bundles - which fails at runtime with
+      # "Could not find the module ... in the React Server Components manifest".
+      - /app/.next
 
     environment:
       # Browser-reachable, not the compose-internal hostname: the browser talks

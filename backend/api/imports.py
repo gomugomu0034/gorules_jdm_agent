@@ -7,8 +7,9 @@ import json
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 
+from backend import auth
 from backend.api.errors import ApiError
 from backend.api.graphs import _detail
 from backend.db import bootstrap, dao
@@ -77,6 +78,7 @@ def _read_zip(raw: bytes) -> tuple[dict, list, str | None]:
 async def import_graph(
     file: UploadFile = File(...),
     name: str | None = Form(default=None),
+    owner: str = Depends(auth.get_owner),
 ) -> ImportResponse:
     raw = await file.read()
     if len(raw) > MAX_UPLOAD_BYTES:
@@ -94,6 +96,7 @@ async def import_graph(
         derived = bootstrap.humanise(Path(filename).stem)
 
     graph = await dao.create_graph(
+        owner=owner,
         name=name or derived,
         content=content,
         description=f"Imported from {filename}",
@@ -103,5 +106,5 @@ async def import_graph(
     if tests:
         await dao.replace_tests(graph["id"], tests)
 
-    detail = await _detail(await dao.get_graph(graph["id"]))
+    detail = await _detail(await dao.get_graph(graph["id"], owner=owner))
     return ImportResponse(**detail.model_dump(), tests_imported=len(tests))

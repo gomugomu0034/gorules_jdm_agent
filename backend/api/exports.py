@@ -12,9 +12,10 @@ import zipfile
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 
+from backend import auth
 from backend.api.errors import ApiError
 from backend.api.graphs import require_graph
 from backend.db import dao
@@ -81,12 +82,59 @@ async def export_graph(
     graph_id: str,
     format: ExportFormat = Query(default="jdm"),
     version: int | None = Query(default=None),
+    owner: str = Depends(auth.get_owner),
 ) -> Response:
-    graph = await require_graph(graph_id, version)
+    graph = await require_graph(graph_id, version, owner=owner)
     tests = [
         {"name": t["name"], "input": t["input"], "expectedOutput": t["expectedOutput"]}
         for t in await dao.list_tests(graph_id)
     ]
     return export_response(
         format, graph["slug"], graph["name"], graph["content"], tests, graph.get("version")
+    )
+
+
+@router.get("/export-all", include_in_schema=True)
+async def export_all(owner: str = Depends(auth.get_owner)) -> Response:
+    """Every graph the caller owns, at its latest version, with its suite.
+
+    One zip holding a folder per policy, so a guest can take their whole
+    session's work away in a single click.
+    """
+    graphs = await dao.list_graphs(owner)
+    if not graphs:
+        raise ApiError("NOTHING_TO_EXPORT", "You have no policies to export.", 404)
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        names = []
+        for summary in graphs:
+            graph = await dao.get_graph(summary["id"], owner=owner)
+            if graph is None:
+                continue
+            slug = graph["slug"]
+            tests = [
+                {"name": t["name"], "input": t["input"],
+                 "expectedOutput": t["expectedOutput"]}
+                for t in await dao.list_tests(graph["id"])
+            ]
+            archive.writestr(
+                f"{slug}/{slug}_jdm.json", json.dumps(graph["content"], indent=2)
+            )
+            archive.writestr(
+                f"{slug}/{slug}_tests.json", json.dumps(tests, indent=2)
+            )
+            names.append(f"- {graph['name']} (v{graph['version']}, {len(tests)} tests)")
+
+        archive.writestr(
+            "README.md",
+            "# JDM Studio export\n\n"
+            f"Exported {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n\n"
+            + "\n".join(names)
+            + "\n\nEach folder holds a decision graph and its test suite.\n",
+        )
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return _attachment(
+        buffer.getvalue(), f"jdm-studio-{stamp}.zip", "application/zip"
     )
