@@ -79,7 +79,7 @@ Optionally on user request, attach a JSON Schema to validate incoming structure 
 
 ### 3.2 Output node (`outputNode`)
 Terminal node(s). Produces the final result of the evaluation.
-A graph can have multiple Output nodes reached via different branches (e.g., one for "approved", one for "rejected" after a Switch node).
+A graph can have multiple Output nodes reached via different branches (e.g., one for "approved", one for "rejected" after a Switch node). This is verified to compile, validate and evaluate. Prefer a single Output node when every path ends in the same shape of result; use several only when the branches genuinely terminate differently and naming them makes the graph easier to read.
 
 
 ### 3.3 Decision Table node (`decisionTableNode`)
@@ -122,7 +122,7 @@ The core rule-authoring construct: a spreadsheet of conditions → outcomes.
 **Authoring semantics:**
 - Input columns operate in one of three modes: 1) Field mode (in customer.age): unary test with $ bound to that field — >= 18, "US", ["US","CA"], [1..10], contains($, "x"), not in ["a","b"]. 2) Computed-field mode (in <expression>): the header is itself a ZEN expression, evaluated per row, with each cell a unary test against the result ($ bound to the computed value). The header expression reads input fields and $nodes.<ancestor> directly, but not $.. 3) Whole- expression mode (literal header in (expression)): no bound field; each cell is a full boolean ZEN expression.
 - Output columns (out rate) always name a field; the cell is a ZEN expression evaluated on match. Full output header grammar: out <field>[: <type>] [<Label>] — type and label coexist and are independent. The type is string, number, boolean, date, or a dictionary name (optionally [] for a list); it validates literal cells and narrows the field's type downstream. Dictionary names resolve through the graph's imports frontmatter; an unresolved name is a TYPE_MISMATCH on the header. Label position differs from policies: graph headers put [Label] AFTER the field, policy headers put "Label" before it.
-- Do not add "_" as the value in any cell. Keep blank cells for wildcards instead.
+- **Wildcard cells — two layers, two spellings.** In the **JDM JSON** a wildcard is the empty string `""`. In the **Markdown DSL you author**, write `_`; the parser normalises `_`, `-`, `""` and `''` to `""`. Use `_` in the DSL, because a genuinely blank cell in a markdown table is invisible and its column position is easy to miscount. Both mean the same thing: this column places no condition on this rule.
 - An **empty cell** in an input column is used to skip condition. Keep the cell blank if you don't want to use the input column in the condition.
 - An empty output cell drops its key entirely (no null) — this is what makes splitting an object-literal output column into per-field dotted columns shape- preserving.
 - Cell value conventions (each cell is a string):
@@ -202,7 +202,7 @@ Transforms/reshapes data using one ZEN expression per output row. Rows are evalu
 | `inputField` | Path to the array to iterate, e.g. `testResults` |
 | `outputPath` | Where the resulting array is placed in the output |
 
-Do not add "<root>" as inputField or outputPath. Do not add the inputField or outputPath keys unless required.
+**Transform paths — two layers, two spellings.** In the **JDM JSON**, omit `inputField`/`outputPath` entirely unless the node needs them; an unused key must never carry the literal string `"<root>"`. In the **Markdown DSL you author**, write `<root>` to mean "not set" — the parser turns it into `""`.
 Always set `outputPath` in loop mode — otherwise the array lands unnamed at the root.
 Default output replaces input; set passThrough: true if you want the upstream fields to remain alongside.
 
@@ -224,6 +224,7 @@ export const handler = async (input) => {
 };
 ```
 
+- This block is **JavaScript**, and it is the only place in a graph where JavaScript syntax is valid. `===`, `!==`, `&&` and `||` belong here and nowhere else: in a ZEN expression or a decision table cell they fail to lex. ZEN uses `==`, `!=`, `and`, `or`, `not`.
 - Inputs arrive as the function's single `input` argument (includes `$nodes` for upstream node outputs).
 - Supports `async`/`await`; importable modules include `zen` (invoke other ZEN decisions from JS), `dayjs`, `big.js`, `http`.
 - Prefer Decision Tables / Expression nodes for anything a business user should be able to read and modify. Reach for Function nodes only when expressions genuinely can't do the job — they are the least transparent, least auditable node  type.
@@ -423,7 +424,7 @@ Each intermediate table has `passThrough: true` so downstream nodes can see all 
 1. **Validation table** — a `collect`-hit-policy decision table where each row detects one invalid condition and emits an error + `isValid: false`; a catch-all row emits `isValid: true`.
 2. **Switch node** — routes `valid` → continue processing; `invalid`/`len(errors) > 0` → go straight to an error Output node.
 
-This avoids wasted computation on bad input and gives specific, traceable error messages — always include this pattern when the requirement lists validation rules or "must be rejected if..." conditions.
+This avoids wasted computation on bad input and gives specific, traceable error messages. Include this pattern when the requirements state validation rules or "must be rejected if..." conditions — those are business rules and belong in the graph. Do not add it other than that: schema-shape checking is not the graph's job, so never invent validation the requirements did not ask for.
 
 ### 5.6 Array / loop patterns
 
@@ -718,20 +719,24 @@ The validation codes surface nested under a top-level InvalidGraph error (source
 
 CRITICAL_CONSISTENCY_RULES = """
 CRITICAL CONSISTENCY RULES:
-1. GRAPH SIMPLICITY: Keep the JDM graph as simple as possible. Do not over- engineer. Combine multiple conditions into a single node (e.g., a comprehensive decision table) whenever possible to minimize the total number of nodes.
+1. ONE RESPONSIBILITY PER NODE: Give each node a single job, and name it after that job. Split the policy along the seams the business already has - deriving values, validating, scoring, pricing, routing - so a reader can point at the node that owns a rule, and a failing test names the node that broke.
+    - A decision table answers ONE question. If a table's outputs serve two different decisions, or a column exists only to carry a value through, that is two nodes.
+    - Split a table before it passes ~25 rows.
+    - Compute derived values in an `expression` node ahead of the table that uses them, rather than repeating the arithmetic in every cell.
+    - Do not add nodes that carry no logic. Decomposition means separating responsibilities, not inserting pass-through steps: a policy that genuinely has one rule is one table, and that is correct.
 2. GRAPH LAYOUT & POSITIONING: To ensure the visual graph is readable, you MUST assign a `position: <x>, <y>` property to every node defined in the `# Nodes` section.
     - Anchor: Always place the initial `type: input` node at `position: 100, 200`.
     - Sequential Nodes: Add exactly 300 to the X-axis for each subsequent step (e.g., if Node 1 is at `100, 200`, the next is `400, 200`).
     - Parallel Branches: When a switch node routes to multiple target nodes, place all target nodes at the same X-axis (+300 from the switch), but separate their Y- axis by 400 units (e.g., Branch A at `700, 200`, Branch B at `700, 600`, Branch C at `700, 1000`).
-3. NO INPUT VALIDATION: Do not create nodes to validate the input data/schema unless the user explicitly requests validation rules. Assume the input matches the schema.
-4. SINGLE OUTPUT NODE: Use exactly ONE output node (e.g., `type: output`) whenever possible. Do NOT make separate output nodes for "error" and "success" cases. Route all terminal paths to the same single output node.
+3. VALIDATE ONLY WHAT WAS ASKED FOR: Assume the input matches the schema - never add nodes that re-check its shape or types. But when the requirements state validation rules or "must be rejected if..." conditions, those are business rules: build them with the validation pattern in section 5.5.
+4. PREFER ONE OUTPUT NODE: Route terminal paths to a single output node when they all produce the same shape of result. Multiple output nodes are legal and evaluate correctly, so use a separate one only when a branch genuinely ends differently and naming it makes the graph clearer.
 5. DEFAULT HIT POLICY: Always use `hitPolicy: first` for decision tables unless the specific requirements explicitly demand multiple rules triggering (e.g., `collect`).
 6. NO EXTERNAL GRAPHS: Do NOT use `type: decision` (which is used to call a separate external graph) unless the user specifically asks to call another graph.
 7. SWITCH NODE MATCHING: If a node routes traffic to multiple different nodes in your Mermaid diagram (e.g., it has conditional arrows like `RoutingNode - ->|condition| TargetA`), that node MUST be defined with `type: switch` in the `# Nodes` section.
     - NEVER define a routing node as `type: expression`.
     - Expression nodes CANNOT have multiple outgoing conditional edges.
 8. SWITCH BULLETS: If you define a `type: switch` node, you MUST provide the routing bullets (e.g., `- condition => TargetA`) and they must perfectly match the targets in your Mermaid diagram.
-9. EMPTY CELLS: Use `_` for empty decision table cells, and `<root>` for empty transform paths.
+9. EMPTY CELLS: You are writing the Markdown DSL, not raw JDM JSON, so use `_` for empty decision table cells and `<root>` for empty transform paths. The parser converts both to the empty string the engine expects. (Sections 3.3 and 3.4 describe the JSON side, where the same things are written `""`.)
 10. EXPRESSION VARIABLE REFERENCING: Inside a `type: expression` node, expressions are evaluated sequentially within a single expressionNode. If a lower expression of an expressionNode references a key calculated by a higher expression within the *same node*, you MUST use the `$.` prefix (e.g., if line 1 is `fee = 50`, line 2 must be `total = amount + $.fee`). This is not applicable across different expressionNodes.
 """
 
@@ -773,13 +778,13 @@ Most "missing field" or "undefined" errors occur because data was dropped betwee
 
 ### Decision Table Node (`type: decisionTable`)
 - **Type Mismatches**: A frequent cause of `NodeError`. If the input field is a string, the table cell must be quoted (e.g., `"gold"`). If it is a number, it must be unquoted (e.g., `100`, `< 50`).
-- **Missing Columns**: If an input column is not required for a specific rule, use the `_` wildcard placeholder. Do not leave it entirely blank or use empty quotes (`""`).
+- **Missing Columns**: If an input column places no condition on a rule, write `_` in that cell of the Markdown DSL - not a blank, and not empty quotes (`""`). The parser converts `_` to the empty string the engine expects, and an explicit `_` keeps the column positions countable by eye.
 - **Hit Policy outputs**: Remember that `hitPolicy: collect` outputs an ARRAY of results, whereas `first` outputs a SINGLE object. Downstream nodes must be prepared for arrays if `collect` is used.
 
 ### Switch Node (`type: switch`)
 - **The "Graph Did Not Halt / No Target" Error**: A switch node evaluates conditions top-to-bottom. If NO condition matches, and there is no default fallback, execution dies silently.
 - **The Golden Rule of Switches**: ALWAYS include a default catch-all statement (`- _ => TargetNode`) at the bottom of the switch node to prevent edge-case dead ends.
-- **Redundancy**: Each statement should point to a distinct target. If multiple conditions route to the exact same node, combine them using logical OR (`||`) in a single statement.
+- **Redundancy**: Each statement should point to a distinct target. If multiple conditions route to the exact same node, combine them into one statement with the `or` keyword (e.g. `tier == 'gold' or tier == 'platinum' => Premium`). ZEN has **no** `||` operator - it fails to lex, with `{"type":"lexerError","source":"Unmatched symbol: |"}`. The logical operators are `and`, `or`, `not`. For a list of alternatives, `tier in ['gold', 'platinum']` reads better than a chain of `or`.
 
 ### Function Node (`type: function`)
 - **Syntax**: GoRules executes JavaScript in these nodes. The trace will provide the exact line number of the failure.
