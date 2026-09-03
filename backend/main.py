@@ -1,0 +1,95 @@
+"""FastAPI application for GoRules JDM Studio."""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+from backend.api import chat, exports, graphs, health, imports, simulate, tests
+from backend.api.errors import register_error_handlers
+from backend.config import settings
+from backend import agent_runtime
+from backend.db import bootstrap, connection
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+limiter = Limiter(key_func=get_remote_address, default_limits=[settings.rate_limit_default])
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await connection.connect()
+    await bootstrap.bootstrap()
+    await agent_runtime.startup()
+    logger.info("%s %s ready (db=%s)", settings.app_name, settings.version, settings.db_path)
+    try:
+        yield
+    finally:
+        await agent_runtime.shutdown()
+        await connection.disconnect()
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.version,
+    lifespan=lifespan,
+)
+
+app.state.limiter = limiter
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request.state.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
+
+
+register_error_handlers(app)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limited(request: Request, exc: RateLimitExceeded):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "code": "RATE_LIMITED",
+                "message": "Too many requests; slow down.",
+                "detail": str(exc.detail),
+                "request_id": getattr(request.state, "request_id", None),
+            }
+        },
+    )
+
+
+app.include_router(health.router)
+app.include_router(graphs.router)
+app.include_router(imports.router)
+app.include_router(exports.router)
+app.include_router(simulate.router)
+app.include_router(tests.router)
+app.include_router(chat.router)

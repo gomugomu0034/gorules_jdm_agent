@@ -1,0 +1,232 @@
+{
+  "contentType": "application/vnd.gorules.decision",
+  "nodes": [
+    {
+      "id": "aa3a27c4-a3b0-4e48-b0db-eb5d44949a99",
+      "name": "Input",
+      "type": "inputNode",
+      "content": {
+        "schema": ""
+      },
+      "position": {
+        "x": 100,
+        "y": 200
+      }
+    },
+    {
+      "id": "0268a348-f160-49a1-9999-4c2be0a73bad",
+      "name": "RefundEligibility",
+      "type": "decisionTableNode",
+      "content": {
+        "hitPolicy": "first",
+        "passThrough": true,
+        "executionMode": "single",
+        "inputField": "",
+        "outputPath": "",
+        "inputs": [
+          {
+            "id": "54050a89-ee31-4df5-aa96-9ea7a9e31042",
+            "name": "Product Type",
+            "field": "productType"
+          },
+          {
+            "id": "407c8ae9-566a-4589-8bf4-ca7096dbc9e2",
+            "name": "Days Since Purchase",
+            "field": "daysSincePurchase"
+          },
+          {
+            "id": "f18bdb45-e0c6-410e-8261-f8a1930ad980",
+            "name": "Condition",
+            "field": "condition"
+          },
+          {
+            "id": "83b00856-b591-4264-b3c0-010bb556bb16",
+            "name": "Discount %",
+            "field": "discountPercentage"
+          },
+          {
+            "id": "1a7176f2-8e62-412e-9eea-f211d03e7b53",
+            "name": "Refund Requests/Year",
+            "field": "refundRequestsThisYear"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "e3eff424-bb55-467a-9a5e-206c715abd36",
+            "name": "Refund Type",
+            "field": "refundType"
+          },
+          {
+            "id": "4d4f6ef1-e746-4d75-a5aa-20fa3685b605",
+            "name": "%",
+            "field": "refundPercentage"
+          },
+          {
+            "id": "ccbbd9e1-e0df-4a41-9771-ca82e6eaee08",
+            "name": "Reason",
+            "field": "reason"
+          },
+          {
+            "id": "9e4e307d-2d96-4642-9cac-cfa6e885a7d9",
+            "name": "Method",
+            "field": "refundMethod"
+          },
+          {
+            "id": "6297d1bc-b0bf-421d-872c-e1b4134e371e",
+            "name": "Processing",
+            "field": "processingTime"
+          },
+          {
+            "id": "8a7845ec-a46e-4483-922c-5ca8f383a780",
+            "name": "Eligible",
+            "field": "eligible"
+          }
+        ],
+        "rules": [
+          {
+            "_id": "f9a9e4fe-564b-46cb-bd21-834df42c0391",
+            "54050a89-ee31-4df5-aa96-9ea7a9e31042": "in ['giftCard','customized','perishable']",
+            "407c8ae9-566a-4589-8bf4-ca7096dbc9e2": "",
+            "f18bdb45-e0c6-410e-8261-f8a1930ad980": "",
+            "83b00856-b591-4264-b3c0-010bb556bb16": "",
+            "1a7176f2-8e62-412e-9eea-f211d03e7b53": "",
+            "e3eff424-bb55-467a-9a5e-206c715abd36": "rejected",
+            "4d4f6ef1-e746-4d75-a5aa-20fa3685b605": "0",
+            "ccbbd9e1-e0df-4a41-9771-ca82e6eaee08": "Non-refundable item type",
+            "9e4e307d-2d96-4642-9cac-cfa6e885a7d9": "N/A",
+            "6297d1bc-b0bf-421d-872c-e1b4134e371e": "N/A",
+            "8a7845ec-a46e-4483-922c-5ca8f383a780": "false"
+          },
+          {
+            "_id": "aec31cc8-2aab-4bc1-ad7d-2e60db58daff",
+            "54050a89-ee31-4df5-aa96-9ea7a9e31042": "",
+            "407c8ae9-566a-4589-8bf4-ca7096dbc9e2": "> 30",
+            "f18bdb45-e0c6-410e-8261-f8a1930ad980": "",
+            "83b00856-b591-4264-b3c0-010bb556bb16": "",
+            "1a7176f2-8e62-412e-9eea-f211d03e7b53": "",
+            "e3eff424-bb55-467a-9a5e-206c715abd36": "rejected",
+            "4d4f6ef1-e746-4d75-a5aa-20fa3685b605": "0",
+            "ccbbd9e1-e0df-4a41-9771-ca82e6eaee08": "Past 30-day refund window",
+            "9e4e307d-2d96-4642-9cac-cfa6e885a7d9": "N/A",
+            "6297d1bc-b0bf-421d-872c-e1b4134e371e": "N/A",
+            "8a7845ec-a46e-4483-922c-5ca8f383a780": "false"
+          },
+          {
+            "_id": "a0bc2222-a971-49b9-8e76-ab537eb2ae2f",
+            "54050a89-ee31-4df5-aa96-9ea7a9e31042": "",
+            "407c8ae9-566a-4589-8bf4-ca7096dbc9e2": "",
+            "f18bdb45-e0c6-410e-8261-f8a1930ad980": "",
+            "83b00856-b591-4264-b3c0-010bb556bb16": "",
+            "1a7176f2-8e62-412e-9eea-f211d03e7b53": "> 3",
+            "e3eff424-bb55-467a-9a5e-206c715abd36": "manualReview",
+            "4d4f6ef1-e746-4d75-a5aa-20fa3685b605": "0",
+            "ccbbd9e1-e0df-4a41-9771-ca82e6eaee08": "Flagged for manual review - excessive refund requests",
+            "9e4e307d-2d96-4642-9cac-cfa6e885a7d9": "originalPaymentMethod",
+            "6297d1bc-b0bf-421d-872c-e1b4134e371e": "5-10 business days",
+            "8a7845ec-a46e-4483-922c-5ca8f383a780": "false"
+          },
+          {
+            "_id": "afca5983-11f2-4059-bc04-3d8f0de0fbbb",
+            "54050a89-ee31-4df5-aa96-9ea7a9e31042": "",
+            "407c8ae9-566a-4589-8bf4-ca7096dbc9e2": "",
+            "f18bdb45-e0c6-410e-8261-f8a1930ad980": "",
+            "83b00856-b591-4264-b3c0-010bb556bb16": ">= 30",
+            "1a7176f2-8e62-412e-9eea-f211d03e7b53": "",
+            "e3eff424-bb55-467a-9a5e-206c715abd36": "storeCredit",
+            "4d4f6ef1-e746-4d75-a5aa-20fa3685b605": "100",
+            "ccbbd9e1-e0df-4a41-9771-ca82e6eaee08": "Store credit - discounted item",
+            "9e4e307d-2d96-4642-9cac-cfa6e885a7d9": "storeCredit",
+            "6297d1bc-b0bf-421d-872c-e1b4134e371e": "5-10 business days",
+            "8a7845ec-a46e-4483-922c-5ca8f383a780": "true"
+          },
+          {
+            "_id": "d9b3de52-f9e4-48ff-a88c-9722d3d2bb38",
+            "54050a89-ee31-4df5-aa96-9ea7a9e31042": "digital",
+            "407c8ae9-566a-4589-8bf4-ca7096dbc9e2": "",
+            "f18bdb45-e0c6-410e-8261-f8a1930ad980": "!= 'new'",
+            "83b00856-b591-4264-b3c0-010bb556bb16": "",
+            "1a7176f2-8e62-412e-9eea-f211d03e7b53": "",
+            "e3eff424-bb55-467a-9a5e-206c715abd36": "rejected",
+            "4d4f6ef1-e746-4d75-a5aa-20fa3685b605": "0",
+            "ccbbd9e1-e0df-4a41-9771-ca82e6eaee08": "Digital product must be unused for refund",
+            "9e4e307d-2d96-4642-9cac-cfa6e885a7d9": "N/A",
+            "6297d1bc-b0bf-421d-872c-e1b4134e371e": "N/A",
+            "8a7845ec-a46e-4483-922c-5ca8f383a780": "false"
+          },
+          {
+            "_id": "cb0ac430-5706-4f02-bfc8-4eaa9c65e486",
+            "54050a89-ee31-4df5-aa96-9ea7a9e31042": "",
+            "407c8ae9-566a-4589-8bf4-ca7096dbc9e2": "",
+            "f18bdb45-e0c6-410e-8261-f8a1930ad980": "'new'",
+            "83b00856-b591-4264-b3c0-010bb556bb16": "",
+            "1a7176f2-8e62-412e-9eea-f211d03e7b53": "",
+            "e3eff424-bb55-467a-9a5e-206c715abd36": "full",
+            "4d4f6ef1-e746-4d75-a5aa-20fa3685b605": "100",
+            "ccbbd9e1-e0df-4a41-9771-ca82e6eaee08": "Full refund - item in original condition",
+            "9e4e307d-2d96-4642-9cac-cfa6e885a7d9": "originalPaymentMethod",
+            "6297d1bc-b0bf-421d-872c-e1b4134e371e": "5-10 business days",
+            "8a7845ec-a46e-4483-922c-5ca8f383a780": "true"
+          },
+          {
+            "_id": "ead56acb-a807-453e-96cc-533bd7ace256",
+            "54050a89-ee31-4df5-aa96-9ea7a9e31042": "",
+            "407c8ae9-566a-4589-8bf4-ca7096dbc9e2": "",
+            "f18bdb45-e0c6-410e-8261-f8a1930ad980": "in ['used','damaged']",
+            "83b00856-b591-4264-b3c0-010bb556bb16": "",
+            "1a7176f2-8e62-412e-9eea-f211d03e7b53": "",
+            "e3eff424-bb55-467a-9a5e-206c715abd36": "partial",
+            "4d4f6ef1-e746-4d75-a5aa-20fa3685b605": "80",
+            "ccbbd9e1-e0df-4a41-9771-ca82e6eaee08": "Partial refund - item shows signs of use",
+            "9e4e307d-2d96-4642-9cac-cfa6e885a7d9": "originalPaymentMethod",
+            "6297d1bc-b0bf-421d-872c-e1b4134e371e": "5-10 business days",
+            "8a7845ec-a46e-4483-922c-5ca8f383a780": "true"
+          },
+          {
+            "_id": "18635f96-490c-4925-b080-716e53730141",
+            "54050a89-ee31-4df5-aa96-9ea7a9e31042": "",
+            "407c8ae9-566a-4589-8bf4-ca7096dbc9e2": "",
+            "f18bdb45-e0c6-410e-8261-f8a1930ad980": "",
+            "83b00856-b591-4264-b3c0-010bb556bb16": "",
+            "1a7176f2-8e62-412e-9eea-f211d03e7b53": "",
+            "e3eff424-bb55-467a-9a5e-206c715abd36": "rejected",
+            "4d4f6ef1-e746-4d75-a5aa-20fa3685b605": "0",
+            "ccbbd9e1-e0df-4a41-9771-ca82e6eaee08": "Refund not eligible",
+            "9e4e307d-2d96-4642-9cac-cfa6e885a7d9": "N/A",
+            "6297d1bc-b0bf-421d-872c-e1b4134e371e": "N/A",
+            "8a7845ec-a46e-4483-922c-5ca8f383a780": "false"
+          }
+        ]
+      },
+      "position": {
+        "x": 400,
+        "y": 200
+      }
+    },
+    {
+      "id": "cb037db8-352d-4a3c-a661-130d7263d85f",
+      "name": "Output",
+      "type": "outputNode",
+      "content": {
+        "schema": ""
+      },
+      "position": {
+        "x": 700,
+        "y": 200
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "680d9dad-d349-4875-b45d-3e3a84f3a72f",
+      "sourceId": "aa3a27c4-a3b0-4e48-b0db-eb5d44949a99",
+      "targetId": "0268a348-f160-49a1-9999-4c2be0a73bad",
+      "type": "edge"
+    },
+    {
+      "id": "d2acce54-8a29-4a7b-bf7a-b0933132252e",
+      "sourceId": "0268a348-f160-49a1-9999-4c2be0a73bad",
+      "targetId": "cb037db8-352d-4a3c-a661-130d7263d85f",
+      "type": "edge"
+    }
+  ]
+}

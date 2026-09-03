@@ -1,0 +1,59 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: gorules_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Source mount for hot reload during development.
+      - .:/app
+      # A named volume for SQLite. Do NOT keep the database on a bind-mounted
+      # macOS path: file locking over osxfs is unreliable and WAL mode needs it.
+      - studio_data:/app/data
+    env_file:
+      - ./backend/.env
+    environment:
+      - DB_PATH=/app/data/studio.db
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 25s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      # The `deps` stage carries node_modules for `next dev`; the final stage is
+      # a production standalone image without them.
+      target: deps
+    container_name: gorules_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      # Keep the Linux-built node_modules from being shadowed by the host's.
+      - /app/node_modules
+
+    environment:
+      # Browser-reachable, not the compose-internal hostname: the browser talks
+      # to FastAPI directly so SSE is not buffered by Next's rewrite proxy.
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - BACKEND_URL=http://backend:8000
+    # Docker keeps the anonymous node_modules volume across `compose up --build`,
+    # so a container recreated after a dependency change would otherwise start
+    # with a stale module tree and fail at import. Reconciling on boot is a few
+    # seconds when nothing changed, and self-healing when it has.
+    command: sh -c "npm install --no-audit --no-fund && npm run dev"
+    depends_on:
+      - backend
+
+volumes:
+  studio_data:
