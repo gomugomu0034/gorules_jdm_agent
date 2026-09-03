@@ -31,8 +31,19 @@ def check_jdm_format(jdm_content: str, tests_content: str) -> tuple[bool, any]:
         if "nodes" not in parsed_jdm or "edges" not in parsed_jdm:
             return False, "JDM missing 'nodes' or 'edges'."
 
+        if not parsed_jdm["nodes"]:
+            # An empty graph used to pass this gate and then fail deep inside the engine
+            # as an opaque `invalidInputCount`, once per test case.
+            return False, "The graph has no nodes."
+
         if not isinstance(parsed_tests, list):
             return False, "Test suite must be a JSON array."
+
+        if not parsed_tests:
+            return False, (
+                "The test suite is empty. Write at least one case as "
+                '{"name": ..., "input": {...}, "expectedOutput": {...}}.'
+            )
 
         return True, (parsed_jdm, parsed_tests)
 
@@ -307,4 +318,19 @@ def evaluate_against_zen(jdm_content: str, parsed_tests: list) -> tuple[bool, st
     summary = report["summary"]
     if summary["failed"] or summary["errored"]:
         return False, _format_failures_for_llm(report)
+
+    # A case with no `expectedOutput` is skipped rather than run, so a suite made entirely
+    # of skips reports zero failures while asserting nothing - and the build would be
+    # declared SUCCESS on the strength of it. Nothing proven is not the same as passing.
+    if summary["total"] and not summary["passed"]:
+        return False, (
+            f"NO ASSERTIONS RAN: {summary['skipped']} of {summary['total']} test cases were "
+            "skipped because they have no \"expectedOutput\", so the graph was never actually "
+            "checked.\n\n"
+            "Rewrite the suite so every case is an object with \"name\", \"input\" and "
+            "\"expectedOutput\", where \"expectedOutput\" holds the fields the graph must "
+            "return for that input. Matching is by subset, so assert only the fields the "
+            "policy decides - you do not need to repeat the input fields."
+        )
+
     return True, _format_success(report)

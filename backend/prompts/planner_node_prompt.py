@@ -12,7 +12,11 @@ ADDITIONAL_KNOWLEDGE_BASE = {ADDITIONAL_DOMAIN_KNOWLEDGE_BASE}
 2. Draft a clear step-by-step implementation plan.
 3. Output the exact Graph DSL inside ---DSL STARTS--- and ---DSL ENDS--- boundaries.
 4. Output the Test Suite JSON inside ---TESTS STARTS--- and ---TESTS ENDS--- boundaries.
-5. Output the Usecase Name inside ---USECASE NAME STARTS--- and --- USECASE NAME ENDS--- boundaries.
+5. Output the Usecase Name inside ---USECASE NAME STARTS--- and ---USECASE NAME ENDS--- boundaries.
+
+# MARKERS ARE MATCHED LITERALLY
+The six boundary markers are compared byte for byte. Write them exactly as shown, with no
+extra spaces inside the dashes, and put each on its own line.
 
 # 🚨 CRITICAL RULE FOR MODIFYING EXISTING GRAPHS 🚨
 If the conversation history contains an "EXISTING JDM JSON", you are in MODIFICATION MODE. You must strictly adhere to these rules:
@@ -38,14 +42,14 @@ EXAMPLE MARKDOWN DSL FORMAT:
 
 ---DSL STARTS---
 # Structure
-` ` `mermaid
+```mermaid
 flowchart LR
 Application --> riskScore
 riskScore --> tierPricing
 tierPricing --> routing
 routing -->|amount > 1000| manualReview
 routing -->|_| regionalRules
-` ` `
+```
 
 # Nodes
 ## Application
@@ -58,10 +62,10 @@ executionMode: single
 inputField: <root>
 outputPath: <root>
 
-` ` `expressions
+```expressions
 score = base * 1.1
 totals.net = $.score - fees
-` ` `
+```
 
 ## tierPricing
 type: decisionTable
@@ -96,12 +100,36 @@ outputPath: results
 
 ---DSL ENDS---
 
+TEST CASE RULES:
+Every case is an object with three keys: "name", "input", and "expectedOutput".
+- "expectedOutput" is REQUIRED on every case. A case without it is not run - it is
+  skipped - so a suite of such cases proves nothing and the build is rejected.
+- Matching is by subset: assert only the fields you care about. Because nodes pass data
+  through by default, the input fields also appear in the result; you do not need to
+  repeat them in "expectedOutput".
+- Name each case after the behaviour it pins down ("senior gets the age discount"), not
+  after its number, so a failure says what broke.
+- Cover the boundary on both sides of every threshold, plus the catch-all row.
+
 EXAMPLE TEST CASES FORMAT:
 ---TESTS STARTS---
 ```json
 [
-{{ "amount": 1500, "customer": {{"age": 45}} }},
-{{ "amount": 500, "customer": {{"age": 70}} }}
+  {{
+    "name": "Senior qualifies for the age rate",
+    "input": {{ "amount": 500, "customer": {{ "age": 70 }} }},
+    "expectedOutput": {{ "rate": 0.12 }}
+  }},
+  {{
+    "name": "Boundary: age 65 exactly still qualifies",
+    "input": {{ "amount": 500, "customer": {{ "age": 65 }} }},
+    "expectedOutput": {{ "rate": 0.12 }}
+  }},
+  {{
+    "name": "Large order routes to manual review",
+    "input": {{ "amount": 1500, "customer": {{ "age": 45 }} }},
+    "expectedOutput": {{ "manual": true }}
+  }}
 ]
 ```
 ---TESTS ENDS---

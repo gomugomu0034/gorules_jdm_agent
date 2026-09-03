@@ -100,7 +100,12 @@ def test_create_policy_end_to_end(client):
     progress = [e for e in events if e["type"] == "progress"]
     assert progress, "the builder loop must report live progress"
     assert progress[0]["node"] == "builder_node"
-    assert progress[0]["max_attempts"] == 8
+    # The repair budget is derived from the run's wall clock rather than fixed, so assert
+    # the property that matters: it is reported, and it cannot outlive the run it is spent
+    # inside. A hardcoded ceiling was how 8 x 120s came to exceed the 900s run timeout.
+    budget = progress[0]["max_attempts"]
+    assert budget >= 1
+    assert (budget - 1) * agent.LLM_TIMEOUT_SECONDS < agent.AGENT_RUN_TIMEOUT_SECONDS
 
     proposed = next(e for e in events if e["type"] == "graph_proposed")
     assert proposed["jdm"]["nodes"]

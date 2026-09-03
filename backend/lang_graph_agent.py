@@ -1,3 +1,4 @@
+import time
 import json
 import re
 import os
@@ -53,6 +54,27 @@ ACTIVE_PROVIDER = os.getenv("LLM_PROVIDER", "huggingface").lower()
 # Every provider gets the same ceiling; a hung call would otherwise stall a run
 # until the agent-level wall-clock budget fires.
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT", "120"))
+
+# Generating a delimited DSL is a format-following task, not a creative one, and the repair
+# loop depends on the same input producing the same output. Only Gemini pinned this before;
+# the other three ran at whatever the provider defaults to.
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
+
+# The whole-run budget enforced by `asyncio.wait_for` in chat_runner. Mirrors
+# `settings.agent_run_timeout`; the builder needs it to size its repair loop.
+AGENT_RUN_TIMEOUT_SECONDS = int(os.getenv("AGENT_RUN_TIMEOUT", "900"))
+
+
+def _max_build_attempts() -> int:
+    """How many builder passes fit inside the run's wall clock.
+
+    Attempt 0 spends no LLM call, so N attempts cost N-1 calls. The old fixed ceiling of 8
+    could spend 960s against a 900s run budget - and when that budget fires, `asyncio.wait_for`
+    discards the turn while this node has checkpointed nothing, losing every repair it made.
+    Leave room for the planner call that precedes the loop and the reporting that follows.
+    """
+    usable = AGENT_RUN_TIMEOUT_SECONDS - LLM_TIMEOUT_SECONDS  # the planner's own call
+    return max(2, min(8, 1 + int(usable * 0.8) // max(LLM_TIMEOUT_SECONDS, 1)))
 
 # Gemini Config
 GOOGLE_API_KEY = os.getenv("GOOGLE_AI_API_KEY")
@@ -175,7 +197,7 @@ def _call_gemini(sys_prompt: str, messages: list) -> str:
 
     config = types.GenerateContentConfig(
         system_instruction=sys_prompt,
-        temperature=0.0,
+        temperature=LLM_TEMPERATURE,
         http_options=types.HttpOptions(timeout=LLM_TIMEOUT_SECONDS * 1000),
     )
     response = gemini_client.models.generate_content(
@@ -189,7 +211,7 @@ def _call_litellm(sys_prompt: str, messages: list) -> str:
     response = litellm_client.chat.completions.create(
         model=LITELLM_MODEL_NAME, messages=formatted,
         timeout=LLM_TIMEOUT_SECONDS,
-        # temperature=0.0
+        temperature=LLM_TEMPERATURE,
     )
     return response.choices[0].message.content
 
@@ -214,6 +236,7 @@ def _call_huggingface(sys_prompt: str, messages: list) -> str:
         model=model,
         messages=formatted,
         timeout=LLM_TIMEOUT_SECONDS,
+        temperature=LLM_TEMPERATURE,
     )
     return response.choices[0].message.content
 
@@ -232,6 +255,7 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
     payload = {
         "model": OPENROUTER_MODEL_NAME,
         "messages": formatted,
+        "temperature": LLM_TEMPERATURE,
     }
     if OPENROUTER_REASONING_ENABLED:
         payload["reasoning"] = {"enabled": True}
@@ -303,6 +327,7 @@ class AgentState(TypedDict):
     evaluation_feedback: str
     build_status: str
     build_failed: bool
+    build_attempts_used: int  # Repair budget spent so far, across re-entries to the builder
     final_approval_status: str
     usecase_name: str
     mode: str  # "NEW" or "EXISTING"
@@ -375,23 +400,101 @@ def _extract_single_json(text: str) -> str:
     return text.strip()
 
 
-def _extract_bounded_text(content: str, start_marker: str, end_marker: str, strip_lang: str = "") -> str:
-    """Extracts text between custom markers and strips any rogue markdown backticks."""
-    # Find text between markers
-    pattern = rf'{start_marker}\s*(.*?)\s*{end_marker}'
-    match = re.search(pattern, content, re.DOTALL)
+# A fence that opens on the first line and closes on the last: the only shape that can be
+# a *wrapper* rather than part of the payload.
+_WRAPPING_FENCE_RE = re.compile(r'^```([^\s`]*)[^\S\n]*\n(.*)\n```$', re.DOTALL)
 
+
+def _unwrap_fence(text: str, expect_lang: str = "") -> str:
+    """Remove a code fence, but only one that encloses the whole of `text`.
+
+    The DSL legitimately *contains* fences - ```mermaid for the flowchart, ```expressions,
+    ```js - so a stripper that removes any leading backticks eats the mermaid fence and
+    leaves the bare word "mermaid" behind. That parses to a graph with no edges and raises
+    nothing, which is exactly the failure `backend/debug_graph.md` was left behind by.
+
+    A fence is treated as a wrapper only when it opens at the very start, closes at the very
+    end, and its language tag is either absent or the one we asked for.
+    """
+    match = _WRAPPING_FENCE_RE.match(text.strip())
+    if not match:
+        return text.strip()
+    lang = match.group(1).lower()
+    if lang and expect_lang and lang != expect_lang.lower():
+        # e.g. ```mermaid where we expected ```markdown: this is content, not a wrapper.
+        return text.strip()
+    return match.group(2).strip()
+
+
+def _extract_bounded_text(content: str, start_marker: str, end_marker: str, strip_lang: str = "") -> str:
+    """Extract the text between two literal markers, unwrapping an enclosing fence."""
+    pattern = rf'{re.escape(start_marker)}\s*(.*?)\s*{re.escape(end_marker)}'
+    match = re.search(pattern, content, re.DOTALL)
     if not match:
         return ""
-    text = match.group(1).strip()
-    # Strip rogue opening backticks (e.g., ```markdown or ```json)
-    if text.startswith('```'):
-        text = re.sub(rf'^```(?:{strip_lang})?\s*', '', text, flags=re.IGNORECASE)
-    # Strip rogue closing backticks
-    if text.endswith('```'):
-        text = re.sub(r'```$', '', text).strip()
+    return _unwrap_fence(match.group(1), strip_lang)
 
-    return text.strip()
+
+def _fenced_block(content: str, lang: str) -> str:
+    """First fenced block tagged `lang`, matched to *its own* closing fence.
+
+    Depth matters here: the DSL nests ```mermaid and ```js inside, so a non-greedy regex
+    stops at the first inner close and silently truncates the block. A line of bare
+    backticks closes; a line of backticks with a language tag opens.
+    """
+    lines = content.split("\n")
+    opener = re.compile(rf'^\s*```{re.escape(lang)}\s*$', re.IGNORECASE)
+    start = next((i for i, line in enumerate(lines) if opener.match(line)), None)
+    if start is None:
+        return ""
+
+    depth = 0
+    for i in range(start, len(lines)):
+        fence = lines[i].strip()
+        if not fence.startswith("```"):
+            continue
+        if fence == "```":
+            depth -= 1
+            if depth == 0:
+                return "\n".join(lines[start + 1:i]).strip()
+        else:
+            depth += 1
+    return ""
+
+
+def _extract_plan_blocks(content: str) -> tuple[str, str, str]:
+    """Pull (dsl, tests, usecase_name) out of a planner or builder reply.
+
+    The markers are the contract, but a small model follows a long format imperfectly, and
+    an unparseable reply costs a whole attempt. So each block falls back to the shape the
+    model most plausibly reached for instead: a fenced block, or - for the DSL, which has an
+    unmistakable "# Structure" / "# Nodes" skeleton - the raw text itself.
+    """
+    dsl = _extract_bounded_text(content, "---DSL STARTS---", "---DSL ENDS---", strip_lang="markdown")
+    tests = _extract_bounded_text(content, "---TESTS STARTS---", "---TESTS ENDS---", strip_lang="json")
+    usecase = _extract_bounded_text(content, "---USECASE NAME STARTS---", "---USECASE NAME ENDS---")
+
+    if not dsl:
+        dsl = _fenced_block(content, "markdown")
+    if not dsl and "# Structure" in content and "# Nodes" in content:
+        # Unfenced and unmarked, but structurally unmistakable. Take from the heading to
+        # wherever the tests begin, so a trailing JSON array is not swept into the DSL.
+        body = content[content.index("# Structure"):]
+        for boundary in ("---TESTS STARTS---", "---USECASE NAME STARTS---"):
+            if boundary in body:
+                body = body[: body.index(boundary)]
+        # An unmarked tests array may simply trail the DSL; do not swallow it.
+        body = re.sub(r'\n\s*\[\s*\{.*}\s*]\s*$', '', body, flags=re.DOTALL)
+        dsl = body.strip()
+
+    if not tests:
+        tests = _fenced_block(content, "json")
+    if not tests:
+        # A bare array anywhere in the reply.
+        match = re.search(r'\[\s*\{.*}\s*]', content, re.DOTALL)
+        tests = match.group(0).strip() if match else ""
+
+    return dsl, tests, usecase
 
 # ==========================================
 # 3. WORKFLOW NODES
@@ -775,9 +878,7 @@ def planner_node(state: AgentState):
     print(f"planner node content: {content}")
 
     # Use the robust extraction
-    dsl_content = _extract_bounded_text(content, "---DSL STARTS---", "---DSL ENDS---", strip_lang="markdown")
-    test_suite_json = _extract_bounded_text(content, "---TESTS STARTS---", "---TESTS ENDS---", strip_lang="json")
-    usecase_name = _extract_bounded_text(content, "---USECASE NAME STARTS---", "---USECASE NAME ENDS---")
+    dsl_content, test_suite_json, usecase_name = _extract_plan_blocks(content)
 
     # Fallback to empty array if tests weren't found
     if not test_suite_json:
@@ -787,7 +888,12 @@ def planner_node(state: AgentState):
         "graph_plan_dsl": dsl_content,
         "test_suite_json": test_suite_json,
         "usecase_name": usecase_name,
-        # "messages": [AIMessage(content=content)]
+        # The builder repairs what the planner wrote, so the plan has to be in the history
+        # it reads. Without this the first repair attempt is asked to fix a graph it was
+        # never shown and has to reconstruct it from the triage conversation. Tagged
+        # internal so `_is_internal` keeps the raw DSL out of the chat, exactly as the
+        # builder's own retry dumps already are.
+        "messages": [_assistant_message_from_llm(content, internal=True)],
     }
 
 
@@ -804,9 +910,22 @@ def builder_node(state: AgentState):
 
     new_messages = []  # Track LLM responses during the loop to append later
 
-    # Internal loop: Attempt 0 uses the Planner's output directly. Attempt 1-4 uses the LLM.
-    MAX_ATTEMPTS = 8
+    # Internal loop: attempt 0 validates the Planner's output directly; later attempts ask
+    # the LLM to repair it. The budget lives in state, so re-entering the builder through
+    # the final-approval loop cannot silently restart it and overrun the run's wall clock.
+    spent_before = int(state.get("build_attempts_used") or 0)
+    MAX_ATTEMPTS = max(1, _max_build_attempts() - spent_before)
+    started = time.monotonic()
+    attempts_used = 0
+
     for attempt in range(MAX_ATTEMPTS):
+        attempts_used = attempt + 1
+
+        # Stop while there is still time to report; being killed by the run budget
+        # mid-repair would discard everything, since this node checkpoints only on return.
+        if attempt and time.monotonic() - started > AGENT_RUN_TIMEOUT_SECONDS * 0.7:
+            print("  --> [Builder]: wall-clock budget nearly spent; stopping early.")
+            break
 
         if state.get("cancel_requested"):
             print("  --> [Builder]: Cancellation requested; stopping.")
@@ -834,28 +953,28 @@ def builder_node(state: AgentState):
             new_messages.append(_assistant_message_from_llm(content, internal=True))
             context.append(_assistant_message_from_llm(content))
 
-            # 1. Extract using the robust markers
-            dsl_content = _extract_bounded_text(content, "---DSL STARTS---", "---DSL ENDS---", strip_lang="markdown")
-            test_suite_json = _extract_bounded_text(content, "---TESTS STARTS---", "---TESTS ENDS---", strip_lang="json")
-            usecase_name = _extract_bounded_text(content, "---USECASE NAME STARTS---", "---USECASE NAME ENDS---")
+            # 1. Extract, accepting the near-misses a small model tends to produce
+            new_dsl, new_tests, new_name = _extract_plan_blocks(content)
 
             # 2. Fallbacks if LLM skipped something
-            if not dsl_content:
-                # If it completely failed to output DSL, prompt it
+            if not new_dsl:
+                # Nothing usable came back. This is the only shape worth spending an
+                # attempt on, because there is no graph to compile.
                 context.append(HumanMessage(
                     content="FORMAT ERROR: Could not find ---DSL STARTS--- and ---DSL ENDS--- markers. Please output the DSL within these boundaries."))
                 continue
+            dsl_content = new_dsl
 
-            if not test_suite_json or test_suite_json == "[]":
+            if not new_tests or new_tests == "[]":
                 # Fallback to the history if the LLM was lazy
-                test_suite_json = state.get("test_suite_json", "[]")
                 print("  --> [Info]: Retained test suite from history.")
+            else:
+                test_suite_json = new_tests
 
-            if not usecase_name:
-                # If it completely failed to output DSL, prompt it
-                context.append(HumanMessage(
-                    content="FORMAT ERROR: Could not find ---USECASE NAME STARTS--- and ---USECASE NAME ENDS--- markers. Please output the Usecase name within these boundaries."))
-                continue
+            # A missing name is cosmetic - `usecase_name` already defaults, and the save
+            # path handles it - so it must never cost an attempt or discard a working DSL.
+            if new_name:
+                usecase_name = new_name
 
 
         # Save to a scratch file for debugging
@@ -890,6 +1009,7 @@ def builder_node(state: AgentState):
                 "evaluation_feedback": eval_result,
                 "usecase_name": usecase_name,
                 "build_status": "SUCCESS",
+                "build_attempts_used": spent_before + attempts_used,
                 "messages": new_messages  # Append debugging conversation to state
             }
 
@@ -901,7 +1021,8 @@ def builder_node(state: AgentState):
 
     return {
         "build_status": "ERROR",
-        "evaluation_feedback": f"Failed to compile and test the Markdown DSL after {MAX_ATTEMPTS} attempts.",
+        "evaluation_feedback": f"Failed to compile and test the Markdown DSL after {attempts_used} attempts.",
+        "build_attempts_used": spent_before + attempts_used,
         "messages": new_messages,
     }
 
