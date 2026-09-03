@@ -5,22 +5,19 @@ import {
   ChevronDown,
   Download,
   History,
-  LogIn,
-  LogOut,
   MessageSquare,
   Moon,
   PanelLeft,
   Save,
   Sun,
 } from 'lucide-react';
-import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
 
 import { downloadGraph } from '../../lib/download';
 import { useGraphStore } from '../../stores/useGraphStore';
-import { useSessionStore } from '../../stores/useSessionStore';
 import { useUiStore } from '../../stores/useUiStore';
 import { Badge, Button, IconButton, Spinner, cx } from '../ui';
+import { SessionControl } from './SessionControl';
 
 export function TopBar({
   onOpenHistory,
@@ -36,11 +33,6 @@ export function TopBar({
   // worth saving until the user or the assistant has added to it.
   const worthSaving = (content?.nodes?.length ?? 0) > 2 || dirty;
   const { theme, toggleTheme, toggleSidebar, toggleChat, chatOpen } = useUiStore();
-  const { session, hydrate, logout } = useSessionStore();
-
-  useEffect(() => {
-    void hydrate();
-  }, [hydrate]);
 
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState('');
@@ -213,26 +205,7 @@ export function TopBar({
         {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
       </IconButton>
 
-      {session?.mode === 'admin' ? (
-        <div className="flex items-center gap-1.5 pl-1">
-          <span
-            className="max-w-[10rem] truncate text-2xs text-fg-muted"
-            title={session.email ?? undefined}
-          >
-            {session.email}
-          </span>
-          <IconButton label="Sign out" onClick={() => void logout()}>
-            <LogOut size={15} />
-          </IconButton>
-        </div>
-      ) : session?.login_enabled ? (
-        <Link
-          href="/login"
-          className="ml-1 inline-flex h-7 items-center gap-1.5 rounded border border-border px-2.5 text-xs font-medium hover:bg-bg-subtle focus-ring"
-        >
-          <LogIn size={13} /> Sign in
-        </Link>
-      ) : null}
+      <SessionControl />
     </header>
   );
 }

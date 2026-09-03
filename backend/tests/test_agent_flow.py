@@ -237,6 +237,48 @@ def test_test_intent_runs_saved_suite(stub_llm):
     assert "tests passed" in report and "❌" in report
 
 
+def test_two_replies_in_a_row_do_not_collide(stub_llm):
+    """The clarification path resumes twice against one checkpoint.
+
+    The triage gate pauses for a chip; choosing "Custom clarification" pauses
+    again for free text. Every resume carries the live canvas with it, and both
+    land on the *same* checkpoint, so LangGraph accumulates two writes per
+    canvas key into a single step. With plain channels the second reply died
+    with INVALID_CONCURRENT_GRAPH_UPDATE; the reducer keeps the newer canvas.
+    """
+    stub_llm([GOOD_DSL])
+    graph = agent.build_graph()
+    config = new_thread()
+
+    canvas = {
+        "canvas_jdm_json": "",
+        "canvas_graph_id": "",
+        "canvas_graph_name": "",
+        "cancel_requested": False,
+    }
+    drain(
+        graph,
+        {"messages": [HumanMessage(content="Create a shipping policy.")], **canvas},
+        config,
+    )
+
+    # First reply: the chip that asks for a text box.
+    drain(graph, Command(resume="Custom clarification", update=dict(canvas)), config)
+    payload = pending_interrupt(graph, config)
+    assert payload is not None
+    assert payload["options"] == [], "the second pause must be a free-text prompt"
+
+    # Second reply, on the same checkpoint, with the canvas as it now stands.
+    edited = {**canvas, "canvas_jdm_json": '{"nodes": [], "edges": []}'}
+    drain(graph, Command(resume="Also charge $12 to PO boxes", update=edited), config)
+
+    values = graph.get_state(config).values
+    assert values["canvas_jdm_json"] == '{"nodes": [], "edges": []}', "newest canvas wins"
+    assert any(
+        getattr(m, "content", "") == "Also charge $12 to PO boxes" for m in values["messages"]
+    ), "the typed clarification must reach the agent"
+
+
 def test_intent_router_never_interrupts(stub_llm):
     """The entry node must do work immediately rather than pausing for input."""
     stub_llm([GOOD_DSL])

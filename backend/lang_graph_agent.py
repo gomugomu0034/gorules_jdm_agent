@@ -279,6 +279,19 @@ def call_llm(sys_prompt: str, messages: list) -> str:
 # ==========================================
 # 3. STATE & HELPERS
 # ==========================================
+def _latest(_current, incoming):
+    """Reducer: when a step carries more than one write, the newest one wins.
+
+    Resuming a paused run sends the live canvas along with the reply. A node
+    that pauses twice in a row - the clarification chip, then the text box -
+    is resumed twice against the *same* checkpoint, and LangGraph accumulates
+    the writes of every resume into that single step. A plain last-value
+    channel rejects two values in one step (INVALID_CONCURRENT_GRAPH_UPDATE),
+    so the channels the resume carries reduce instead of colliding.
+    """
+    return incoming
+
+
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     triage_status: str
@@ -297,12 +310,14 @@ class AgentState(TypedDict):
     existing_jdm_json: str  # The raw JSON of the policy under discussion
     action_type: str  # "EXPLAIN", "MODIFY", or "TEST"
     # --- Web studio fields ---
-    canvas_jdm_json: str  # The graph currently on the canvas, unsaved edits included
-    canvas_graph_id: str  # Database id, "" for a scratch canvas
-    canvas_graph_name: str
+    # These four travel with every resume, so they take the `_latest` reducer:
+    # see the note there for why a plain channel is not enough.
+    canvas_jdm_json: Annotated[str, _latest]  # The graph on the canvas, unsaved edits included
+    canvas_graph_id: Annotated[str, _latest]  # Database id, "" for a scratch canvas
+    canvas_graph_name: Annotated[str, _latest]
     intent: str  # "CREATE" | "MODIFY" | "TEST" | "EXPLAIN"
     intent_confidence: float
-    cancel_requested: bool
+    cancel_requested: Annotated[bool, _latest]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

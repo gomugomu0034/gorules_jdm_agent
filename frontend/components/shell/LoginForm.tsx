@@ -27,8 +27,9 @@ export function LoginForm() {
     event.preventDefault();
     clearError();
     try {
+      // The store lands us on /graphs itself: a signed-in session needs a full
+      // page load, not a client-side navigation.
       await login(email, password);
-      router.replace('/graphs');
     } catch {
       // The store holds the message; keep the form mounted so it can show.
     }

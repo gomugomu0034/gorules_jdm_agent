@@ -19,6 +19,21 @@ type SessionState = {
 
 let hydrated = false;
 
+/**
+ * Leave the app and load `path` from scratch.
+ *
+ * Signing in or out changes who the server thinks we are, while every store in
+ * the tab still holds the previous identity's data: the policy list, the open
+ * graph, the chat thread. A client-side navigation keeps all of it - an
+ * admin's policies stay on screen after signing out, and their chat thread
+ * then 404s on every stream reconnect - so an identity change is followed by a
+ * real page load, which is the only way to be sure nothing is left behind.
+ */
+function reloadInto(path: string): void {
+  if (typeof window === 'undefined') return;
+  window.location.assign(path);
+}
+
 export const useSessionStore = create<SessionState>((set) => ({
   session: null,
   loading: false,
@@ -49,6 +64,7 @@ export const useSessionStore = create<SessionState>((set) => ({
       // The identity changed, so the established session is stale.
       resetSession();
       set({ session: next, loading: false });
+      reloadInto('/graphs');
     } catch (e) {
       set({
         loading: false,
@@ -64,6 +80,8 @@ export const useSessionStore = create<SessionState>((set) => ({
       const next = await api.logout();
       resetSession();
       set({ session: next, loading: false });
+      // Back to the guest landing page, with nothing of the admin's left over.
+      reloadInto('/');
     } finally {
       set({ loading: false });
     }

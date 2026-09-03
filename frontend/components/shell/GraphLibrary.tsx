@@ -9,6 +9,7 @@ import { api, AppError } from '../../lib/api';
 import type { GraphSummary } from '../../lib/types';
 import { useUiStore } from '../../stores/useUiStore';
 import { Button, EmptyState, IconButton, Spinner } from '../ui';
+import { SessionControl } from './SessionControl';
 
 export function GraphLibrary() {
   const router = useRouter();
@@ -55,6 +56,7 @@ export function GraphLibrary() {
         <IconButton label="Toggle theme" onClick={toggleTheme}>
           {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
         </IconButton>
+        <SessionControl />
       </header>
 
       <main className="mx-auto w-full max-w-5xl px-6 py-10">

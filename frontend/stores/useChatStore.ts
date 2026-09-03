@@ -25,6 +25,8 @@ type Canvas = { content: DecisionGraphType; graph_id?: string | null; name?: str
 
 type ChatState = {
   threadId: string | null;
+  /** The graph this conversation belongs to; `null` for a draft. */
+  graphId: string | null;
   messages: ChatMessage[];
   steps: RunStep[];
   pending: PendingInterrupt | null;
@@ -35,6 +37,8 @@ type ChatState = {
   connected: boolean;
 
   open: (graphId: string | null) => Promise<void>;
+  /** Replace a conversation the server no longer has with a fresh one. */
+  restart: () => Promise<void>;
   send: (text: string, canvas: Canvas) => Promise<void>;
   respond: (value: string, canvas: Canvas) => Promise<void>;
   cancel: () => Promise<void>;
@@ -44,8 +48,16 @@ type ChatState = {
 
 let stream: ReturnType<typeof createEventStream> | null = null;
 
+// A conversation the server has lost is replaced rather than reconnected to,
+// but only so many times: if the replacement is unreachable too, something
+// systemic is wrong and silently minting threads would hide it. The budget is
+// per visit - `reset` runs when the studio unmounts.
+const MAX_RESTARTS = 2;
+let restarts = 0;
+
 const initial = {
   threadId: null,
+  graphId: null,
   messages: [] as ChatMessage[],
   steps: [] as RunStep[],
   pending: null,
@@ -62,6 +74,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   reset: () => {
     stream?.close();
     stream = null;
+    restarts = 0;
     set({ ...initial });
   },
 
@@ -76,6 +89,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       set({
         threadId: id,
+        graphId,
         messages: state.messages.map((m, i) => ({ id: `restored-${i}`, ...m })),
         pending: state.pending_interrupt,
         proposal: state.proposal,
@@ -87,10 +101,37 @@ export const useChatStore = create<ChatState>((set, get) => ({
         fromSeq: state.last_seq,
         onEvent: (event) => apply(set, get, event),
         onError: () => set({ connected: false }),
+        onGone: () => void get().restart(),
       });
       set({ connected: true });
     } catch (e) {
       set({ error: describe(e) });
+    }
+  },
+
+  /**
+   * The thread vanished from under us - swept with an expired guest session,
+   * deleted, or created under an identity this browser has since traded for
+   * another. Its history is unrecoverable either way, and the stream would
+   * otherwise reconnect to a 404 for as long as the tab stayed open, so open a
+   * new conversation in its place and say so.
+   */
+  restart: async () => {
+    if (restarts >= MAX_RESTARTS) {
+      stream?.close();
+      stream = null;
+      set({
+        connected: false,
+        running: false,
+        error: 'Lost the connection to the assistant. Reload the page to start again.',
+      });
+      return;
+    }
+    restarts += 1;
+    const { graphId } = get();
+    await get().open(graphId);
+    if (!get().error) {
+      set({ error: 'That conversation is no longer available, so a new one was started.' });
     }
   },
 
