@@ -12,7 +12,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from backend.api import chat, exports, graphs, health, imports, simulate, tests
+from backend.api import auth, chat, exports, graphs, health, imports, simulate, tests
 from backend.api.errors import register_error_handlers
 from backend.config import settings
 from backend import agent_runtime
@@ -31,6 +31,12 @@ limiter = Limiter(key_func=get_remote_address, default_limits=[settings.rate_lim
 async def lifespan(app: FastAPI):
     await connection.connect()
     await bootstrap.bootstrap()
+    if not settings.session_secret:
+        logger.warning(
+            "SESSION_SECRET is not set: a new signing key is generated on every "
+            "start, so guests lose their session (and the policies attached to "
+            "it) whenever the API restarts. Set it in backend/.env."
+        )
     await agent_runtime.startup()
     logger.info("%s %s ready (db=%s)", settings.app_name, settings.version, settings.db_path)
     try:
@@ -48,10 +54,14 @@ app = FastAPI(
 
 app.state.limiter = limiter
 
+# Credentials are required: the session travels in a cookie so that
+# EventSource, which cannot set headers, still authenticates the chat stream.
+# The CORS spec forbids pairing this with a wildcard origin, so the origin list
+# must stay explicit.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
@@ -87,9 +97,12 @@ async def _rate_limited(request: Request, exc: RateLimitExceeded):
 
 
 app.include_router(health.router)
+app.include_router(auth.router)
+# exports before graphs: FastAPI matches in registration order, and the literal
+# /api/graphs/export-all would otherwise be swallowed by /api/graphs/{graph_id}.
+app.include_router(exports.router)
 app.include_router(graphs.router)
 app.include_router(imports.router)
-app.include_router(exports.router)
 app.include_router(simulate.router)
 app.include_router(tests.router)
 app.include_router(chat.router)

@@ -30,6 +30,17 @@ export function downloadProposal(threadId: string, format: ExportFormat) {
   click(apiUrl(`/api/chat/threads/${threadId}/proposal/export?format=${format}`));
 }
 
+/**
+ * Every policy the current session owns, as one zip.
+ *
+ * A plain navigation rather than fetch: the browser sends the session cookie
+ * on a top-level GET (SameSite=Lax) and saves the file from
+ * Content-Disposition without buffering it in memory.
+ */
+export function downloadAllGraphs() {
+  click(apiUrl('/api/graphs/export-all'));
+}
+
 /** Client-side download for content that only exists in the browser. */
 export function downloadJson(filename: string, data: unknown) {
   const url = URL.createObjectURL(

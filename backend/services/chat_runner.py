@@ -233,6 +233,29 @@ def _message_ids(values: dict) -> set[str]:
     return {getattr(m, "id", None) for m in (values or {}).get("messages", []) if getattr(m, "id", None)}
 
 
+# The builder keeps every raw LLM reply in state as its retry context, and each
+# one is a DSL/JSON dump addressed to the model rather than to the reader. They
+# must stay in the agent's memory but never reach the chat.
+#
+# The reliable signal is the `internal` flag the builder sets. The markers are a
+# fallback for threads written before that flag existed, and for the case where
+# the model wraps its answer differently than asked.
+_INTERNAL_MARKERS = (
+    "---DSL STARTS---",
+    "---TESTS STARTS---",
+    "---USECASE NAME STARTS---",
+    "## Markdown DSL",
+)
+
+
+def _is_internal(message_or_text) -> bool:
+    if isinstance(message_or_text, str):
+        return any(m in message_or_text for m in _INTERNAL_MARKERS)
+    if getattr(message_or_text, "additional_kwargs", {}).get("internal"):
+        return True
+    return any(m in str(message_or_text.content) for m in _INTERNAL_MARKERS)
+
+
 def _new_messages(delta, seen: set[str]) -> list[dict]:
     """Emit assistant messages this turn produced, once each."""
     out = []
@@ -244,13 +267,17 @@ def _new_messages(delta, seen: set[str]) -> list[dict]:
             continue
         if mid:
             seen.add(mid)
-        if isinstance(message, AIMessage) and str(message.content).strip():
-            out.append({
-                "type": "message",
-                "role": "assistant",
-                "content": str(message.content),
-                "message_id": mid or str(uuid.uuid4()),
-            })
+        if not isinstance(message, AIMessage):
+            continue
+        content = str(message.content).strip()
+        if not content or _is_internal(message):
+            continue
+        out.append({
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "message_id": mid or str(uuid.uuid4()),
+        })
     return out
 
 

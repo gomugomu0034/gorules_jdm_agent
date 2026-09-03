@@ -106,14 +106,46 @@ def test_create_policy_end_to_end(client):
     assert proposed["jdm"]["nodes"]
     assert proposed["test_report"]["summary"]["passed"] == len(TESTS)
 
-    # Accepting writes a real, agent-authored version.
-    accept = client.post(f"/api/chat/threads/{thread_id}/proposal/accept", json={}).json()
+    # Accepting with persist writes a real, agent-authored version.
+    accept = client.post(
+        f"/api/chat/threads/{thread_id}/proposal/accept", json={"persist": True}
+    ).json()
+    assert accept["draft"] is False
     graph = client.get(f"/api/graphs/{accept['graph_id']}").json()
     assert graph["name"] == "Shipping Fees"
     assert graph["test_count"] == len(TESTS)
 
     versions = client.get(f"/api/graphs/{accept['graph_id']}/versions").json()["versions"]
     assert versions[0]["author"] == "agent"
+
+
+def test_accept_without_persist_returns_an_unsaved_draft(client):
+    """A guest sees the graph on the canvas before deciding to keep it."""
+    thread_id = client.post("/api/chat/threads", json={}).json()["id"]
+    client.post(
+        f"/api/chat/threads/{thread_id}/messages",
+        json={"text": "Create a shipping policy.",
+              "canvas": {"content": {"nodes": [], "edges": []}}},
+    )
+    read_events(client, thread_id)
+    client.post(
+        f"/api/chat/threads/{thread_id}/resume",
+        json={"value": "Approve with above understanding & assumptions"},
+    )
+    read_events(client, thread_id)
+
+    before = len(client.get("/api/graphs").json()["graphs"])
+    accept = client.post(
+        f"/api/chat/threads/{thread_id}/proposal/accept", json={}
+    ).json()
+
+    assert accept["draft"] is True
+    assert accept["graph_id"] is None
+    assert accept["content"]["nodes"], "the draft carries the graph for the canvas"
+    assert accept["tests"]
+    assert len(client.get("/api/graphs").json()["graphs"]) == before, (
+        "a draft must not create a graph until the user saves it"
+    )
 
 
 def test_resume_rejected_when_not_awaiting_input(client):

@@ -1,9 +1,11 @@
 import type { DecisionGraphType } from '@gorules/jdm-editor';
 
 import type {
+  AcceptProposalResult,
   GraphDetail,
   GraphSummary,
   Proposal,
+  Session,
   SimulationResponse,
   TestCase,
   TestRunReport,
@@ -37,11 +39,50 @@ export function apiUrl(path: string): string {
   return `${API_BASE}${path}`;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/**
+ * A guest session is minted lazily by the server on the first request it sees
+ * with no cookie. A cold page load fires several requests at once, and each
+ * would mint a *different* guest - the browser keeps only the last cookie, so
+ * anything created under a discarded identity becomes invisible (a thread
+ * created that way 404s on the very next call).
+ *
+ * So the first call establishes the session on its own and everything else
+ * waits behind it. Only the first load pays for this; afterwards the cookie
+ * exists and the promise is already resolved.
+ */
+let sessionReady: Promise<void> | null = null;
+
+function ensureSession(): Promise<void> {
+  if (!sessionReady) {
+    sessionReady = fetch(apiUrl('/api/auth/me'), { credentials: 'include' })
+      .then(() => undefined)
+      // A failure here must not block the app: the request that follows will
+      // surface the real error.
+      .catch(() => undefined);
+  }
+  return sessionReady;
+}
+
+/** Forget the established session, e.g. after signing in or out. */
+export function resetSession(): void {
+  sessionReady = null;
+}
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  opts: { bootstrap?: boolean } = {},
+): Promise<T> {
+  // `bootstrap: false` is for callers that must not wait on the session gate.
+  if (opts.bootstrap !== false) await ensureSession();
+
   let response: Response;
   try {
     response = await fetch(apiUrl(path), {
       ...init,
+      // The session lives in a cookie, so every call must carry it. Without
+      // this each request would arrive as a brand-new guest.
+      credentials: 'include',
       headers: {
         ...(init?.body && !(init.body instanceof FormData)
           ? { 'Content-Type': 'application/json' }
@@ -201,11 +242,23 @@ export const api = {
   cancelRun: (threadId: string) =>
     request<{ cancelled: boolean }>(`/api/chat/threads/${threadId}/cancel`, { method: 'POST' }),
 
-  acceptProposal: (threadId: string, graphId?: string | null, name?: string) =>
-    request<{ graph_id: string; version: number }>(
-      `/api/chat/threads/${threadId}/proposal/accept`,
-      { method: 'POST', ...json({ graph_id: graphId, name }) },
-    ),
+  /**
+   * Take the agent's proposal.
+   *
+   * With `persist` false and no target graph the server returns the content as
+   * an unsaved draft, so it can be shown on the canvas and tested before the
+   * user commits to keeping it.
+   */
+  acceptProposal: (
+    threadId: string,
+    graphId?: string | null,
+    name?: string,
+    persist = false,
+  ) =>
+    request<AcceptProposalResult>(`/api/chat/threads/${threadId}/proposal/accept`, {
+      method: 'POST',
+      ...json({ graph_id: graphId, name, persist }),
+    }),
 
   rejectProposal: (threadId: string, reason: string) =>
     request<{ rejected: boolean }>(`/api/chat/threads/${threadId}/proposal/reject`, {
@@ -215,4 +268,12 @@ export const api = {
 
   getProposal: (threadId: string) =>
     request<ThreadState>(`/api/chat/threads/${threadId}`).then((s) => s.proposal as Proposal | null),
+
+  // Session ----------------------------------------------------------------
+  me: () => request<Session>('/api/auth/me'),
+
+  login: (email: string, password: string) =>
+    request<Session>('/api/auth/login', { method: 'POST', ...json({ email, password }) }),
+
+  logout: () => request<Session>('/api/auth/logout', { method: 'POST' }),
 };

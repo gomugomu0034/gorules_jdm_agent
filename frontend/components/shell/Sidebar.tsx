@@ -1,22 +1,27 @@
 'use client';
 
-import { FileJson, Plus, Search, Upload } from 'lucide-react';
+import { Download, FileJson, Plus, Search, Upload } from 'lucide-react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../../lib/api';
+import { downloadAllGraphs } from '../../lib/download';
+import { useGraphStore } from '../../stores/useGraphStore';
 import type { GraphSummary } from '../../lib/types';
 import { Button, EmptyState, IconButton, Input, Spinner, cx } from '../ui';
+import { confirmDiscardUnsaved } from './UnsavedGuard';
 
 type Props = {
-  activeId?: string;
+  activeId?: string | null;
   /** Bumping this refetches the list (e.g. after the agent saves a graph). */
   refreshToken?: number;
 };
 
 export function Sidebar({ activeId, refreshToken = 0 }: Props) {
   const router = useRouter();
+  const isDraft = useGraphStore((s) => s.isDraft);
+  const dirty = useGraphStore((s) => s.dirty);
   const [graphs, setGraphs] = useState<GraphSummary[]>([]);
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(true);
@@ -41,17 +46,15 @@ export function Sidebar({ activeId, refreshToken = 0 }: Props) {
     return q ? graphs.filter((g) => g.name.toLowerCase().includes(q)) : graphs;
   }, [graphs, query]);
 
-  const createGraph = async () => {
-    setBusy(true);
-    try {
-      const graph = await api.createGraph(`Untitled policy ${graphs.length + 1}`);
-      router.push(`/graphs/${graph.id}`);
-    } finally {
-      setBusy(false);
-    }
+  const startNewPolicy = () => {
+    if (!confirmDiscardUnsaved(isDraft, dirty)) return;
+    // A new policy begins as a draft on the chat-first screen rather than as an
+    // empty row, so nothing is stored until it is worth storing.
+    router.push('/');
   };
 
   const importGraph = async (file: File) => {
+    if (!confirmDiscardUnsaved(isDraft, dirty)) return;
     setBusy(true);
     try {
       const graph = await api.importGraph(file);
@@ -88,7 +91,12 @@ export function Sidebar({ activeId, refreshToken = 0 }: Props) {
             <Upload size={14} />
           </IconButton>
         </div>
-        <Button variant="primary" icon={<Plus size={14} />} onClick={createGraph} loading={busy}>
+        <Button
+          variant="primary"
+          icon={<Plus size={14} />}
+          onClick={startNewPolicy}
+          loading={busy}
+        >
           New policy
         </Button>
         <input
@@ -112,7 +120,11 @@ export function Sidebar({ activeId, refreshToken = 0 }: Props) {
           <EmptyState
             icon={<FileJson size={22} />}
             title={query ? 'No matches' : 'No policies yet'}
-            description={query ? undefined : 'Create one, or import an existing JDM file.'}
+            description={
+              query
+                ? undefined
+                : 'Describe one to the assistant, or import an existing JDM file.'
+            }
           />
         ) : (
           <ul className="flex flex-col gap-0.5">
@@ -120,6 +132,11 @@ export function Sidebar({ activeId, refreshToken = 0 }: Props) {
               <li key={graph.id}>
                 <Link
                   href={`/graphs/${graph.id}`}
+                  onClick={(e) => {
+                    // beforeunload does not fire for client-side navigation,
+                    // so opening another policy is guarded here instead.
+                    if (!confirmDiscardUnsaved(isDraft, dirty)) e.preventDefault();
+                  }}
                   className={cx(
                     'block rounded px-2.5 py-2 transition-colors',
                     graph.id === activeId
@@ -137,6 +154,18 @@ export function Sidebar({ activeId, refreshToken = 0 }: Props) {
           </ul>
         )}
       </div>
+
+      {graphs.length > 0 ? (
+        <div className="border-t border-border p-2">
+          <button
+            onClick={downloadAllGraphs}
+            className="flex w-full items-center justify-center gap-1.5 rounded px-2 py-1.5 text-xs text-fg-muted transition-colors hover:bg-bg-inset hover:text-fg focus-ring"
+          >
+            <Download size={13} />
+            Export all ({graphs.length})
+          </button>
+        </div>
+      ) : null}
     </aside>
   );
 }

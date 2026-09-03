@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import anyio
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 
+from backend import auth
 from backend.api.errors import ApiError
 from backend.api.graphs import require_graph
 from backend.db import dao
@@ -22,35 +23,39 @@ router = APIRouter(tags=["tests"])
 
 
 @router.get("/api/graphs/{graph_id}/tests", response_model=TestListResponse)
-async def list_tests(graph_id: str) -> TestListResponse:
-    await require_graph(graph_id)
+async def list_tests(graph_id: str, owner: str = Depends(auth.get_owner)) -> TestListResponse:
+    await require_graph(graph_id, owner=owner)
     return TestListResponse(tests=await dao.list_tests(graph_id))
 
 
 @router.put("/api/graphs/{graph_id}/tests", response_model=TestListResponse)
-async def replace_tests(graph_id: str, body: ReplaceTestsRequest) -> TestListResponse:
-    await require_graph(graph_id)
+async def replace_tests(
+    graph_id: str, body: ReplaceTestsRequest, owner: str = Depends(auth.get_owner)
+) -> TestListResponse:
+    await require_graph(graph_id, owner=owner)
     tests = await dao.replace_tests(graph_id, [t.model_dump() for t in body.tests])
     return TestListResponse(tests=tests)
 
 
 @router.post("/api/graphs/{graph_id}/tests", response_model=TestCase,
              status_code=status.HTTP_201_CREATED)
-async def add_test(graph_id: str, body: TestCase) -> TestCase:
-    await require_graph(graph_id)
+async def add_test(graph_id: str, body: TestCase, owner: str = Depends(auth.get_owner)) -> TestCase:
+    await require_graph(graph_id, owner=owner)
     return TestCase(**await dao.add_test(graph_id, body.model_dump()))
 
 
 @router.patch("/api/graphs/{graph_id}/tests/{test_id}", response_model=TestListResponse)
-async def patch_test(graph_id: str, test_id: str, body: PatchTestRequest) -> TestListResponse:
-    await require_graph(graph_id)
+async def patch_test(
+    graph_id: str, test_id: str, body: PatchTestRequest, owner: str = Depends(auth.get_owner)
+) -> TestListResponse:
+    await require_graph(graph_id, owner=owner)
     await dao.update_test(graph_id, test_id, body.model_dump(exclude_unset=True))
     return TestListResponse(tests=await dao.list_tests(graph_id))
 
 
 @router.delete("/api/graphs/{graph_id}/tests/{test_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_test(graph_id: str, test_id: str) -> Response:
-    await require_graph(graph_id)
+async def delete_test(graph_id: str, test_id: str, owner: str = Depends(auth.get_owner)) -> Response:
+    await require_graph(graph_id, owner=owner)
     await dao.delete_test(graph_id, test_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -66,8 +71,10 @@ async def _execute(content: dict, tests: list[dict], strict: bool) -> dict:
 
 
 @router.post("/api/graphs/{graph_id}/tests/run", response_model=TestRunResponse)
-async def run_graph_tests(graph_id: str, body: RunTestsRequest) -> TestRunResponse:
-    graph = await require_graph(graph_id, body.version)
+async def run_graph_tests(
+    graph_id: str, body: RunTestsRequest, owner: str = Depends(auth.get_owner)
+) -> TestRunResponse:
+    graph = await require_graph(graph_id, body.version, owner=owner)
     # `content` lets the caller test the unsaved canvas rather than what's stored.
     content = body.content if body.content is not None else graph["content"]
 
@@ -100,9 +107,11 @@ async def run_adhoc_tests(body: RunTestsRequest) -> TestRunResponse:
 
 
 @router.post("/api/graphs/{graph_id}/tests/generate", response_model=TestListResponse)
-async def generate_tests(graph_id: str, request: Request) -> TestListResponse:
+async def generate_tests(
+    graph_id: str, request: Request, owner: str = Depends(auth.get_owner)
+) -> TestListResponse:
     """Generate a suite with the LLM. Returns without saving."""
-    graph = await require_graph(graph_id)
+    graph = await require_graph(graph_id, owner=owner)
     from backend.services.test_service import generate_test_suite
 
     try:

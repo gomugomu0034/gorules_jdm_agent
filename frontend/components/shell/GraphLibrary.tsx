@@ -9,6 +9,7 @@ import { api, AppError } from '../../lib/api';
 import type { GraphSummary } from '../../lib/types';
 import { useUiStore } from '../../stores/useUiStore';
 import { Button, EmptyState, IconButton, Spinner } from '../ui';
+import { SessionControl } from './SessionControl';
 
 export function GraphLibrary() {
   const router = useRouter();
@@ -28,16 +29,9 @@ export function GraphLibrary() {
       .finally(() => setLoading(false));
   }, []);
 
-  const create = async () => {
-    setBusy(true);
-    try {
-      const graph = await api.createGraph(`Untitled policy ${graphs.length + 1}`);
-      router.push(`/graphs/${graph.id}`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not create a policy.');
-      setBusy(false);
-    }
-  };
+  // A new policy starts as a draft on the chat-first screen: nothing is stored
+  // until it has content and a name worth storing.
+  const create = () => router.push('/');
 
   const importFile = async (file: File) => {
     setBusy(true);
@@ -62,6 +56,7 @@ export function GraphLibrary() {
         <IconButton label="Toggle theme" onClick={toggleTheme}>
           {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
         </IconButton>
+        <SessionControl />
       </header>
 
       <main className="mx-auto w-full max-w-5xl px-6 py-10">
@@ -110,7 +105,7 @@ export function GraphLibrary() {
               <EmptyState
                 icon={<FileJson size={24} />}
                 title="No policies yet"
-                description="Create your first decision policy, or import an existing JDM file."
+                description="Describe one to the assistant, or import an existing JDM file."
                 action={
                   <Button variant="primary" icon={<Plus size={14} />} onClick={create}>
                     New policy

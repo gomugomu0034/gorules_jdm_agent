@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Response, status
 
+from backend import auth
 from backend.api.errors import ApiError, not_found
 from backend.db import dao
 from backend.models.api import (
@@ -44,8 +45,15 @@ EMPTY_GRAPH = {
 }
 
 
-async def require_graph(graph_id: str, version: int | None = None) -> dict:
-    graph = await dao.get_graph(graph_id, version)
+async def require_graph(
+    graph_id: str, version: int | None = None, owner: str | None = None
+) -> dict:
+    """Fetch a graph the caller owns.
+
+    A graph owned by someone else is reported as missing rather than
+    forbidden - a 403 would confirm that the id exists.
+    """
+    graph = await dao.get_graph(graph_id, version, owner=owner)
     if graph is None:
         raise not_found("graph", graph_id)
     if version is not None and graph.get("version") != version:
@@ -57,12 +65,15 @@ async def require_graph(graph_id: str, version: int | None = None) -> dict:
 async def list_graphs(
     q: str | None = Query(default=None),
     archived: bool = Query(default=False),
+    owner: str = Depends(auth.get_owner),
 ) -> GraphListResponse:
-    return GraphListResponse(graphs=await dao.list_graphs(q=q, archived=archived))
+    return GraphListResponse(graphs=await dao.list_graphs(owner, q=q, archived=archived))
 
 
 @router.post("", response_model=GraphDetail, status_code=status.HTTP_201_CREATED)
-async def create_graph(body: CreateGraphRequest) -> GraphDetail:
+async def create_graph(
+    body: CreateGraphRequest, owner: str = Depends(auth.get_owner)
+) -> GraphDetail:
     content = body.content if body.content is not None else EMPTY_GRAPH
     errors = blocking_errors(validate_decision(content))
     if errors:
@@ -72,7 +83,7 @@ async def create_graph(body: CreateGraphRequest) -> GraphDetail:
             422,
             [i.model_dump() for i in errors],
         )
-    graph = await dao.create_graph(body.name, content, body.description)
+    graph = await dao.create_graph(owner, body.name, content, body.description)
     return await _detail(graph)
 
 
@@ -85,13 +96,19 @@ async def validate(body: ValidateRequest) -> ValidateResponse:
 
 
 @router.get("/{graph_id}", response_model=GraphDetail)
-async def get_graph(graph_id: str, version: int | None = Query(default=None)) -> GraphDetail:
-    return await _detail(await require_graph(graph_id, version))
+async def get_graph(
+    graph_id: str,
+    version: int | None = Query(default=None),
+    owner: str = Depends(auth.get_owner),
+) -> GraphDetail:
+    return await _detail(await require_graph(graph_id, version, owner=owner))
 
 
 @router.put("/{graph_id}", response_model=SaveGraphResponse)
-async def update_graph(graph_id: str, body: UpdateGraphRequest) -> SaveGraphResponse:
-    graph = await require_graph(graph_id)
+async def update_graph(
+    graph_id: str, body: UpdateGraphRequest, owner: str = Depends(auth.get_owner)
+) -> SaveGraphResponse:
+    graph = await require_graph(graph_id, owner=owner)
 
     if body.base_version is not None and body.base_version != graph["current_version"]:
         raise ApiError(
@@ -118,27 +135,36 @@ async def update_graph(graph_id: str, body: UpdateGraphRequest) -> SaveGraphResp
         is_autosave=body.autosave,
     )
     if body.name is not None or body.description is not None:
-        await dao.update_graph_meta(graph_id, name=body.name, description=body.description)
+        await dao.update_graph_meta(
+            graph_id, name=body.name, description=body.description, owner=owner
+        )
 
-    return SaveGraphResponse(graph=await _detail(await require_graph(graph_id)), version=version)
+    return SaveGraphResponse(
+        graph=await _detail(await require_graph(graph_id, owner=owner)), version=version
+    )
 
 
 @router.patch("/{graph_id}", response_model=GraphDetail)
-async def patch_graph(graph_id: str, body: PatchGraphRequest) -> GraphDetail:
-    await require_graph(graph_id)
+async def patch_graph(
+    graph_id: str, body: PatchGraphRequest, owner: str = Depends(auth.get_owner)
+) -> GraphDetail:
+    await require_graph(graph_id, owner=owner)
     await dao.update_graph_meta(
-        graph_id, name=body.name, description=body.description, archived=body.archived
+        graph_id, name=body.name, description=body.description,
+        archived=body.archived, owner=owner,
     )
-    return await _detail(await require_graph(graph_id))
+    return await _detail(await require_graph(graph_id, owner=owner))
 
 
 @router.delete("/{graph_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_graph(graph_id: str, hard: bool = Query(default=False)) -> Response:
-    await require_graph(graph_id)
+async def delete_graph(
+    graph_id: str, hard: bool = Query(default=False), owner: str = Depends(auth.get_owner)
+) -> Response:
+    await require_graph(graph_id, owner=owner)
     if hard:
-        await dao.delete_graph(graph_id)
+        await dao.delete_graph(graph_id, owner=owner)
     else:
-        await dao.update_graph_meta(graph_id, archived=True)
+        await dao.update_graph_meta(graph_id, archived=True, owner=owner)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -147,14 +173,14 @@ async def delete_graph(graph_id: str, hard: bool = Query(default=False)) -> Resp
 # --------------------------------------------------------------------------
 
 @router.get("/{graph_id}/versions", response_model=VersionListResponse)
-async def list_versions(graph_id: str) -> VersionListResponse:
-    await require_graph(graph_id)
+async def list_versions(graph_id: str, owner: str = Depends(auth.get_owner)) -> VersionListResponse:
+    await require_graph(graph_id, owner=owner)
     return VersionListResponse(versions=await dao.list_versions(graph_id))
 
 
 @router.get("/{graph_id}/versions/{version}", response_model=VersionDetail)
-async def get_version(graph_id: str, version: int) -> VersionDetail:
-    await require_graph(graph_id)
+async def get_version(graph_id: str, version: int, owner: str = Depends(auth.get_owner)) -> VersionDetail:
+    await require_graph(graph_id, owner=owner)
     found = await dao.get_version(graph_id, version)
     if found is None:
         raise ApiError("VERSION_NOT_FOUND", f"Graph has no version {version}.", 404)
@@ -162,8 +188,10 @@ async def get_version(graph_id: str, version: int) -> VersionDetail:
 
 
 @router.post("/{graph_id}/versions/{version}/restore", response_model=SaveGraphResponse)
-async def restore_version(graph_id: str, version: int) -> SaveGraphResponse:
-    await require_graph(graph_id)
+async def restore_version(
+    graph_id: str, version: int, owner: str = Depends(auth.get_owner)
+) -> SaveGraphResponse:
+    await require_graph(graph_id, owner=owner)
     found = await dao.get_version(graph_id, version)
     if found is None:
         raise ApiError("VERSION_NOT_FOUND", f"Graph has no version {version}.", 404)
@@ -171,13 +199,14 @@ async def restore_version(graph_id: str, version: int) -> SaveGraphResponse:
         graph_id, found["content"], message=f"Restored from version {version}", author="user"
     )
     return SaveGraphResponse(
-        graph=await _detail(await require_graph(graph_id)), version=new_version
+        graph=await _detail(await require_graph(graph_id, owner=owner)),
+        version=new_version
     )
 
 
 @router.get("/{graph_id}/versions/{a}/diff/{b}")
-async def diff_versions(graph_id: str, a: int, b: int) -> dict:
-    await require_graph(graph_id)
+async def diff_versions(graph_id: str, a: int, b: int, owner: str = Depends(auth.get_owner)) -> dict:
+    await require_graph(graph_id, owner=owner)
     left, right = await dao.get_version(graph_id, a), await dao.get_version(graph_id, b)
     if left is None or right is None:
         raise ApiError("VERSION_NOT_FOUND", "One of the versions does not exist.", 404)

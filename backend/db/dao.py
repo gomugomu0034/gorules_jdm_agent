@@ -18,6 +18,10 @@ from backend.db import connection
 
 AUTOSAVE_COALESCE_WINDOW = timedelta(seconds=60)
 
+# Compared against when no user matches, so a bad email costs the same time as
+# a bad password and cannot be distinguished by an attacker.
+_DUMMY_HASH = "$2b$12$" + "." * 53
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -37,11 +41,14 @@ def slugify(name: str) -> str:
     return slug or "graph"
 
 
-async def unique_slug(conn: aiosqlite.Connection, name: str) -> str:
+async def unique_slug(conn: aiosqlite.Connection, owner: str, name: str) -> str:
+    """Unique within one owner: two guests may each have a `refund-policy`."""
     base = slugify(name)
     candidate, n = base, 2
     while True:
-        cur = await conn.execute("SELECT 1 FROM graphs WHERE slug = ?", (candidate,))
+        cur = await conn.execute(
+            "SELECT 1 FROM graphs WHERE owner_id = ? AND slug = ?", (owner, candidate)
+        )
         if await cur.fetchone() is None:
             return candidate
         candidate, n = f"{base}-{n}", n + 1
@@ -54,6 +61,7 @@ async def unique_slug(conn: aiosqlite.Connection, name: str) -> str:
 def _graph_row(row: aiosqlite.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
+        "owner_id": row["owner_id"],
         "name": row["name"],
         "slug": row["slug"],
         "description": row["description"],
@@ -64,16 +72,18 @@ def _graph_row(row: aiosqlite.Row) -> dict[str, Any]:
     }
 
 
-async def list_graphs(q: str | None = None, archived: bool = False) -> list[dict[str, Any]]:
+async def list_graphs(
+    owner: str, q: str | None = None, archived: bool = False
+) -> list[dict[str, Any]]:
     sql = """
         SELECT g.*,
                (SELECT COUNT(*) FROM test_cases t WHERE t.graph_id = g.id) AS test_count,
                (SELECT v.content FROM graph_versions v
                  WHERE v.graph_id = g.id AND v.version = g.current_version) AS content
           FROM graphs g
-         WHERE (g.archived_at IS NULL) = ?
+         WHERE g.owner_id = ? AND (g.archived_at IS NULL) = ?
     """
-    params: list[Any] = [0 if archived else 1]
+    params: list[Any] = [owner, 0 if archived else 1]
     if q:
         sql += " AND (g.name LIKE ? OR g.description LIKE ?)"
         params += [f"%{q}%", f"%{q}%"]
@@ -95,9 +105,17 @@ async def list_graphs(q: str | None = None, archived: bool = False) -> list[dict
     return out
 
 
-async def get_graph(graph_id: str, version: int | None = None) -> dict[str, Any] | None:
+async def get_graph(
+    graph_id: str, version: int | None = None, owner: str | None = None
+) -> dict[str, Any] | None:
+    """Fetch a graph. With `owner`, another owner's graph reads as missing."""
     async with connection.read() as conn:
-        cur = await conn.execute("SELECT * FROM graphs WHERE id = ?", (graph_id,))
+        if owner is None:
+            cur = await conn.execute("SELECT * FROM graphs WHERE id = ?", (graph_id,))
+        else:
+            cur = await conn.execute(
+                "SELECT * FROM graphs WHERE id = ? AND owner_id = ?", (graph_id, owner)
+            )
         row = await cur.fetchone()
         if row is None:
             return None
@@ -119,6 +137,7 @@ async def get_graph(graph_id: str, version: int | None = None) -> dict[str, Any]
 
 
 async def create_graph(
+    owner: str,
     name: str,
     content: dict[str, Any],
     description: str = "",
@@ -128,11 +147,11 @@ async def create_graph(
     ts = now()
     graph_id = new_id()
     async with connection.write() as conn:
-        slug = await unique_slug(conn, name)
+        slug = await unique_slug(conn, owner, name)
         await conn.execute(
-            "INSERT INTO graphs (id, name, slug, description, current_version,"
-            " created_at, updated_at) VALUES (?,?,?,?,1,?,?)",
-            (graph_id, name, slug, description, ts, ts),
+            "INSERT INTO graphs (id, owner_id, name, slug, description,"
+            " current_version, created_at, updated_at) VALUES (?,?,?,?,?,1,?,?)",
+            (graph_id, owner, name, slug, description, ts, ts),
         )
         await conn.execute(
             "INSERT INTO graph_versions (graph_id, version, content, message, author,"
@@ -215,6 +234,7 @@ async def update_graph_meta(
     name: str | None = None,
     description: str | None = None,
     archived: bool | None = None,
+    owner: str | None = None,
 ) -> None:
     sets, params = [], []
     if name is not None:
@@ -230,19 +250,29 @@ async def update_graph_meta(
         return
     sets.append("updated_at = ?")
     params += [now(), graph_id]
+    where = "id = ?"
+    if owner is not None:
+        where += " AND owner_id = ?"
+        params.append(owner)
     async with connection.write() as conn:
-        await conn.execute(f"UPDATE graphs SET {', '.join(sets)} WHERE id = ?", params)
+        await conn.execute(f"UPDATE graphs SET {', '.join(sets)} WHERE {where}", params)
 
 
-async def delete_graph(graph_id: str) -> None:
+async def delete_graph(graph_id: str, owner: str | None = None) -> None:
     async with connection.write() as conn:
-        await conn.execute("DELETE FROM graphs WHERE id = ?", (graph_id,))
+        if owner is None:
+            await conn.execute("DELETE FROM graphs WHERE id = ?", (graph_id,))
+        else:
+            await conn.execute(
+                "DELETE FROM graphs WHERE id = ? AND owner_id = ?", (graph_id, owner)
+            )
 
 
-async def find_graph_by_name(name: str) -> dict[str, Any] | None:
+async def find_graph_by_name(name: str, owner: str) -> dict[str, Any] | None:
     async with connection.read() as conn:
         cur = await conn.execute(
-            "SELECT id FROM graphs WHERE name = ? OR slug = ?", (name, slugify(name))
+            "SELECT id FROM graphs WHERE owner_id = ? AND (name = ? OR slug = ?)",
+            (owner, name, slugify(name)),
         )
         row = await cur.fetchone()
     return await get_graph(row["id"]) if row else None
@@ -421,31 +451,42 @@ async def record_test_run(
 # Chat threads, events and proposals
 # --------------------------------------------------------------------------
 
-async def create_thread(graph_id: str | None = None, title: str = "New chat") -> dict[str, Any]:
+async def create_thread(
+    owner: str, graph_id: str | None = None, title: str = "New chat"
+) -> dict[str, Any]:
     ts = now()
     thread_id = new_id()
     async with connection.write() as conn:
         await conn.execute(
-            "INSERT INTO chat_threads (id, graph_id, title, status, created_at, updated_at)"
-            " VALUES (?,?,?,'idle',?,?)",
-            (thread_id, graph_id, title, ts, ts),
+            "INSERT INTO chat_threads (id, owner_id, graph_id, title, status,"
+            " created_at, updated_at) VALUES (?,?,?,?,'idle',?,?)",
+            (thread_id, owner, graph_id, title, ts, ts),
         )
-    return {"id": thread_id, "graph_id": graph_id, "title": title, "status": "idle",
-            "created_at": ts, "updated_at": ts}
+    return {"id": thread_id, "owner_id": owner, "graph_id": graph_id, "title": title,
+            "status": "idle", "created_at": ts, "updated_at": ts}
 
 
-async def get_thread(thread_id: str) -> dict[str, Any] | None:
+async def get_thread(thread_id: str, owner: str | None = None) -> dict[str, Any] | None:
+    """With `owner`, another owner's thread reads as missing."""
     async with connection.read() as conn:
-        cur = await conn.execute("SELECT * FROM chat_threads WHERE id = ?", (thread_id,))
+        if owner is None:
+            cur = await conn.execute(
+                "SELECT * FROM chat_threads WHERE id = ?", (thread_id,)
+            )
+        else:
+            cur = await conn.execute(
+                "SELECT * FROM chat_threads WHERE id = ? AND owner_id = ?",
+                (thread_id, owner),
+            )
         row = await cur.fetchone()
     return dict(row) if row else None
 
 
-async def list_threads(graph_id: str | None = None) -> list[dict[str, Any]]:
-    sql = "SELECT * FROM chat_threads"
-    params: list[Any] = []
+async def list_threads(owner: str, graph_id: str | None = None) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM chat_threads WHERE owner_id = ?"
+    params: list[Any] = [owner]
     if graph_id:
-        sql += " WHERE graph_id = ?"
+        sql += " AND graph_id = ?"
         params.append(graph_id)
     sql += " ORDER BY updated_at DESC"
     async with connection.read() as conn:
@@ -574,3 +615,74 @@ async def set_meta(key: str, value: str) -> None:
             " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+
+# --------------------------------------------------------------------------
+# Users and guest housekeeping
+# --------------------------------------------------------------------------
+
+async def upsert_user(user_id: str, email: str, password: str) -> None:
+    """Create or update a user, storing only a bcrypt hash of the password."""
+    import bcrypt
+
+    digest = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("ascii")
+    ts = now()
+    async with connection.write() as conn:
+        await conn.execute(
+            "INSERT INTO users (id, email, password_hash, created_at, updated_at)"
+            " VALUES (?,?,?,?,?)"
+            " ON CONFLICT(id) DO UPDATE SET email=excluded.email,"
+            " password_hash=excluded.password_hash, updated_at=excluded.updated_at",
+            (user_id, email, digest, ts, ts),
+        )
+
+
+async def verify_user(email: str, password: str) -> dict[str, Any] | None:
+    """Return the user when the password matches, else None.
+
+    The hash comparison runs even when no such user exists so that a wrong
+    email and a wrong password take the same time to reject.
+    """
+    import bcrypt
+
+    async with connection.read() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM users WHERE email = ?", (email.strip().lower(),)
+        )
+        row = await cur.fetchone()
+
+    digest = row["password_hash"] if row else _DUMMY_HASH
+    try:
+        ok = bcrypt.checkpw(password.encode("utf-8"), digest.encode("ascii"))
+    except ValueError:
+        return None
+    return {"id": row["id"], "email": row["email"]} if (ok and row) else None
+
+
+async def get_user(user_id: str) -> dict[str, Any] | None:
+    async with connection.read() as conn:
+        cur = await conn.execute("SELECT id, email FROM users WHERE id = ?", (user_id,))
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def delete_stale_guests(ttl_days: int) -> int:
+    """Delete guest graphs and threads idle for longer than `ttl_days`.
+
+    Versions, tests, runs, chat events and proposals all cascade from these two
+    tables, so no other cleanup is needed.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat(
+        timespec="seconds"
+    )
+    async with connection.write() as conn:
+        cur = await conn.execute(
+            "DELETE FROM graphs WHERE owner_id LIKE 'guest:%' AND updated_at < ?",
+            (cutoff,),
+        )
+        removed = cur.rowcount or 0
+        await conn.execute(
+            "DELETE FROM chat_threads WHERE owner_id LIKE 'guest:%' AND updated_at < ?",
+            (cutoff,),
+        )
+    return removed

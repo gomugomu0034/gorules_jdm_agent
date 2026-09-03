@@ -17,9 +17,21 @@ import { downloadGraph } from '../../lib/download';
 import { useGraphStore } from '../../stores/useGraphStore';
 import { useUiStore } from '../../stores/useUiStore';
 import { Badge, Button, IconButton, Spinner, cx } from '../ui';
+import { SessionControl } from './SessionControl';
 
-export function TopBar({ onOpenHistory }: { onOpenHistory: () => void }) {
-  const { graph, dirty, saving, rename, save } = useGraphStore();
+export function TopBar({
+  onOpenHistory,
+  onSaveDraft,
+}: {
+  onOpenHistory: () => void;
+  /** Opens the name dialog; only reachable while editing an unsaved draft. */
+  onSaveDraft?: () => void;
+}) {
+  const { graph, content, dirty, saving, isDraft, draftName: draftPolicyName, rename, save } =
+    useGraphStore();
+  // The starting skeleton is just an input and an output; there is nothing
+  // worth saving until the user or the assistant has added to it.
+  const worthSaving = (content?.nodes?.length ?? 0) > 2 || dirty;
   const { theme, toggleTheme, toggleSidebar, toggleChat, chatOpen } = useUiStore();
 
   const [editing, setEditing] = useState(false);
@@ -57,7 +69,15 @@ export function TopBar({ onOpenHistory }: { onOpenHistory: () => void }) {
 
       <div className="mx-1 h-5 w-px bg-border" />
 
-      {graph ? (
+      {isDraft ? (
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate px-1.5 py-1 text-sm font-medium text-fg">
+            {draftPolicyName ?? 'Untitled policy'}
+          </span>
+          <Badge tone="warning">Draft</Badge>
+          <span className="text-2xs text-fg-subtle">Not saved yet</span>
+        </div>
+      ) : graph ? (
         <div className="flex min-w-0 items-center gap-2">
           {editing ? (
             <input
@@ -106,7 +126,19 @@ export function TopBar({ onOpenHistory }: { onOpenHistory: () => void }) {
 
       <div className="flex-1" />
 
-      {graph ? (
+      {isDraft ? (
+        <Button
+          size="sm"
+          variant="primary"
+          icon={<Save size={13} />}
+          onClick={onSaveDraft}
+          loading={saving}
+          disabled={!worthSaving}
+          title={worthSaving ? undefined : 'Add a node, or ask the assistant, first'}
+        >
+          Save policy
+        </Button>
+      ) : graph ? (
         <>
           <Button
             size="sm"
@@ -172,6 +204,8 @@ export function TopBar({ onOpenHistory }: { onOpenHistory: () => void }) {
       >
         {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
       </IconButton>
+
+      <SessionControl />
     </header>
   );
 }

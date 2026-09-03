@@ -248,7 +248,27 @@ class ThreadStateResponse(BaseModel):
 class AcceptProposalRequest(BaseModel):
     graph_id: str | None = None
     name: str | None = None
+    # When there is no target graph yet, False returns the content as an
+    # unsaved draft and True commits it as a new graph.
+    persist: bool = False
 
 
 class RejectProposalRequest(BaseModel):
     reason: str = ""
+
+
+# --------------------------------------------------------------------------
+# Session
+# --------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class SessionResponse(BaseModel):
+    mode: Literal["guest", "admin"]
+    email: str | None = None
+    # False when no ADMIN_PASSWORD is configured, so the UI can hide sign-in
+    # instead of offering a form that cannot succeed.
+    login_enabled: bool = False
