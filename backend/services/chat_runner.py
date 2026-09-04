@@ -28,18 +28,29 @@ NODE_LABELS = {
     "modify_triage_node": "Checking the change against the current graph",
     "human_triage_review_node": "Waiting for your approval",
     "planner_node": "Planning the graph structure",
+    "patch_node": "Editing the policy",
     "builder_node": "Building and testing the graph",
     "output_node": "Preparing the result",
     "human_final_approval_node": "Waiting for your approval",
     "save_files_node": "Saving the policy",
     "explain_node": "Reading the graph",
     "test_node": "Running the test suite",
+    "lint_node": "Checking the graph for problems",
 }
-TOTAL_STEPS = 6
+# Runs vary in length - a lint is one node, a build with retries is a dozen - so a fixed
+# denominator produced "step 9 of 6". The count adapts to what the run has actually done.
+MIN_TOTAL_STEPS = 6
 
 _runs: dict[str, asyncio.Task] = {}
 _locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+# Threads the user has asked to stop. Written by `request_cancel`, read by the agent's
+# long-running nodes between attempts so a run can end cleanly - reporting what it had -
+# instead of only ever being killed mid-step by `task.cancel()`, which discards the turn.
 _cancelled: set[str] = set()
+
+
+def is_cancelled(thread_id: str) -> bool:
+    return thread_id in _cancelled
 
 
 class ThreadBusy(Exception):
@@ -52,12 +63,22 @@ def is_running(thread_id: str) -> bool:
 
 
 async def request_cancel(thread_id: str) -> bool:
+    """Ask a run to stop.
+
+    The flag is set first so a node between steps can return a CANCELLED result with its
+    work intact; the hard cancel follows because an in-flight LLM call cannot be
+    interrupted and the user is entitled to a prompt stop either way.
+    """
     _cancelled.add(thread_id)
     task = _runs.get(thread_id)
     if task and not task.done():
         task.cancel()
         return True
     return False
+
+
+def _clear_cancel(thread_id: str) -> None:
+    _cancelled.discard(thread_id)
 
 
 def _canvas_state(canvas) -> dict:
@@ -73,7 +94,9 @@ def _canvas_state(canvas) -> dict:
 
 async def start_message(thread_id: str, text: str, canvas) -> str:
     """Begin a new turn from a user message."""
-    payload = {"messages": [HumanMessage(content=text)], **_canvas_state(canvas)}
+    _clear_cancel(thread_id)
+    payload = {"messages": [HumanMessage(content=text)], "thread_id": thread_id,
+               **_canvas_state(canvas)}
 
     # Pre-load the saved suite so test_node runs what the user actually has,
     # rather than regenerating one every time.
@@ -225,7 +248,7 @@ def _node_start(node: str, step: int) -> dict:
         "node": node,
         "label": NODE_LABELS.get(node, node.replace("_node", "").replace("_", " ").title()),
         "step": step,
-        "of": TOTAL_STEPS,
+        "of": max(MIN_TOTAL_STEPS, step),
     }
 
 

@@ -230,11 +230,14 @@ def test_test_intent_runs_saved_suite(stub_llm):
     values = graph.get_state(config).values
     assert values["intent"] == "TEST"
     summary = json.loads(values["evaluation_feedback"])
-    # This graph genuinely does not emit its declared outputs.
-    assert summary["failed"] == summary["total"] > 0
+    # The shipped policy passes its own suite. It used to fail all 11 - every output cell
+    # was an unquoted label, so the fields were silently dropped - which the linter found
+    # and this fixture now guards against regressing.
+    assert summary["passed"] == summary["total"] > 0
+    assert summary["failed"] == 0
 
     report = values["messages"][-1].content
-    assert "tests passed" in report and "❌" in report
+    assert "tests passed" in report and "✅" in report
 
 
 def test_two_replies_in_a_row_do_not_collide(stub_llm):
@@ -292,3 +295,33 @@ def test_intent_router_never_interrupts(stub_llm):
     assert payload is not None
     assert "Welcome" not in payload["prompt"]
     assert graph.get_state(config).next != ("intent_router_node",)
+
+
+def test_every_key_sent_on_a_resume_can_be_written_twice():
+    """A resume payload key without a reducer is a latent INVALID_CONCURRENT_GRAPH_UPDATE.
+
+    A node that pauses twice - the clarification chip, then the free-text box - is resumed
+    twice against the *same* checkpoint, and LangGraph accumulates both writes into one
+    step. A plain last-value channel rejects that. This guards the whole payload rather
+    than the keys that happened to break, so adding a new one cannot quietly reintroduce it.
+    """
+    from typing import Annotated, get_args, get_origin, get_type_hints
+
+    from backend.services import chat_runner
+
+    class Canvas:
+        content = {"nodes": [], "edges": []}
+        graph_id = "g"
+        name = "n"
+
+    carried = set(chat_runner._canvas_state(Canvas())) | {"thread_id"}
+    hints = get_type_hints(agent.AgentState, include_extras=True)
+
+    unguarded = [
+        key for key in sorted(carried)
+        if get_origin(hints.get(key)) is not Annotated or len(get_args(hints[key])) < 2
+    ]
+    assert not unguarded, (
+        f"these keys travel on every resume but have no reducer: {unguarded}. "
+        "Annotate them with `_latest`."
+    )

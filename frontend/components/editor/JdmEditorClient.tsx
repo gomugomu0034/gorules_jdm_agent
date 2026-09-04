@@ -9,12 +9,13 @@ import {
   type Simulation,
 } from '@gorules/jdm-editor';
 import '@gorules/jdm-editor/dist/style.css';
-import { FlaskConical, Play } from 'lucide-react';
+import { FlaskConical, Play, ShieldCheck } from 'lucide-react';
 import { useMemo } from 'react';
 
 import { antdTheme } from '../../lib/theme';
 import { useUiStore } from '../../stores/useUiStore';
 import { SimulatorPanel } from './SimulatorPanel';
+import { ProblemsPanel } from './ProblemsPanel';
 import { TestRunnerPanel } from './TestRunnerPanel';
 
 type Props = {
@@ -86,6 +87,12 @@ export default function JdmEditorClient({
         title: 'Tests',
         icon: <FlaskConical size={14} />,
         renderPanel: () => <TestRunnerPanel />,
+      },
+      {
+        id: 'problems',
+        title: 'Problems',
+        icon: <ShieldCheck size={14} />,
+        renderPanel: () => <ProblemsPanel />,
       },
     ],
     [onSimulate, simulating, onClearSimulation],

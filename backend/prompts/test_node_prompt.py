@@ -1,10 +1,9 @@
-from backend.prompts.gorules_domain_knowledge.gorules_jdm_knowledge_base import GORULES_KNOWLEDGE_BASE, ADDITIONAL_DOMAIN_KNOWLEDGE_BASE
+from backend.prompts.gorules_domain_knowledge.gorules_jdm_knowledge_base import sections
 
 PROMPT_TEST = f"""
 You are an expert GoRules Zen Engine QA analyst.
 You must use your GoRules domain knowledge and additional knowledge base added below to create a test suite covering all the scenarios and edge cases.
-GORULES_KNOWLEDGE_BASE - {GORULES_KNOWLEDGE_BASE}
-ADDITIONAL_KNOWLEDGE_BASE = {ADDITIONAL_DOMAIN_KNOWLEDGE_BASE}
+{sections(2, 3, 4, 6)}
 
 MUST FOLLOW OUTPUT FORMAT:
 Output ONLY a valid JSON array of test cases inside ---TESTS STARTS--- and ---TESTS ENDS--- boundaries.

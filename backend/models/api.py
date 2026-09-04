@@ -175,6 +175,39 @@ class PatchTestRequest(BaseModel):
     order: int | None = None
 
 
+class CoverageResponse(BaseModel):
+    summary: dict[str, Any]
+    nodes: list[dict[str, Any]]
+    suggestions: list[dict[str, Any]]
+
+
+class ExplainRequest(BaseModel):
+    """Explain one evaluation. `content` targets the unsaved canvas."""
+
+    context: Any = Field(default_factory=dict)
+    content: dict[str, Any] | None = None
+    version: int | None = None
+
+
+class ExplainResponse(BaseModel):
+    result: Any
+    steps: list[dict[str, Any]]
+
+
+class LintRequest(BaseModel):
+    """Lint a saved graph, or the unsaved canvas when `content` is supplied."""
+
+    content: dict[str, Any] | None = None
+    version: int | None = None
+
+
+class LintResponse(BaseModel):
+    summary: dict[str, int]
+    # Untyped like TestRunResponse.results, so a new diagnostic field reaches the client
+    # without a schema change on both sides.
+    findings: list[dict[str, Any]]
+
+
 class RunTestsRequest(BaseModel):
     content: dict[str, Any] | None = None
     test_ids: list[str] | None = None

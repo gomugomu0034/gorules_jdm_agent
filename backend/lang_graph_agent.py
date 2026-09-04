@@ -1,3 +1,4 @@
+import time
 import json
 import re
 import os
@@ -31,8 +32,17 @@ from backend.prompts.modify_triage_node_prompt import PROMPT_MODIFY_TRIAGE
 from backend.prompts.explain_node_prompt import PROMPT_EXPLAIN, PROMPT_EXPLAIN_USER
 from backend.prompts.test_node_prompt import PROMPT_TEST, PROMPT_TEST_USER, PROMPT_TEST_REPORT
 from backend.prompts.intent_router_prompt import PROMPT_INTENT
+from backend.prompts.patch_node_prompt import PROMPT_PATCH, PROMPT_PATCH_USER
 
-from backend.tools.markdown_dsl_parser import parse_markdown_dsl
+from backend.tools.markdown_dsl_parser import DslError, parse_markdown_dsl
+from backend.tools.diagnostics import (
+    KIND_HEADINGS,
+    Diagnostic,
+    format_for_llm,
+    parse_engine_error,
+)
+from backend.tools.jdm_linter import blocking, lint
+from backend.tools.jdm_patch import PatchError, apply_patch, describe as describe_patch
 from backend.tools.zen_evaluator import check_jdm_format, evaluate_against_zen, run_test_suite
 
 
@@ -53,6 +63,27 @@ ACTIVE_PROVIDER = os.getenv("LLM_PROVIDER", "huggingface").lower()
 # Every provider gets the same ceiling; a hung call would otherwise stall a run
 # until the agent-level wall-clock budget fires.
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT", "120"))
+
+# Generating a delimited DSL is a format-following task, not a creative one, and the repair
+# loop depends on the same input producing the same output. Only Gemini pinned this before;
+# the other three ran at whatever the provider defaults to.
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
+
+# The whole-run budget enforced by `asyncio.wait_for` in chat_runner. Mirrors
+# `settings.agent_run_timeout`; the builder needs it to size its repair loop.
+AGENT_RUN_TIMEOUT_SECONDS = int(os.getenv("AGENT_RUN_TIMEOUT", "900"))
+
+
+def _max_build_attempts() -> int:
+    """How many builder passes fit inside the run's wall clock.
+
+    Attempt 0 spends no LLM call, so N attempts cost N-1 calls. The old fixed ceiling of 8
+    could spend 960s against a 900s run budget - and when that budget fires, `asyncio.wait_for`
+    discards the turn while this node has checkpointed nothing, losing every repair it made.
+    Leave room for the planner call that precedes the loop and the reporting that follows.
+    """
+    usable = AGENT_RUN_TIMEOUT_SECONDS - LLM_TIMEOUT_SECONDS  # the planner's own call
+    return max(2, min(8, 1 + int(usable * 0.8) // max(LLM_TIMEOUT_SECONDS, 1)))
 
 # Gemini Config
 GOOGLE_API_KEY = os.getenv("GOOGLE_AI_API_KEY")
@@ -175,7 +206,7 @@ def _call_gemini(sys_prompt: str, messages: list) -> str:
 
     config = types.GenerateContentConfig(
         system_instruction=sys_prompt,
-        temperature=0.0,
+        temperature=LLM_TEMPERATURE,
         http_options=types.HttpOptions(timeout=LLM_TIMEOUT_SECONDS * 1000),
     )
     response = gemini_client.models.generate_content(
@@ -189,7 +220,7 @@ def _call_litellm(sys_prompt: str, messages: list) -> str:
     response = litellm_client.chat.completions.create(
         model=LITELLM_MODEL_NAME, messages=formatted,
         timeout=LLM_TIMEOUT_SECONDS,
-        # temperature=0.0
+        temperature=LLM_TEMPERATURE,
     )
     return response.choices[0].message.content
 
@@ -214,6 +245,7 @@ def _call_huggingface(sys_prompt: str, messages: list) -> str:
         model=model,
         messages=formatted,
         timeout=LLM_TIMEOUT_SECONDS,
+        temperature=LLM_TEMPERATURE,
     )
     return response.choices[0].message.content
 
@@ -232,6 +264,7 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
     payload = {
         "model": OPENROUTER_MODEL_NAME,
         "messages": formatted,
+        "temperature": LLM_TEMPERATURE,
     }
     if OPENROUTER_REASONING_ENABLED:
         payload["reasoning"] = {"enabled": True}
@@ -303,6 +336,13 @@ class AgentState(TypedDict):
     evaluation_feedback: str
     build_status: str
     build_failed: bool
+    build_attempts_used: int  # Repair budget spent so far, across re-entries to the builder
+    # Travels with every resume, so it needs `_latest` for the same reason the canvas
+    # keys do: two resumes against one checkpoint would otherwise collide.
+    thread_id: Annotated[str, _latest]  # Lets long-running nodes see a stop request
+    lint_findings: list  # Non-blocking lint warnings and hints on the built graph
+    patch_log: list  # One line per edit applied, for the action log
+    test_regressions: list  # Saved cases that disagree with an edit's new behaviour
     final_approval_status: str
     usecase_name: str
     mode: str  # "NEW" or "EXISTING"
@@ -315,7 +355,7 @@ class AgentState(TypedDict):
     canvas_jdm_json: Annotated[str, _latest]  # The graph on the canvas, unsaved edits included
     canvas_graph_id: Annotated[str, _latest]  # Database id, "" for a scratch canvas
     canvas_graph_name: Annotated[str, _latest]
-    intent: str  # "CREATE" | "MODIFY" | "TEST" | "EXPLAIN"
+    intent: str  # "CREATE" | "MODIFY" | "TEST" | "EXPLAIN" | "LINT"
     intent_confidence: float
     cancel_requested: Annotated[bool, _latest]
 
@@ -375,23 +415,101 @@ def _extract_single_json(text: str) -> str:
     return text.strip()
 
 
-def _extract_bounded_text(content: str, start_marker: str, end_marker: str, strip_lang: str = "") -> str:
-    """Extracts text between custom markers and strips any rogue markdown backticks."""
-    # Find text between markers
-    pattern = rf'{start_marker}\s*(.*?)\s*{end_marker}'
-    match = re.search(pattern, content, re.DOTALL)
+# A fence that opens on the first line and closes on the last: the only shape that can be
+# a *wrapper* rather than part of the payload.
+_WRAPPING_FENCE_RE = re.compile(r'^```([^\s`]*)[^\S\n]*\n(.*)\n```$', re.DOTALL)
 
+
+def _unwrap_fence(text: str, expect_lang: str = "") -> str:
+    """Remove a code fence, but only one that encloses the whole of `text`.
+
+    The DSL legitimately *contains* fences - ```mermaid for the flowchart, ```expressions,
+    ```js - so a stripper that removes any leading backticks eats the mermaid fence and
+    leaves the bare word "mermaid" behind. That parses to a graph with no edges and raises
+    nothing, which is exactly the failure `backend/debug_graph.md` was left behind by.
+
+    A fence is treated as a wrapper only when it opens at the very start, closes at the very
+    end, and its language tag is either absent or the one we asked for.
+    """
+    match = _WRAPPING_FENCE_RE.match(text.strip())
+    if not match:
+        return text.strip()
+    lang = match.group(1).lower()
+    if lang and expect_lang and lang != expect_lang.lower():
+        # e.g. ```mermaid where we expected ```markdown: this is content, not a wrapper.
+        return text.strip()
+    return match.group(2).strip()
+
+
+def _extract_bounded_text(content: str, start_marker: str, end_marker: str, strip_lang: str = "") -> str:
+    """Extract the text between two literal markers, unwrapping an enclosing fence."""
+    pattern = rf'{re.escape(start_marker)}\s*(.*?)\s*{re.escape(end_marker)}'
+    match = re.search(pattern, content, re.DOTALL)
     if not match:
         return ""
-    text = match.group(1).strip()
-    # Strip rogue opening backticks (e.g., ```markdown or ```json)
-    if text.startswith('```'):
-        text = re.sub(rf'^```(?:{strip_lang})?\s*', '', text, flags=re.IGNORECASE)
-    # Strip rogue closing backticks
-    if text.endswith('```'):
-        text = re.sub(r'```$', '', text).strip()
+    return _unwrap_fence(match.group(1), strip_lang)
 
-    return text.strip()
+
+def _fenced_block(content: str, lang: str) -> str:
+    """First fenced block tagged `lang`, matched to *its own* closing fence.
+
+    Depth matters here: the DSL nests ```mermaid and ```js inside, so a non-greedy regex
+    stops at the first inner close and silently truncates the block. A line of bare
+    backticks closes; a line of backticks with a language tag opens.
+    """
+    lines = content.split("\n")
+    opener = re.compile(rf'^\s*```{re.escape(lang)}\s*$', re.IGNORECASE)
+    start = next((i for i, line in enumerate(lines) if opener.match(line)), None)
+    if start is None:
+        return ""
+
+    depth = 0
+    for i in range(start, len(lines)):
+        fence = lines[i].strip()
+        if not fence.startswith("```"):
+            continue
+        if fence == "```":
+            depth -= 1
+            if depth == 0:
+                return "\n".join(lines[start + 1:i]).strip()
+        else:
+            depth += 1
+    return ""
+
+
+def _extract_plan_blocks(content: str) -> tuple[str, str, str]:
+    """Pull (dsl, tests, usecase_name) out of a planner or builder reply.
+
+    The markers are the contract, but a small model follows a long format imperfectly, and
+    an unparseable reply costs a whole attempt. So each block falls back to the shape the
+    model most plausibly reached for instead: a fenced block, or - for the DSL, which has an
+    unmistakable "# Structure" / "# Nodes" skeleton - the raw text itself.
+    """
+    dsl = _extract_bounded_text(content, "---DSL STARTS---", "---DSL ENDS---", strip_lang="markdown")
+    tests = _extract_bounded_text(content, "---TESTS STARTS---", "---TESTS ENDS---", strip_lang="json")
+    usecase = _extract_bounded_text(content, "---USECASE NAME STARTS---", "---USECASE NAME ENDS---")
+
+    if not dsl:
+        dsl = _fenced_block(content, "markdown")
+    if not dsl and "# Structure" in content and "# Nodes" in content:
+        # Unfenced and unmarked, but structurally unmistakable. Take from the heading to
+        # wherever the tests begin, so a trailing JSON array is not swept into the DSL.
+        body = content[content.index("# Structure"):]
+        for boundary in ("---TESTS STARTS---", "---USECASE NAME STARTS---"):
+            if boundary in body:
+                body = body[: body.index(boundary)]
+        # An unmarked tests array may simply trail the DSL; do not swallow it.
+        body = re.sub(r'\n\s*\[\s*\{.*}\s*]\s*$', '', body, flags=re.DOTALL)
+        dsl = body.strip()
+
+    if not tests:
+        tests = _fenced_block(content, "json")
+    if not tests:
+        # A bare array anywhere in the reply.
+        match = re.search(r'\[\s*\{.*}\s*]', content, re.DOTALL)
+        tests = match.group(0).strip() if match else ""
+
+    return dsl, tests, usecase
 
 # ==========================================
 # 3. WORKFLOW NODES
@@ -409,6 +527,17 @@ _EXPLAIN_RE = re.compile(
 )
 _TEST_RE = re.compile(
     r"\b(test|tests|testing|test case|test cases|run the suite|verify|validate|check that)\b",
+    re.IGNORECASE,
+)
+# Matched before EXPLAIN and TEST: "check my policy" is a request to review it, not to
+# run its suite. Rules cover the common phrasings so this never has to reach the LLM -
+# which also matters on a rate-limited free tier.
+_LINT_RE = re.compile(
+    r"\b(lint|critique|code review|best practices?|"
+    r"well[ -]?built|well[ -]?structured|look(s)? (ok|okay|good|right|fine)|"
+    r"(any|what) (problems?|issues?|mistakes?)|anything wrong|what.s wrong|"
+    r"review (this|the|my)|(check|assess|audit) (the |this |my )?(graph|policy|quality|structure)|"
+    r"quality (check|control)|improve (this|the|my) (graph|policy))\b",
     re.IGNORECASE,
 )
 _MODIFY_RE = re.compile(
@@ -452,6 +581,8 @@ def _classify_intent(text: str, has_graph: bool) -> tuple[str, float]:
     if not text:
         return "MODIFY", 0.3
 
+    if _LINT_RE.search(text):
+        return "LINT", 0.9
     if _EXPLAIN_RE.search(text):
         return "EXPLAIN", 0.9
     if _TEST_RE.search(text):
@@ -465,7 +596,7 @@ def _classify_intent(text: str, has_graph: bool) -> tuple[str, float]:
         raw = call_llm(PROMPT_INTENT, [HumanMessage(content=text)])
         parsed = json.loads(_extract_single_json(raw))
         intent = str(parsed.get("intent", "")).upper()
-        if intent in ("CREATE", "MODIFY", "TEST", "EXPLAIN"):
+        if intent in ("CREATE", "MODIFY", "TEST", "EXPLAIN", "LINT"):
             return intent, float(parsed.get("confidence", 0.5))
     except Exception as e:
         print(f"  --> [Intent]: LLM classification failed ({e}); defaulting.")
@@ -674,6 +805,67 @@ def _format_test_report_markdown(report: dict) -> str:
 
 
 # Step 1: Evaluate Requirement
+
+# Step 0c: Lint (static analysis of the open graph)
+_SEVERITY_TITLES = {
+    "error": "Must fix",
+    "warning": "Worth checking",
+    "hint": "Could be better",
+}
+
+
+def lint_node(state: AgentState):
+    """Report the graph's static findings. Deterministic - no LLM call.
+
+    The same checks that gate a build, run on demand against whatever is on the canvas.
+    """
+    print("\n[Lint]: Checking the open graph...")
+
+    raw = state.get("existing_jdm_json") or state.get("canvas_jdm_json") or ""
+    try:
+        graph = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError:
+        graph = None
+
+    if not graph or not graph.get("nodes"):
+        return {"messages": [_assistant_message_from_llm(
+            "There is no policy open to check. Build or open one first."
+        )]}
+
+    _emit({"type": "progress", "node": "lint_node", "attempt": 1, "max_attempts": 1,
+           "phase": "lint", "message": "Checking the graph against the quality rules"})
+
+    findings = lint(graph)
+    name = state.get("selected_file") or state.get("canvas_graph_name") or "this policy"
+
+    if not findings:
+        return {"messages": [_assistant_message_from_llm(
+            f"**{name}** passes every check - structure, expressions, and quality."
+        )]}
+
+    counts = {s: sum(1 for d in findings if d.severity == s) for s in ("error", "warning", "hint")}
+    headline = ", ".join(f"{n} {s}{'s' if n != 1 else ''}"
+                         for s, n in counts.items() if n)
+    body = [f"Checked **{name}**: {headline}.", ""]
+
+    for severity in ("error", "warning", "hint"):
+        group = [d for d in findings if d.severity == severity]
+        if not group:
+            continue
+        body.append(f"### {_SEVERITY_TITLES[severity]}")
+        for diagnostic in group:
+            where = f" *({diagnostic.node_name})*" if diagnostic.node_name else ""
+            body.append(f"- **{diagnostic.code}**{where} - {diagnostic.message}")
+            if diagnostic.fix_hint:
+                body.append(f"  - {diagnostic.fix_hint}")
+        body.append("")
+
+    if counts["error"]:
+        body.append("Ask me to fix any of these and I will update the policy.")
+
+    return {"messages": [_assistant_message_from_llm("\n".join(body).strip())]}
+
+
 def triage_node(state: AgentState):
     print(f"\n[Step 1: Triage]: Evaluating requirements using {ACTIVE_PROVIDER.upper()}...")
 
@@ -775,9 +967,7 @@ def planner_node(state: AgentState):
     print(f"planner node content: {content}")
 
     # Use the robust extraction
-    dsl_content = _extract_bounded_text(content, "---DSL STARTS---", "---DSL ENDS---", strip_lang="markdown")
-    test_suite_json = _extract_bounded_text(content, "---TESTS STARTS---", "---TESTS ENDS---", strip_lang="json")
-    usecase_name = _extract_bounded_text(content, "---USECASE NAME STARTS---", "---USECASE NAME ENDS---")
+    dsl_content, test_suite_json, usecase_name = _extract_plan_blocks(content)
 
     # Fallback to empty array if tests weren't found
     if not test_suite_json:
@@ -787,8 +977,179 @@ def planner_node(state: AgentState):
         "graph_plan_dsl": dsl_content,
         "test_suite_json": test_suite_json,
         "usecase_name": usecase_name,
-        # "messages": [AIMessage(content=content)]
+        # The builder repairs what the planner wrote, so the plan has to be in the history
+        # it reads. Without this the first repair attempt is asked to fix a graph it was
+        # never shown and has to reconstruct it from the triage conversation. Tagged
+        # internal so `_is_internal` keeps the raw DSL out of the chat, exactly as the
+        # builder's own retry dumps already are.
+        "messages": [_assistant_message_from_llm(content, internal=True)],
     }
+
+
+def _user_cancelled(state: AgentState) -> bool:
+    """Has the user asked to stop this thread?
+
+    Imported lazily: the agent must not depend on the web layer at import time, since it
+    is also driven directly from tests and scripts.
+    """
+    thread_id = state.get("thread_id")
+    if not thread_id:
+        return False
+    try:
+        from backend.services.chat_runner import is_cancelled
+    except ImportError:  # pragma: no cover - agent used without the API
+        return False
+    return is_cancelled(thread_id)
+
+
+def _repair_instruction(error: Exception) -> str:
+    """Turn whatever went wrong into one instruction the model can act on.
+
+    Everything used to arrive as `SYSTEM ERROR: {str(e)}`, so a parse error, a dangling
+    edge, a bad expression and a wrong business answer were indistinguishable - and none
+    of them said which node to look at.
+    """
+    if isinstance(error, (DslError, PatchError)):
+        return format_for_llm([
+            Diagnostic(kind="dsl_parse", code="EDIT_ERROR", message=problem)
+            for problem in error.problems
+        ])
+
+    text = str(error)
+    if any(text.startswith(heading) for heading in KIND_HEADINGS.values()):
+        return text  # already a rendered diagnostic, raised from inside the loop
+
+    return format_for_llm([parse_engine_error(error)])
+
+
+
+# Step 2b: Patch (edit an existing graph in place)
+def patch_node(state: AgentState):
+    """Apply the requested change as targeted edits, rather than regenerating the policy.
+
+    The planner path rebuilds a graph from a plan, which mints new ids for every node and
+    edge - so an edit lost the canvas layout, broke `$nodes` references and produced a
+    total diff. Here the existing graph is the base and only the named parts move.
+    """
+    print("\n[Step 2b: Patch]: Editing the existing graph...")
+
+    # The canvas is re-sent on every resume, but `existing_jdm_json` is only computed once
+    # in the intent router - so an edit made on the canvas mid-conversation never reached
+    # the agent. Prefer the live canvas whenever there is one.
+    raw = state.get("canvas_jdm_json") or state.get("existing_jdm_json") or ""
+    try:
+        graph = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError:
+        graph = None
+    if not graph or not graph.get("nodes"):
+        return {
+            "build_status": "ERROR",
+            "evaluation_feedback": "There is no policy open to edit.",
+            "build_failed": True,
+        }
+
+    tests = _load_tests(state)
+    context = list(state["messages"]) + [
+        HumanMessage(content=_inject_jdm(PROMPT_PATCH_USER, json.dumps(graph, indent=2)))
+    ]
+
+    spent_before = int(state.get("build_attempts_used") or 0)
+    attempts = max(1, _max_build_attempts() - spent_before)
+    new_messages: list = []
+    last_feedback = ""
+
+    for attempt in range(attempts):
+        _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
+               "max_attempts": attempts, "phase": "llm",
+               "message": "Working out the smallest change" if attempt == 0
+                          else f"Revising the edit after attempt {attempt}"})
+
+        content = call_llm(PROMPT_PATCH, context)
+        new_messages.append(_assistant_message_from_llm(content, internal=True))
+        context.append(_assistant_message_from_llm(content))
+
+        block = _extract_bounded_text(content, "---OPS STARTS---", "---OPS ENDS---", strip_lang="json")
+        if not block:
+            block = _fenced_block(content, "json")
+        try:
+            operations = json.loads(block) if block.strip() else []
+        except json.JSONDecodeError as exc:
+            last_feedback = (f"The edit operations were not valid JSON ({exc}). Output a JSON "
+                             "array between ---OPS STARTS--- and ---OPS ENDS---.")
+            context.append(HumanMessage(content=last_feedback))
+            continue
+
+        if not operations:
+            return {
+                "build_status": "ERROR",
+                "build_failed": True,
+                "evaluation_feedback": "That change cannot be made by editing this policy.",
+                "messages": new_messages + [_assistant_message_from_llm(
+                    "I could not express that as a change to this policy. Could you say which "
+                    "node or rule it should affect?"
+                )],
+                "build_attempts_used": spent_before + attempt + 1,
+            }
+
+        try:
+            _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
+                   "max_attempts": attempts, "phase": "parse",
+                   "message": f"Applying {len(operations)} change(s)"})
+            patched = apply_patch(graph, operations)
+
+            blockers = blocking(lint(patched))
+            if blockers:
+                raise RuntimeError(format_for_llm(blockers))
+
+            _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
+                   "max_attempts": attempts, "phase": "evaluate",
+                   "message": f"Re-running {len(tests)} test case(s)"})
+
+            # A failing suite after a clean edit is not necessarily a mistake. The user
+            # asked for a behaviour change, so the cases that pinned the old behaviour are
+            # *supposed* to disagree - retrying would have the agent fight the request it
+            # was given. Report which ones moved and let the approval gate decide.
+            report = run_test_suite(json.dumps(patched), tests, trace=True) if tests else None
+            regressions = [
+                r["name"] for r in (report or {}).get("results", [])
+                if r["status"] in ("failed", "errored")
+            ]
+            result = "" if report is None else json.dumps(report["summary"])
+
+            return {
+                "test_regressions": regressions,
+                "jdm_json": json.dumps(patched),
+                "test_suite_json": json.dumps(tests),
+                "evaluation_feedback": result,
+                "usecase_name": state.get("canvas_graph_name") or state.get("selected_file") or "Policy",
+                "build_status": "SUCCESS",
+                "patch_log": describe_patch(operations),
+                "lint_findings": [d.as_dict() for d in lint(patched)],
+                "build_attempts_used": spent_before + attempt + 1,
+                "messages": new_messages,
+            }
+
+        except Exception as exc:  # noqa: BLE001
+            last_feedback = _repair_instruction(exc)
+            print(f"  --> [Patch error]: {str(exc)[:100]}...")
+            context.append(HumanMessage(content=last_feedback))
+            continue
+
+    return {
+        "build_status": "ERROR",
+        "evaluation_feedback": last_feedback or "The edit could not be applied.",
+        "build_attempts_used": spent_before + attempts,
+        "messages": new_messages,
+    }
+
+
+def _load_tests(state: AgentState) -> list:
+    """The saved suite, so an edit is checked against what the policy already promised."""
+    try:
+        tests = json.loads(state.get("test_suite_json") or "[]")
+        return tests if isinstance(tests, list) else []
+    except json.JSONDecodeError:
+        return []
 
 
 # Step 3: Builder (Generate JDM and Tests)
@@ -804,11 +1165,26 @@ def builder_node(state: AgentState):
 
     new_messages = []  # Track LLM responses during the loop to append later
 
-    # Internal loop: Attempt 0 uses the Planner's output directly. Attempt 1-4 uses the LLM.
-    MAX_ATTEMPTS = 8
-    for attempt in range(MAX_ATTEMPTS):
+    # Internal loop: attempt 0 validates the Planner's output directly; later attempts ask
+    # the LLM to repair it. The budget lives in state, so re-entering the builder through
+    # the final-approval loop cannot silently restart it and overrun the run's wall clock.
+    spent_before = int(state.get("build_attempts_used") or 0)
+    MAX_ATTEMPTS = max(1, _max_build_attempts() - spent_before)
+    started = time.monotonic()
+    attempts_used = 0
+    last_feedback = ""
+    advisories: list = []
 
-        if state.get("cancel_requested"):
+    for attempt in range(MAX_ATTEMPTS):
+        attempts_used = attempt + 1
+
+        # Stop while there is still time to report; being killed by the run budget
+        # mid-repair would discard everything, since this node checkpoints only on return.
+        if attempt and time.monotonic() - started > AGENT_RUN_TIMEOUT_SECONDS * 0.7:
+            print("  --> [Builder]: wall-clock budget nearly spent; stopping early.")
+            break
+
+        if state.get("cancel_requested") or _user_cancelled(state):
             print("  --> [Builder]: Cancellation requested; stopping.")
             return {
                 "build_status": "CANCELLED",
@@ -834,28 +1210,28 @@ def builder_node(state: AgentState):
             new_messages.append(_assistant_message_from_llm(content, internal=True))
             context.append(_assistant_message_from_llm(content))
 
-            # 1. Extract using the robust markers
-            dsl_content = _extract_bounded_text(content, "---DSL STARTS---", "---DSL ENDS---", strip_lang="markdown")
-            test_suite_json = _extract_bounded_text(content, "---TESTS STARTS---", "---TESTS ENDS---", strip_lang="json")
-            usecase_name = _extract_bounded_text(content, "---USECASE NAME STARTS---", "---USECASE NAME ENDS---")
+            # 1. Extract, accepting the near-misses a small model tends to produce
+            new_dsl, new_tests, new_name = _extract_plan_blocks(content)
 
             # 2. Fallbacks if LLM skipped something
-            if not dsl_content:
-                # If it completely failed to output DSL, prompt it
+            if not new_dsl:
+                # Nothing usable came back. This is the only shape worth spending an
+                # attempt on, because there is no graph to compile.
                 context.append(HumanMessage(
                     content="FORMAT ERROR: Could not find ---DSL STARTS--- and ---DSL ENDS--- markers. Please output the DSL within these boundaries."))
                 continue
+            dsl_content = new_dsl
 
-            if not test_suite_json or test_suite_json == "[]":
+            if not new_tests or new_tests == "[]":
                 # Fallback to the history if the LLM was lazy
-                test_suite_json = state.get("test_suite_json", "[]")
                 print("  --> [Info]: Retained test suite from history.")
+            else:
+                test_suite_json = new_tests
 
-            if not usecase_name:
-                # If it completely failed to output DSL, prompt it
-                context.append(HumanMessage(
-                    content="FORMAT ERROR: Could not find ---USECASE NAME STARTS--- and ---USECASE NAME ENDS--- markers. Please output the Usecase name within these boundaries."))
-                continue
+            # A missing name is cosmetic - `usecase_name` already defaults, and the save
+            # path handles it - so it must never cost an attempt or discard a working DSL.
+            if new_name:
+                usecase_name = new_name
 
 
         # Save to a scratch file for debugging
@@ -876,6 +1252,19 @@ def builder_node(state: AgentState):
                 raise ValueError(f"Test JSON Format Error: {format_result}")
 
             parsed_jdm, parsed_tests = format_result
+
+            # Lint before behaviour. `create_decision` only deserializes, so a dangling
+            # edge, a missing input node or a malformed expression compiles cleanly here
+            # and only surfaces during evaluation - once per test case, as an opaque blob
+            # with no node attached. Only errors block: a loop that refused to finish over
+            # a style hint would never converge, so warnings and hints travel with the
+            # result for the user to judge.
+            findings = lint(parsed_jdm)
+            blockers = blocking(findings)
+            if blockers:
+                raise RuntimeError(format_for_llm(blockers))
+            advisories = [d.as_dict() for d in findings]
+
             progress("evaluate", f"Running {len(parsed_tests)} test case(s) through the engine")
             is_success, eval_result = evaluate_against_zen(jdm_json, parsed_tests)
 
@@ -890,18 +1279,26 @@ def builder_node(state: AgentState):
                 "evaluation_feedback": eval_result,
                 "usecase_name": usecase_name,
                 "build_status": "SUCCESS",
+                "lint_findings": advisories,
+                "build_attempts_used": spent_before + attempts_used,
                 "messages": new_messages  # Append debugging conversation to state
             }
 
         except Exception as e:
-            error_msg = f"SYSTEM ERROR:\n{str(e)}\n\nPlease fix the logic and output the corrected DSL and Test array."
+            last_feedback = _repair_instruction(e)
             print(f"  --> [Error Caught]: {str(e)[:100]}...")
-            context.append(HumanMessage(content=error_msg))
+            context.append(HumanMessage(content=last_feedback))
             continue  # Loop back and let the LLM try to fix it
 
     return {
         "build_status": "ERROR",
-        "evaluation_feedback": f"Failed to compile and test the Markdown DSL after {MAX_ATTEMPTS} attempts.",
+        # Carry the real reason, not just a count. This is the only thing the user sees on
+        # a failed build, and the only thing the planner sees if the approval loop sends
+        # the turn back around - a bare "failed after N attempts" told neither anything.
+        "evaluation_feedback": last_feedback or (
+            f"Failed to compile and test the Markdown DSL after {attempts_used} attempts."
+        ),
+        "build_attempts_used": spent_before + attempts_used,
         "messages": new_messages,
     }
 
@@ -959,16 +1356,55 @@ def output_node(state: AgentState):
         }.get(node.get("type", ""), node.get("type", "node"))
         return f"**{node.get('name', 'Unnamed')}** ({kind})"
 
-    lines = [
-        f"Built **{name}** - {len(nodes)} "
-        f"{'node' if len(nodes) == 1 else 'nodes'}, "
-        f"{len(tests)} {'test' if len(tests) == 1 else 'tests'}, all passing.",
-        "",
-        "The graph is on the canvas. Review it there, then approve to keep it.",
-    ]
-    if nodes:
-        lines += ["", "Flow:", ""]
-        lines += [f"- {_describe(n)}" for n in nodes]
+    # An edit reports what it changed; a fresh build reports what it made. Listing every
+    # node after a one-cell change buries the one line the reviewer actually needs.
+    patch_log = state.get("patch_log") or []
+    if patch_log:
+        # Say plainly whether the edit was verified. "0 tests still passing" reads like a
+        # result; it is the absence of one.
+        if tests:
+            headline = (f"Updated **{name}** - {len(patch_log)} "
+                        f"{'change' if len(patch_log) == 1 else 'changes'}, "
+                        f"{len(tests)} {'test' if len(tests) == 1 else 'tests'} still passing.")
+        else:
+            headline = (f"Updated **{name}** - {len(patch_log)} "
+                        f"{'change' if len(patch_log) == 1 else 'changes'}. This policy has "
+                        "no saved tests, so nothing checked the change.")
+        lines = [headline, "", "What changed:", ""]
+        lines += [f"- {entry}" for entry in patch_log]
+
+        regressions = state.get("test_regressions") or []
+        if regressions:
+            # Deliberately not framed as a failure: the change was requested, so the cases
+            # that pinned the old behaviour are meant to disagree. The user decides whether
+            # the policy moved or the tests are now out of date.
+            lines[0] = (f"Updated **{name}** - {len(patch_log)} "
+                        f"{'change' if len(patch_log) == 1 else 'changes'}. "
+                        f"{len(regressions)} saved "
+                        f"{'test' if len(regressions) == 1 else 'tests'} now expect the old "
+                        "behaviour:")
+            lines += ["", "No longer matching:", ""]
+            lines += [f"- {case}" for case in regressions[:8]]
+            if len(regressions) > 8:
+                lines.append(f"- ...and {len(regressions) - 8} more")
+            lines += ["", "Approve if the policy is right and the tests need updating, or "
+                          "tell me what to change instead."]
+        elif tests:
+            lines += ["", "Everything else is untouched. Review it on the canvas, then approve."]
+        else:
+            lines += ["", "Everything else is untouched. Ask me to write a test suite if you "
+                          "want the change pinned down."]
+    else:
+        lines = [
+            f"Built **{name}** - {len(nodes)} "
+            f"{'node' if len(nodes) == 1 else 'nodes'}, "
+            f"{len(tests)} {'test' if len(tests) == 1 else 'tests'}, all passing.",
+            "",
+            "The graph is on the canvas. Review it there, then approve to keep it.",
+        ]
+        if nodes:
+            lines += ["", "Flow:", ""]
+            lines += [f"- {_describe(n)}" for n in nodes]
 
     return {
         "messages": [_assistant_message_from_llm("\n".join(lines))],
@@ -1068,11 +1504,19 @@ def route_after_intent(state: AgentState):
         "MODIFY": "modify_triage_node",
         "TEST": "test_node",
         "EXPLAIN": "explain_node",
+        "LINT": "lint_node",
     }.get(state.get("intent", "CREATE"), "triage_node")
 
 
 def route_after_human_review(state: AgentState):
     if state.get("triage_status") == "APPROVED":
+        # Editing an existing policy is a patch, not a rebuild: regenerating it from a plan
+        # would mint new ids for every node and edge and lose whatever the model did not
+        # happen to re-emit.
+        if state.get("mode") == "EXISTING" and _is_non_empty_graph(
+            state.get("existing_jdm_json") or state.get("canvas_jdm_json") or ""
+        ):
+            return "patch_node"
         return "planner_node"
     else:
         # If the human review resulted in NEEDS_INFO, loop back to the correct triage AI!
@@ -1196,10 +1640,12 @@ workflow = StateGraph(AgentState)
 workflow.add_node("intent_router_node", intent_router_node)
 workflow.add_node("explain_node", explain_node)
 workflow.add_node("test_node", test_node)
+workflow.add_node("lint_node", lint_node)
 workflow.add_node("triage_node", triage_node)
 workflow.add_node("modify_triage_node", modify_triage_node)
 workflow.add_node("human_triage_review_node", human_triage_review_node)
 workflow.add_node("planner_node", planner_node)
+workflow.add_node("patch_node", patch_node)
 workflow.add_node("builder_node", builder_node)
 workflow.add_node("output_node", output_node)
 workflow.add_node("human_final_approval_node", human_final_approval_node)
@@ -1225,6 +1671,7 @@ workflow.add_conditional_edges(
 # Read-only intents finish in one pass.
 workflow.add_edge("explain_node", END)
 workflow.add_edge("test_node", END)
+workflow.add_edge("lint_node", END)
 
 workflow.add_edge("modify_triage_node", "human_triage_review_node")
 workflow.add_edge("triage_node", "human_triage_review_node")
@@ -1236,6 +1683,7 @@ workflow.add_conditional_edges(
     # CRITICAL FIX: Explicit path map prevents silent termination!
     {
         "planner_node": "planner_node",
+        "patch_node": "patch_node",
         "modify_triage_node": "modify_triage_node",
         "triage_node": "triage_node"
     }
@@ -1244,6 +1692,8 @@ workflow.add_conditional_edges(
 # generation for new and existing policy
 # Planner feeds directly to Builder
 workflow.add_edge("planner_node", "builder_node")
+# The patch is applied, linted and tested inside the node, so it reports directly.
+workflow.add_edge("patch_node", "output_node")
 # The builder reports failure through build_status; either way the user sees the
 # result, so this is a plain edge rather than a router with one destination.
 workflow.add_edge("builder_node", "output_node")

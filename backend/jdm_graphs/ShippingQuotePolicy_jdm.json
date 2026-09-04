@@ -1,0 +1,238 @@
+{
+  "contentType": "application/vnd.gorules.decision",
+  "nodes": [
+    {
+      "id": "aefdc3dc-3631-488f-aa0e-72fd64c9c323",
+      "name": "Request",
+      "type": "inputNode",
+      "content": {
+        "schema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"weightKg\": {\n      \"type\": \"number\"\n    },\n    \"destination\": {\n      \"type\": \"string\"\n    },\n    \"orderTotal\": {\n      \"type\": \"number\"\n    },\n    \"membership\": {\n      \"type\": \"string\"\n    }\n  },\n  \"required\": [\n    \"weightKg\",\n    \"destination\",\n    \"orderTotal\",\n    \"membership\"\n  ]\n}"
+      },
+      "position": {
+        "x": 100,
+        "y": 200
+      }
+    },
+    {
+      "id": "d5392017-4c37-459e-b63a-1ecfe8736876",
+      "name": "ValidateOrder",
+      "type": "decisionTableNode",
+      "content": {
+        "hitPolicy": "first",
+        "passThrough": true,
+        "inputs": [
+          {
+            "id": "28f55100-07ed-4143-b13b-b6af592946ff",
+            "name": "Weight",
+            "field": "weightKg"
+          },
+          {
+            "id": "02856497-62b5-4a74-b382-bee1a7ca12ab",
+            "name": "Order total",
+            "field": "orderTotal"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "0fedfc3a-9a7f-406e-b786-7ff8ab6ad1a8",
+            "name": "isValid",
+            "field": "isValid"
+          },
+          {
+            "id": "39bff45d-f3b1-444e-ab4f-c6d3c17a5d4c",
+            "name": "rejectReason",
+            "field": "rejectReason"
+          }
+        ],
+        "rules": [
+          {
+            "_id": "b16f44fe-5aa7-4416-b381-a4ad3783b117",
+            "28f55100-07ed-4143-b13b-b6af592946ff": "<= 0",
+            "02856497-62b5-4a74-b382-bee1a7ca12ab": "",
+            "0fedfc3a-9a7f-406e-b786-7ff8ab6ad1a8": "false",
+            "39bff45d-f3b1-444e-ab4f-c6d3c17a5d4c": "'Weight must be greater than zero'"
+          },
+          {
+            "_id": "caea79d4-2374-4ead-a5e2-c1afbb41e9d6",
+            "28f55100-07ed-4143-b13b-b6af592946ff": "",
+            "02856497-62b5-4a74-b382-bee1a7ca12ab": "< 0",
+            "0fedfc3a-9a7f-406e-b786-7ff8ab6ad1a8": "false",
+            "39bff45d-f3b1-444e-ab4f-c6d3c17a5d4c": "'Order total cannot be negative'"
+          },
+          {
+            "_id": "5eb477ae-3b88-40c8-a8cf-dbcde8251f86",
+            "28f55100-07ed-4143-b13b-b6af592946ff": "",
+            "02856497-62b5-4a74-b382-bee1a7ca12ab": "",
+            "0fedfc3a-9a7f-406e-b786-7ff8ab6ad1a8": "true",
+            "39bff45d-f3b1-444e-ab4f-c6d3c17a5d4c": ""
+          }
+        ]
+      },
+      "position": {
+        "x": 400,
+        "y": 200
+      }
+    },
+    {
+      "id": "a42297d6-a320-4992-a2d6-63e87007803f",
+      "name": "RouteOnValidity",
+      "type": "switchNode",
+      "content": {
+        "hitPolicy": "first",
+        "statements": [
+          {
+            "id": "2332504e-7f91-4736-aaaa-58366469bcb2",
+            "condition": "isValid == false",
+            "isDefault": false
+          },
+          {
+            "id": "32001928-bcb1-41d9-8f58-69cfb27b6cb6",
+            "condition": "",
+            "isDefault": true
+          }
+        ]
+      },
+      "position": {
+        "x": 700,
+        "y": 200
+      }
+    },
+    {
+      "id": "70e5636e-1575-439a-9004-9c78a777994b",
+      "name": "Rejected",
+      "type": "outputNode",
+      "content": {
+        "schema": ""
+      },
+      "position": {
+        "x": 1000,
+        "y": 200
+      }
+    },
+    {
+      "id": "04c98a86-5dc5-4ab7-bee8-5adb239bfa31",
+      "name": "WeightBand",
+      "type": "decisionTableNode",
+      "content": {
+        "hitPolicy": "first",
+        "passThrough": true,
+        "inputs": [
+          {
+            "id": "680c78d2-dc95-48c0-9aa6-6e271721f87c",
+            "name": "Weight",
+            "field": "weightKg"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "2b8d56d1-0c5b-4658-ac98-169a0a6fbdb4",
+            "name": "baseCost",
+            "field": "baseCost"
+          }
+        ],
+        "rules": [
+          {
+            "_id": "17d0a691-d990-4ec0-a4ce-20b6e5847a85",
+            "680c78d2-dc95-48c0-9aa6-6e271721f87c": "< 1",
+            "2b8d56d1-0c5b-4658-ac98-169a0a6fbdb4": "5"
+          },
+          {
+            "_id": "c1f9275f-72c3-4ab5-b7b6-0d9042a5afd6",
+            "680c78d2-dc95-48c0-9aa6-6e271721f87c": "[1..5]",
+            "2b8d56d1-0c5b-4658-ac98-169a0a6fbdb4": "9"
+          },
+          {
+            "_id": "280cc1a2-9893-475a-8646-01940108acf1",
+            "680c78d2-dc95-48c0-9aa6-6e271721f87c": "",
+            "2b8d56d1-0c5b-4658-ac98-169a0a6fbdb4": "15"
+          }
+        ]
+      },
+      "position": {
+        "x": 1300,
+        "y": 200
+      }
+    },
+    {
+      "id": "dea10414-ddd0-40bb-bed1-5a9d57478b0c",
+      "name": "ApplyAdjustments",
+      "type": "expressionNode",
+      "content": {
+        "passThrough": true,
+        "expressions": [
+          {
+            "id": "2c4da1c3-c3a8-4abc-aa8b-f670252caa1c",
+            "key": "zoneMultiplier",
+            "value": "destination == 'international' ? 2 : 1"
+          },
+          {
+            "id": "b8f8c6c7-eb66-41c1-9bef-2e46c886e0cc",
+            "key": "memberDiscount",
+            "value": "membership == 'gold' ? 0.8 : 1"
+          },
+          {
+            "id": "31662177-32aa-4a96-bec3-f5639eabe219",
+            "key": "shippingCost",
+            "value": "orderTotal > 150 ? 0 : $nodes.WeightBand.baseCost * $.zoneMultiplier * $.memberDiscount"
+          }
+        ]
+      },
+      "position": {
+        "x": 1600,
+        "y": 200
+      }
+    },
+    {
+      "id": "d07b6517-6723-4cb0-af7f-f54ca6cf722f",
+      "name": "Quote",
+      "type": "outputNode",
+      "content": {
+        "schema": ""
+      },
+      "position": {
+        "x": 1900,
+        "y": 200
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "98286aa3-9cbe-4ba4-8f1f-496449a05209",
+      "sourceId": "aefdc3dc-3631-488f-aa0e-72fd64c9c323",
+      "targetId": "d5392017-4c37-459e-b63a-1ecfe8736876",
+      "type": "edge"
+    },
+    {
+      "id": "6d3f3a2d-b7ea-4883-86b1-45949daf3b82",
+      "sourceId": "d5392017-4c37-459e-b63a-1ecfe8736876",
+      "targetId": "a42297d6-a320-4992-a2d6-63e87007803f",
+      "type": "edge"
+    },
+    {
+      "id": "1d675547-66e9-49d6-9952-01d3242d1aa7",
+      "sourceId": "a42297d6-a320-4992-a2d6-63e87007803f",
+      "targetId": "70e5636e-1575-439a-9004-9c78a777994b",
+      "type": "edge",
+      "sourceHandle": "2332504e-7f91-4736-aaaa-58366469bcb2"
+    },
+    {
+      "id": "73fcf6c0-f992-4c65-9f6a-41732771cd0c",
+      "sourceId": "a42297d6-a320-4992-a2d6-63e87007803f",
+      "targetId": "04c98a86-5dc5-4ab7-bee8-5adb239bfa31",
+      "type": "edge",
+      "sourceHandle": "32001928-bcb1-41d9-8f58-69cfb27b6cb6"
+    },
+    {
+      "id": "b6d143f4-ad80-425a-906e-3ffe8c47349b",
+      "sourceId": "04c98a86-5dc5-4ab7-bee8-5adb239bfa31",
+      "targetId": "dea10414-ddd0-40bb-bed1-5a9d57478b0c",
+      "type": "edge"
+    },
+    {
+      "id": "7e587780-f3c7-4426-9b32-aca35cb90810",
+      "sourceId": "dea10414-ddd0-40bb-bed1-5a9d57478b0c",
+      "targetId": "d07b6517-6723-4cb0-af7f-f54ca6cf722f",
+      "type": "edge"
+    }
+  ]
+}

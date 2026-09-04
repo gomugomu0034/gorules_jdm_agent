@@ -8,6 +8,7 @@ import type {
   Session,
   SimulationResponse,
   TestCase,
+  LintReport,
   TestRunReport,
   ThreadState,
   ValidationIssue,
@@ -206,6 +207,13 @@ export const api = {
 
   runTests: (id: string, content?: DecisionGraphType) =>
     request<TestRunReport>(`/api/graphs/${id}/tests/run`, { method: 'POST', ...json({ content }) }),
+
+  lintGraph: (id: string, content?: DecisionGraphType) =>
+    request<LintReport>(`/api/graphs/${id}/lint`, { method: 'POST', ...json({ content }) }),
+
+  // A draft has no graph row yet, so it is linted by content alone.
+  lintContent: (content: DecisionGraphType) =>
+    request<LintReport>('/api/lint', { method: 'POST', ...json({ content }) }),
 
   runAdhocTests: (content: DecisionGraphType, tests: TestCase[]) =>
     request<TestRunReport>('/api/tests/run', { method: 'POST', ...json({ content, tests }) }),

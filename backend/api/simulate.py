@@ -11,6 +11,7 @@ from fastapi import APIRouter
 
 from backend.api.errors import ApiError
 from backend.api.graphs import require_graph
+from backend.tools.diagnostics import parse_engine_error
 from backend.models.api import (
     SimulateRequest,
     SimulateResponse,
@@ -49,11 +50,21 @@ async def _run(content: dict, context, trace: bool) -> SimulateResponse:
 
 
 def _node_id_from_error(message: str, content: dict) -> str | None:
-    """Best-effort: point the editor at the node the engine complained about."""
+    """Point the editor at the node the engine complained about.
+
+    The engine's evaluation errors are JSON carrying an explicit ``nodeId``, so read it.
+    This used to scan the message for any node id or name as a substring, first match
+    wins - which would happily attribute an unrelated error to a node called "Fee" or
+    "In" because those strings turn up in ordinary prose.
+    """
+    diagnostic = parse_engine_error(message, content)
+    if diagnostic.node_id:
+        return diagnostic.node_id
+
+    # Fall back to matching by id only. Node ids are UUIDs, so a substring hit is
+    # meaningful; names are not, and are what made the old scan unreliable.
     for node in content.get("nodes", []):
         if node.get("id") and node["id"] in message:
-            return node["id"]
-        if node.get("name") and node["name"] in message:
             return node["id"]
     return None
 
