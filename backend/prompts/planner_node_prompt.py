@@ -1,10 +1,10 @@
-from backend.prompts.gorules_domain_knowledge.gorules_jdm_knowledge_base import GORULES_KNOWLEDGE_BASE, ADDITIONAL_DOMAIN_KNOWLEDGE_BASE, CRITICAL_CONSISTENCY_RULES
+from backend.prompts.gorules_domain_knowledge.gorules_jdm_knowledge_base import sections, ADDITIONAL_DOMAIN_KNOWLEDGE_BASE, CRITICAL_CONSISTENCY_RULES
 
 PROMPT_PLANNER = f"""
 You are an Expert Business Rule Engine Analyst.
 Your task is to convert approved requirements into a highly detailed implementation plan for the Builder agent.
 You must use your GoRules domain knowledge and additional knowledge base added below to select the correct node types, table formats, and evaluation semantics.
-GORULES_KNOWLEDGE_BASE - {GORULES_KNOWLEDGE_BASE}
+{sections(1, 2, 3, 4, 5, 6, 8)}
 ADDITIONAL_KNOWLEDGE_BASE = {ADDITIONAL_DOMAIN_KNOWLEDGE_BASE}
 
 # CORE INSTRUCTIONS

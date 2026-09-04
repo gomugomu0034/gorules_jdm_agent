@@ -197,6 +197,25 @@ def _warnings(graph: dict) -> list[Diagnostic]:
     return found
 
 
+_IDENTIFIER_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+
+def _looks_like_unquoted_label(cell: str, known: set[str]) -> bool:
+    """Is this output cell prose someone forgot to quote, rather than an expression?
+
+    Conservative on purpose. Anything with a quote or a digit is treated as deliberate,
+    and a cell is only suspicious when *every* identifier in it is unknown to the graph -
+    so `amount * 0.1` and `customer.tier` are left alone while `N/A`, `Denied` and
+    `Manual Review` are caught.
+    """
+    if "'" in cell or '"' in cell or any(ch.isdigit() for ch in cell):
+        return False
+    identifiers = _IDENTIFIER_RE.findall(cell)
+    if not identifiers:
+        return False
+    return all(name not in known and name.lower() not in _CELL_KEYWORDS for name in identifiers)
+
+
 def _known_identifiers(graph: dict) -> set[str]:
     """Every name something in this graph could plausibly resolve to.
 
@@ -258,28 +277,33 @@ def _table_warnings(node: dict, content: dict, known: set[str]) -> list[Diagnost
                              "row never matches.",
                 ))
 
-    # The same mistake on the output side is what makes a graph "run" while producing
-    # nothing: an unquoted label is a variable reference, resolves to null, and the engine
-    # drops the key entirely rather than raising. Only flag words nothing in the graph
-    # could actually produce, so a genuine field reference is left alone.
+    # The same mistake on the output side is worse, and it is why a graph can "run" while
+    # deciding nothing. An unquoted label is read as an expression over variables that do
+    # not exist. If it merely resolves to null the key is dropped; if it cannot evaluate at
+    # all - `N/A` parses happily as N divided by A - the engine skips *the whole rule* and
+    # falls through to the next match, so the wrong row silently wins.
+    #
+    # Only flag a cell that reads as a label rather than a computation: no quotes, no
+    # digits, and every identifier in it unknown to this graph. A real field reference or
+    # any arithmetic is left alone.
     for column in content.get("outputs") or []:
         for r, rule in enumerate(rules):
             cell = (rule.get(column.get("id")) or "").strip()
             if (
                 cell
-                and _BARE_WORD_RE.match(cell)
+                and _looks_like_unquoted_label(cell, known)
                 and cell.lower() not in _CELL_KEYWORDS
-                and cell not in known
             ):
                 found.append(Diagnostic(
                     kind="lint", severity="warning", code="UNQUOTED_STRING_CELL",
                     message=f'"{_label(node)}" row {r + 1}, output "{column.get("name")}": '
-                            f'{cell} is read as a variable, not the text "{cell}".',
+                            f'{cell} is read as an expression, not the text "{cell}".',
                     node_id=node.get("id"), node_name=node.get("name"),
                     path=f"rules[{r}].{column.get('name')}",
-                    fix_hint=f"Quote it: '{cell}'. Unquoted it resolves to null, and an "
-                             "empty output drops the key - which is why the field goes "
-                             "missing without any error.",
+                    fix_hint=f"Quote it: '{cell}'. Unquoted it is evaluated - at best it "
+                             "resolves to null and the key is dropped, at worst it cannot "
+                             "evaluate and the engine skips the whole rule, so a later row "
+                             "matches instead. Neither raises an error.",
                 ))
 
     return found

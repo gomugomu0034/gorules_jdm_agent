@@ -56,6 +56,23 @@ def table_of(graph_dict) -> dict:
     return next(n for n in graph_dict["nodes"] if n["type"] == "decisionTableNode")
 
 
+def unquote_outputs(graph_dict) -> dict:
+    """Reintroduce the bug the shipped examples used to have.
+
+    Every output cell was an unquoted label. That is valid ZEN - a variable reference - so
+    nothing raises; it resolves to null and the key is dropped. The graphs now ship fixed,
+    so the broken shape is built here rather than depending on a policy staying broken.
+    """
+    for node in graph_dict["nodes"]:
+        content = node.get("content") or {}
+        for column in content.get("outputs") or []:
+            for rule in content.get("rules") or []:
+                value = (rule.get(column["id"]) or "").strip()
+                if value.startswith("'") and value.endswith("'"):
+                    rule[column["id"]] = value[1:-1]
+    return graph_dict
+
+
 # --------------------------------------------------------------------------- no false positives
 
 def test_a_sound_graph_has_no_errors_or_warnings_worth_blocking(graph):
@@ -159,6 +176,27 @@ def test_a_reference_to_a_node_that_does_not_exist_is_a_warning(graph):
 
 # --------------------------------------------------------------------------- hints
 
+def test_the_shipped_examples_pass_their_own_suites():
+    """A template that fails its own tests teaches the model to write broken graphs."""
+    for name in ("LoanApprovalPolicy", "RefundPolicy", "ShippingQuotePolicy"):
+        with open(f"backend/jdm_graphs/{name}_jdm.json") as handle:
+            graph = json.load(handle)
+        with open(f"backend/jdm_tests/{name}_tests.json") as handle:
+            tests = json.load(handle)
+        summary = run_test_suite(json.dumps(graph), tests)["summary"]
+        assert summary["passed"] == summary["total"] > 0, f"{name}: {summary}"
+
+
+def test_the_decomposed_example_lints_clean():
+    """The template worth imitating: validate, branch, band, adjust - and nothing to fix."""
+    with open("backend/jdm_graphs/ShippingQuotePolicy_jdm.json") as handle:
+        graph = json.load(handle)
+
+    assert lint(graph) == [], [d.code for d in lint(graph)]
+    assert len([n for n in graph["nodes"] if n["type"] in
+                ("decisionTableNode", "expressionNode", "switchNode")]) >= 3
+
+
 def test_both_bundled_examples_are_flagged_as_monolithic():
     """They are the templates the model imitates, and both cram the whole policy into one
     decision table - the shape this rule exists to discourage."""
@@ -211,15 +249,14 @@ def test_a_column_no_rule_uses_is_hinted(graph):
 
 # --------------------------------------------------------------------------- the real bug
 
-def test_the_linter_diagnoses_the_bundled_graph_that_fails_every_test():
-    """LoanApprovalPolicy ships failing 11/11, and has since before the linter existed.
+def test_the_linter_diagnoses_the_unquoted_output_bug():
+    """The bug both shipped examples had, and the round trip out of it.
 
-    The cause is unquoted output cells: `Denied` is valid ZEN, so nothing raises - it
-    resolves to null, and an empty output drops the key entirely. Applying exactly what
-    the linter says, and changing no tests, makes the suite pass.
+    LoanApprovalPolicy failed 11/11 for exactly this reason. Unquote its outputs again and
+    the suite collapses; apply what the linter reports, change no tests, and it comes back.
     """
     with open("backend/jdm_graphs/LoanApprovalPolicy_jdm.json") as handle:
-        graph = json.load(handle)
+        graph = unquote_outputs(json.load(handle))
     with open("backend/jdm_tests/LoanApprovalPolicy_tests.json") as handle:
         tests = json.load(handle)
 
@@ -279,7 +316,7 @@ def test_the_lint_node_reports_findings_without_calling_the_llm(monkeypatch):
 
     monkeypatch.setattr(agent, "call_llm", explode)
     with open("backend/jdm_graphs/LoanApprovalPolicy_jdm.json") as handle:
-        graph = handle.read()
+        graph = json.dumps(unquote_outputs(json.load(handle)))
 
     result = agent.lint_node({"existing_jdm_json": graph, "selected_file": "Loan Approval"})
 

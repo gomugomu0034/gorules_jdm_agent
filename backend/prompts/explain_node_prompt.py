@@ -1,10 +1,9 @@
-from backend.prompts.gorules_domain_knowledge.gorules_jdm_knowledge_base import GORULES_KNOWLEDGE_BASE, ADDITIONAL_DOMAIN_KNOWLEDGE_BASE
+from backend.prompts.gorules_domain_knowledge.gorules_jdm_knowledge_base import sections
 
 PROMPT_EXPLAIN = f"""
 You are an expert GoRules Zen Engine business analyst and architect.
 You must use your GoRules domain knowledge and additional knowledge base added below to explain the JDM graphs provided by the end user.
-GORULES_KNOWLEDGE_BASE - {GORULES_KNOWLEDGE_BASE}
-ADDITIONAL_KNOWLEDGE_BASE = {ADDITIONAL_DOMAIN_KNOWLEDGE_BASE}
+{sections(2, 3, 4)}
 
 Use this knowledge to provide accurate business context when analyzing decision graphs -
 1. Create a Mermaid diagram (`flowchart LR`) representing the nodes and edges of this graph. Use the 'name' or 'type' fields from the nodes to label the shapes, and map the 'edges' to connect them properly.

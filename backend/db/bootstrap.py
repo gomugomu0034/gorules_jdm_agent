@@ -170,9 +170,10 @@ async def import_legacy_graphs() -> int:
 def _warn_if_failing(name: str, content: dict, tests: list) -> None:
     """Log up front when an imported graph does not satisfy its own suite.
 
-    Both graphs shipped in this repo fail every assertion. Surfacing that at
-    import time is deliberate: it is pre-existing breakage that the old
-    evaluator hid, not a regression in the test runner.
+    The shipped examples all pass now, so this should stay quiet. It is kept because an
+    example that fails its own tests teaches the model to write broken graphs - the two
+    originals did exactly that, and it went unnoticed for as long as the evaluator
+    reported any run that did not raise as a success.
     """
     if not tests:
         return
@@ -197,8 +198,11 @@ async def bootstrap() -> None:
     await apply_schema()
     await migrate_owners()
     await seed_admin()
-    if not await dao.get_meta(BOOTSTRAP_KEY):
-        count = await import_legacy_graphs()
-        await dao.set_meta(BOOTSTRAP_KEY, "done")
-        logger.info("Bootstrap complete; imported %s legacy graph(s).", count)
+    # Runs on every boot, not just the first. `import_legacy_graphs` already skips any
+    # graph the admin owns by that name, so this is idempotent - and gating it behind a
+    # one-shot flag meant an example added later never reached an existing install.
+    count = await import_legacy_graphs()
+    await dao.set_meta(BOOTSTRAP_KEY, "done")
+    if count:
+        logger.info("Imported %s example graph(s).", count)
     await sweep_guests()

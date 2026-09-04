@@ -77,6 +77,10 @@ Optionally on user request, attach a JSON Schema to validate incoming structure 
 - An unresolvable $dictionary name is a compile-time diagnostic on the node and a runtime node error. Sibling keys like description are preserved; a type/enum next to $dictionary is overridden.
 
 
+**Schema is a string field, not an object.** In the JDM the agent produces, `content.schema`
+holds the schema as *text* (`"schema": ""` when there is none). Section 7's worked example
+shows it expanded for readability; do not emit a nested object there.
+
 ### 3.2 Output node (`outputNode`)
 Terminal node(s). Produces the final result of the evaluation.
 A graph can have multiple Output nodes reached via different branches (e.g., one for "approved", one for "rejected" after a Switch node). This is verified to compile, validate and evaluate. Prefer a single Output node when every path ends in the same shape of result; use several only when the branches genuinely terminate differently and naming them makes the graph easier to read.
@@ -148,7 +152,9 @@ Add an optional trailing # column for row descriptions (not evaluated).
 
 - **Hit policy** decides what happens across rows:
     - `first` (default) — stop at the first fully-matching row; result is one object shaped by the output columns; if nothing matches, result is `null`/`undefined` (empty object `{}` in the newer editor semantics — treat both as "no match" and always test for it).
-    - `collect` — evaluate every row; result is an **array** of one object per matching row (empty array `[]` if none match). Use when multiple rules can legitimately apply at once (e.g., stacking fees, gathering all rejection reasons, all applicable promotions).
+    - `collect` — evaluate every row; result is an **array** of one object per matching row (empty array `[]` if none match).
+- **Per-column collect**: end an output field name with `[]` to gather just that column across every matching row while the other columns keep first-hit behaviour. `out tags[]` yields `{"tags": ["loyal", "vip"]}` alongside ordinary single-valued outputs.
+- With `collect`, set `outputPath` so the array lands in a named field. Without it the array arrives at the root, which downstream nodes cannot read by name. Use when multiple rules can legitimately apply at once (e.g., stacking fees, gathering all rejection reasons, all applicable promotions).
 **Column types:**
 - **Targeted field (unary)** — column has a `field` path (e.g., `customer.revenue`). Cells contain short unary tests: `> 100`, `[18..65]`, `'US', 'CA'`, empty for wildcard. See §4.3 for full unary syntax.
 - **Generic field (standard expression)** — column `field` is unset (`-`). Cells contain full ZEN expressions, e.g. `customer.revenue > 6000 and customer.status == 'active'`, or expressions referencing other nodes: `$nodes.CreditCheck.rating == 'excellent'`.
@@ -254,6 +260,9 @@ A branch condition appears twice in the projection (mermaid |label| for display,
 
 
 ### 3.7 Decision node (`decisionNode`)
+The engine field is `content.key`; the Markdown DSL spells it `calls:`. Write
+`calls: pricing/regional` in the DSL and the parser emits `{"key": "pricing/regional"}`.
+
 Invokes another JDM graph (by key/path) as a reusable sub-decision, passing it the current context and receiving its output. Use this to modularize shared logic (e.g., a "CreditScoreLookup" sub-decision reused across a loan-approval graph and a credit-limit-increase graph) instead of duplicating a decision table in multiple places.
 
 
@@ -271,6 +280,12 @@ ZEN is the expression language used throughout decision tables, expression nodes
 | **Unary test** | Decision-table input columns with a `field` set | `>= 100`, `[1..10]`, `'US', 'CA'` |
 
 Inside a unary column, prefixing with `$` (or calling a function) flips evaluation into full expression mode, e.g. `len($) > 5`, `contains($, 'urgent')` — `$` stands for the column's own value.
+
+**Membership in a unary cell** has two spellings, both valid and both used in practice:
+- comma list — `'US', 'CA', 'GB'`
+- explicit `in` with an array — `in ['US', 'CA', 'GB']`, and its negation `not in ['a', 'b']`
+The comma form is terser; the `in` form is clearer when the list is long or built from a
+variable. Quote string members in both.
 
 ### 4.2 Literals and core syntax
 ```
@@ -790,3 +805,36 @@ Most "missing field" or "undefined" errors occur because data was dropped betwee
 - **Syntax**: GoRules executes JavaScript in these nodes. The trace will provide the exact line number of the failure.
 - **Context Access**: To access incoming data inside the JS function, you must use the `input` object (e.g., `input.order_amount`). If `input.X` is undefined, verify the upstream node's `passThrough` configuration.
 """
+
+# ---------------------------------------------------------------------------
+# Scoped delivery
+# ---------------------------------------------------------------------------
+# The reference above is ~35,000 characters, and every prompt used to carry all of it -
+# the builder's system prompt ran to roughly 12,900 tokens of domain knowledge before it
+# saw a single error. On a small model that is the difference between the instructions
+# being read and being drowned, and it is paid on every attempt of every retry.
+#
+# So each node takes only the sections it can act on: a node that explains a graph does
+# not need the authoring rules, and a node repairing an expression does not need the test
+# design checklist.
+
+import re as _re
+
+_SECTIONS: dict[int, str] = {}
+_parts = _re.split(r'(?m)^(## (\d+)\..*)$', GORULES_KNOWLEDGE_BASE)
+_PREAMBLE = _parts[0]
+for _i in range(1, len(_parts), 3):
+    _SECTIONS[int(_parts[_i + 1])] = _parts[_i] + _parts[_i + 2]
+
+
+def sections(*numbers: int) -> str:
+    """The numbered sections of the reference, in order, with the preamble.
+
+    1 What the agent produces  2 JDM file structure  3 Node type reference
+    4 ZEN expression language  5 Rule-authoring guidelines  6 Testing guidelines
+    7 Worked example           8 Workflow checklist
+    """
+    unknown = set(numbers) - set(_SECTIONS)
+    if unknown:
+        raise KeyError(f"No such knowledge base section: {sorted(unknown)}")
+    return _PREAMBLE + "".join(_SECTIONS[n] for n in sorted(numbers))

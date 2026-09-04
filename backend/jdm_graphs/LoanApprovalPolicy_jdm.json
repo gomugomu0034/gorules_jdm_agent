@@ -6,7 +6,7 @@
       "name": "Application",
       "type": "inputNode",
       "content": {
-        "schema": ""
+        "schema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"creditScore\": {\n      \"type\": \"number\"\n    },\n    \"dti\": {\n      \"type\": \"number\"\n    },\n    \"ltv\": {\n      \"type\": \"number\"\n    }\n  },\n  \"required\": [\n    \"creditScore\",\n    \"dti\",\n    \"ltv\"\n  ]\n}"
       },
       "position": {
         "x": 100,
@@ -60,8 +60,8 @@
             "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": "< 580",
             "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "",
             "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "",
-            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Denied",
-            "8989971c-e233-423d-91f0-0dd7dc76766f": "Subprime",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "'Denied'",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "'Subprime'",
             "679e2bfa-1ddd-4493-9aca-13d687e40e49": ""
           },
           {
@@ -69,8 +69,8 @@
             "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": "",
             "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "> 50",
             "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "",
-            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Denied",
-            "8989971c-e233-423d-91f0-0dd7dc76766f": "Subprime",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "'Denied'",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "'Subprime'",
             "679e2bfa-1ddd-4493-9aca-13d687e40e49": ""
           },
           {
@@ -78,8 +78,8 @@
             "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": "",
             "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "",
             "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "> 95",
-            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Denied",
-            "8989971c-e233-423d-91f0-0dd7dc76766f": "Subprime",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "'Denied'",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "'Subprime'",
             "679e2bfa-1ddd-4493-9aca-13d687e40e49": ""
           },
           {
@@ -87,8 +87,8 @@
             "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": ">= 720",
             "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "<= 35",
             "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "<= 80",
-            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Approved",
-            "8989971c-e233-423d-91f0-0dd7dc76766f": "Prime",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "'Approved'",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "'Prime'",
             "679e2bfa-1ddd-4493-9aca-13d687e40e49": "0.065"
           },
           {
@@ -96,8 +96,8 @@
             "0a80a78d-e2a4-4a98-b0b8-fa05e9b9251a": "",
             "8dd6606d-e09c-4234-bc61-4d4d52cd50fa": "",
             "bebbcaee-eb8f-4210-9d9d-5cabc372adf2": "",
-            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "Manual Review",
-            "8989971c-e233-423d-91f0-0dd7dc76766f": "Near-Prime",
+            "bcd17ddd-a0d8-41c8-a8f3-d61bf3f06f18": "'Manual Review'",
+            "8989971c-e233-423d-91f0-0dd7dc76766f": "'Near-Prime'",
             "679e2bfa-1ddd-4493-9aca-13d687e40e49": ""
           }
         ]

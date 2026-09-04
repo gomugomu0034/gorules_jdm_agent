@@ -1,0 +1,136 @@
+[
+  {
+    "name": "Light domestic parcel pays the base rate",
+    "input": {
+      "weightKg": 0.5,
+      "destination": "domestic",
+      "orderTotal": 40,
+      "membership": "standard"
+    },
+    "expectedOutput": {
+      "shippingCost": 5
+    }
+  },
+  {
+    "name": "Boundary: exactly 1kg falls in the middle band",
+    "input": {
+      "weightKg": 1,
+      "destination": "domestic",
+      "orderTotal": 40,
+      "membership": "standard"
+    },
+    "expectedOutput": {
+      "shippingCost": 9
+    }
+  },
+  {
+    "name": "Boundary: exactly 5kg is still the middle band",
+    "input": {
+      "weightKg": 5,
+      "destination": "domestic",
+      "orderTotal": 40,
+      "membership": "standard"
+    },
+    "expectedOutput": {
+      "shippingCost": 9
+    }
+  },
+  {
+    "name": "Over 5kg pays the heavy rate",
+    "input": {
+      "weightKg": 7,
+      "destination": "domestic",
+      "orderTotal": 40,
+      "membership": "standard"
+    },
+    "expectedOutput": {
+      "shippingCost": 15
+    }
+  },
+  {
+    "name": "International doubles the base rate",
+    "input": {
+      "weightKg": 0.5,
+      "destination": "international",
+      "orderTotal": 40,
+      "membership": "standard"
+    },
+    "expectedOutput": {
+      "shippingCost": 10
+    }
+  },
+  {
+    "name": "Gold members take 20% off",
+    "input": {
+      "weightKg": 7,
+      "destination": "domestic",
+      "orderTotal": 40,
+      "membership": "gold"
+    },
+    "expectedOutput": {
+      "shippingCost": 12
+    }
+  },
+  {
+    "name": "International gold stacks both adjustments",
+    "input": {
+      "weightKg": 7,
+      "destination": "international",
+      "orderTotal": 40,
+      "membership": "gold"
+    },
+    "expectedOutput": {
+      "shippingCost": 24
+    }
+  },
+  {
+    "name": "Orders over 150 ship free whatever the weight",
+    "input": {
+      "weightKg": 7,
+      "destination": "international",
+      "orderTotal": 200,
+      "membership": "standard"
+    },
+    "expectedOutput": {
+      "shippingCost": 0
+    }
+  },
+  {
+    "name": "Boundary: exactly 150 does not qualify for free shipping",
+    "input": {
+      "weightKg": 0.5,
+      "destination": "domestic",
+      "orderTotal": 150,
+      "membership": "standard"
+    },
+    "expectedOutput": {
+      "shippingCost": 5
+    }
+  },
+  {
+    "name": "Zero weight is rejected before pricing runs",
+    "input": {
+      "weightKg": 0,
+      "destination": "domestic",
+      "orderTotal": 40,
+      "membership": "standard"
+    },
+    "expectedOutput": {
+      "isValid": false,
+      "rejectReason": "Weight must be greater than zero"
+    }
+  },
+  {
+    "name": "A negative order total is rejected",
+    "input": {
+      "weightKg": 2,
+      "destination": "domestic",
+      "orderTotal": -5,
+      "membership": "standard"
+    },
+    "expectedOutput": {
+      "isValid": false,
+      "rejectReason": "Order total cannot be negative"
+    }
+  }
+]

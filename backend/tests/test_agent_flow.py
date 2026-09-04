@@ -230,11 +230,14 @@ def test_test_intent_runs_saved_suite(stub_llm):
     values = graph.get_state(config).values
     assert values["intent"] == "TEST"
     summary = json.loads(values["evaluation_feedback"])
-    # This graph genuinely does not emit its declared outputs.
-    assert summary["failed"] == summary["total"] > 0
+    # The shipped policy passes its own suite. It used to fail all 11 - every output cell
+    # was an unquoted label, so the fields were silently dropped - which the linter found
+    # and this fixture now guards against regressing.
+    assert summary["passed"] == summary["total"] > 0
+    assert summary["failed"] == 0
 
     report = values["messages"][-1].content
-    assert "tests passed" in report and "❌" in report
+    assert "tests passed" in report and "✅" in report
 
 
 def test_two_replies_in_a_row_do_not_collide(stub_llm):
