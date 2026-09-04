@@ -175,6 +175,25 @@ class PatchTestRequest(BaseModel):
     order: int | None = None
 
 
+class CoverageResponse(BaseModel):
+    summary: dict[str, Any]
+    nodes: list[dict[str, Any]]
+    suggestions: list[dict[str, Any]]
+
+
+class ExplainRequest(BaseModel):
+    """Explain one evaluation. `content` targets the unsaved canvas."""
+
+    context: Any = Field(default_factory=dict)
+    content: dict[str, Any] | None = None
+    version: int | None = None
+
+
+class ExplainResponse(BaseModel):
+    result: Any
+    steps: list[dict[str, Any]]
+
+
 class LintRequest(BaseModel):
     """Lint a saved graph, or the unsaved canvas when `content` is supplied."""
 

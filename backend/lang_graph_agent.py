@@ -337,6 +337,9 @@ class AgentState(TypedDict):
     build_status: str
     build_failed: bool
     build_attempts_used: int  # Repair budget spent so far, across re-entries to the builder
+    # Travels with every resume, so it needs `_latest` for the same reason the canvas
+    # keys do: two resumes against one checkpoint would otherwise collide.
+    thread_id: Annotated[str, _latest]  # Lets long-running nodes see a stop request
     lint_findings: list  # Non-blocking lint warnings and hints on the built graph
     patch_log: list  # One line per edit applied, for the action log
     test_regressions: list  # Saved cases that disagree with an edit's new behaviour
@@ -983,6 +986,22 @@ def planner_node(state: AgentState):
     }
 
 
+def _user_cancelled(state: AgentState) -> bool:
+    """Has the user asked to stop this thread?
+
+    Imported lazily: the agent must not depend on the web layer at import time, since it
+    is also driven directly from tests and scripts.
+    """
+    thread_id = state.get("thread_id")
+    if not thread_id:
+        return False
+    try:
+        from backend.services.chat_runner import is_cancelled
+    except ImportError:  # pragma: no cover - agent used without the API
+        return False
+    return is_cancelled(thread_id)
+
+
 def _repair_instruction(error: Exception) -> str:
     """Turn whatever went wrong into one instruction the model can act on.
 
@@ -1165,7 +1184,7 @@ def builder_node(state: AgentState):
             print("  --> [Builder]: wall-clock budget nearly spent; stopping early.")
             break
 
-        if state.get("cancel_requested"):
+        if state.get("cancel_requested") or _user_cancelled(state):
             print("  --> [Builder]: Cancellation requested; stopping.")
             return {
                 "build_status": "CANCELLED",
