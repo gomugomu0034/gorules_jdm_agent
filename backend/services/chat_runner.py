@@ -28,6 +28,7 @@ NODE_LABELS = {
     "modify_triage_node": "Checking the change against the current graph",
     "human_triage_review_node": "Waiting for your approval",
     "planner_node": "Planning the graph structure",
+    "patch_node": "Editing the policy",
     "builder_node": "Building and testing the graph",
     "output_node": "Preparing the result",
     "human_final_approval_node": "Waiting for your approval",

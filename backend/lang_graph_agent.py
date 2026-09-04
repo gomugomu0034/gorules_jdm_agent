@@ -32,6 +32,7 @@ from backend.prompts.modify_triage_node_prompt import PROMPT_MODIFY_TRIAGE
 from backend.prompts.explain_node_prompt import PROMPT_EXPLAIN, PROMPT_EXPLAIN_USER
 from backend.prompts.test_node_prompt import PROMPT_TEST, PROMPT_TEST_USER, PROMPT_TEST_REPORT
 from backend.prompts.intent_router_prompt import PROMPT_INTENT
+from backend.prompts.patch_node_prompt import PROMPT_PATCH, PROMPT_PATCH_USER
 
 from backend.tools.markdown_dsl_parser import DslError, parse_markdown_dsl
 from backend.tools.diagnostics import (
@@ -41,6 +42,7 @@ from backend.tools.diagnostics import (
     parse_engine_error,
 )
 from backend.tools.jdm_linter import blocking, lint
+from backend.tools.jdm_patch import PatchError, apply_patch, describe as describe_patch
 from backend.tools.zen_evaluator import check_jdm_format, evaluate_against_zen, run_test_suite
 
 
@@ -336,6 +338,8 @@ class AgentState(TypedDict):
     build_failed: bool
     build_attempts_used: int  # Repair budget spent so far, across re-entries to the builder
     lint_findings: list  # Non-blocking lint warnings and hints on the built graph
+    patch_log: list  # One line per edit applied, for the action log
+    test_regressions: list  # Saved cases that disagree with an edit's new behaviour
     final_approval_status: str
     usecase_name: str
     mode: str  # "NEW" or "EXISTING"
@@ -986,9 +990,9 @@ def _repair_instruction(error: Exception) -> str:
     edge, a bad expression and a wrong business answer were indistinguishable - and none
     of them said which node to look at.
     """
-    if isinstance(error, DslError):
+    if isinstance(error, (DslError, PatchError)):
         return format_for_llm([
-            Diagnostic(kind="dsl_parse", code="DSL_ERROR", message=problem)
+            Diagnostic(kind="dsl_parse", code="EDIT_ERROR", message=problem)
             for problem in error.problems
         ])
 
@@ -997,6 +1001,136 @@ def _repair_instruction(error: Exception) -> str:
         return text  # already a rendered diagnostic, raised from inside the loop
 
     return format_for_llm([parse_engine_error(error)])
+
+
+
+# Step 2b: Patch (edit an existing graph in place)
+def patch_node(state: AgentState):
+    """Apply the requested change as targeted edits, rather than regenerating the policy.
+
+    The planner path rebuilds a graph from a plan, which mints new ids for every node and
+    edge - so an edit lost the canvas layout, broke `$nodes` references and produced a
+    total diff. Here the existing graph is the base and only the named parts move.
+    """
+    print("\n[Step 2b: Patch]: Editing the existing graph...")
+
+    # The canvas is re-sent on every resume, but `existing_jdm_json` is only computed once
+    # in the intent router - so an edit made on the canvas mid-conversation never reached
+    # the agent. Prefer the live canvas whenever there is one.
+    raw = state.get("canvas_jdm_json") or state.get("existing_jdm_json") or ""
+    try:
+        graph = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError:
+        graph = None
+    if not graph or not graph.get("nodes"):
+        return {
+            "build_status": "ERROR",
+            "evaluation_feedback": "There is no policy open to edit.",
+            "build_failed": True,
+        }
+
+    tests = _load_tests(state)
+    context = list(state["messages"]) + [
+        HumanMessage(content=_inject_jdm(PROMPT_PATCH_USER, json.dumps(graph, indent=2)))
+    ]
+
+    spent_before = int(state.get("build_attempts_used") or 0)
+    attempts = max(1, _max_build_attempts() - spent_before)
+    new_messages: list = []
+    last_feedback = ""
+
+    for attempt in range(attempts):
+        _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
+               "max_attempts": attempts, "phase": "llm",
+               "message": "Working out the smallest change" if attempt == 0
+                          else f"Revising the edit after attempt {attempt}"})
+
+        content = call_llm(PROMPT_PATCH, context)
+        new_messages.append(_assistant_message_from_llm(content, internal=True))
+        context.append(_assistant_message_from_llm(content))
+
+        block = _extract_bounded_text(content, "---OPS STARTS---", "---OPS ENDS---", strip_lang="json")
+        if not block:
+            block = _fenced_block(content, "json")
+        try:
+            operations = json.loads(block) if block.strip() else []
+        except json.JSONDecodeError as exc:
+            last_feedback = (f"The edit operations were not valid JSON ({exc}). Output a JSON "
+                             "array between ---OPS STARTS--- and ---OPS ENDS---.")
+            context.append(HumanMessage(content=last_feedback))
+            continue
+
+        if not operations:
+            return {
+                "build_status": "ERROR",
+                "build_failed": True,
+                "evaluation_feedback": "That change cannot be made by editing this policy.",
+                "messages": new_messages + [_assistant_message_from_llm(
+                    "I could not express that as a change to this policy. Could you say which "
+                    "node or rule it should affect?"
+                )],
+                "build_attempts_used": spent_before + attempt + 1,
+            }
+
+        try:
+            _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
+                   "max_attempts": attempts, "phase": "parse",
+                   "message": f"Applying {len(operations)} change(s)"})
+            patched = apply_patch(graph, operations)
+
+            blockers = blocking(lint(patched))
+            if blockers:
+                raise RuntimeError(format_for_llm(blockers))
+
+            _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
+                   "max_attempts": attempts, "phase": "evaluate",
+                   "message": f"Re-running {len(tests)} test case(s)"})
+
+            # A failing suite after a clean edit is not necessarily a mistake. The user
+            # asked for a behaviour change, so the cases that pinned the old behaviour are
+            # *supposed* to disagree - retrying would have the agent fight the request it
+            # was given. Report which ones moved and let the approval gate decide.
+            report = run_test_suite(json.dumps(patched), tests, trace=True) if tests else None
+            regressions = [
+                r["name"] for r in (report or {}).get("results", [])
+                if r["status"] in ("failed", "errored")
+            ]
+            result = "" if report is None else json.dumps(report["summary"])
+
+            return {
+                "test_regressions": regressions,
+                "jdm_json": json.dumps(patched),
+                "test_suite_json": json.dumps(tests),
+                "evaluation_feedback": result,
+                "usecase_name": state.get("canvas_graph_name") or state.get("selected_file") or "Policy",
+                "build_status": "SUCCESS",
+                "patch_log": describe_patch(operations),
+                "lint_findings": [d.as_dict() for d in lint(patched)],
+                "build_attempts_used": spent_before + attempt + 1,
+                "messages": new_messages,
+            }
+
+        except Exception as exc:  # noqa: BLE001
+            last_feedback = _repair_instruction(exc)
+            print(f"  --> [Patch error]: {str(exc)[:100]}...")
+            context.append(HumanMessage(content=last_feedback))
+            continue
+
+    return {
+        "build_status": "ERROR",
+        "evaluation_feedback": last_feedback or "The edit could not be applied.",
+        "build_attempts_used": spent_before + attempts,
+        "messages": new_messages,
+    }
+
+
+def _load_tests(state: AgentState) -> list:
+    """The saved suite, so an edit is checked against what the policy already promised."""
+    try:
+        tests = json.loads(state.get("test_suite_json") or "[]")
+        return tests if isinstance(tests, list) else []
+    except json.JSONDecodeError:
+        return []
 
 
 # Step 3: Builder (Generate JDM and Tests)
@@ -1203,16 +1337,55 @@ def output_node(state: AgentState):
         }.get(node.get("type", ""), node.get("type", "node"))
         return f"**{node.get('name', 'Unnamed')}** ({kind})"
 
-    lines = [
-        f"Built **{name}** - {len(nodes)} "
-        f"{'node' if len(nodes) == 1 else 'nodes'}, "
-        f"{len(tests)} {'test' if len(tests) == 1 else 'tests'}, all passing.",
-        "",
-        "The graph is on the canvas. Review it there, then approve to keep it.",
-    ]
-    if nodes:
-        lines += ["", "Flow:", ""]
-        lines += [f"- {_describe(n)}" for n in nodes]
+    # An edit reports what it changed; a fresh build reports what it made. Listing every
+    # node after a one-cell change buries the one line the reviewer actually needs.
+    patch_log = state.get("patch_log") or []
+    if patch_log:
+        # Say plainly whether the edit was verified. "0 tests still passing" reads like a
+        # result; it is the absence of one.
+        if tests:
+            headline = (f"Updated **{name}** - {len(patch_log)} "
+                        f"{'change' if len(patch_log) == 1 else 'changes'}, "
+                        f"{len(tests)} {'test' if len(tests) == 1 else 'tests'} still passing.")
+        else:
+            headline = (f"Updated **{name}** - {len(patch_log)} "
+                        f"{'change' if len(patch_log) == 1 else 'changes'}. This policy has "
+                        "no saved tests, so nothing checked the change.")
+        lines = [headline, "", "What changed:", ""]
+        lines += [f"- {entry}" for entry in patch_log]
+
+        regressions = state.get("test_regressions") or []
+        if regressions:
+            # Deliberately not framed as a failure: the change was requested, so the cases
+            # that pinned the old behaviour are meant to disagree. The user decides whether
+            # the policy moved or the tests are now out of date.
+            lines[0] = (f"Updated **{name}** - {len(patch_log)} "
+                        f"{'change' if len(patch_log) == 1 else 'changes'}. "
+                        f"{len(regressions)} saved "
+                        f"{'test' if len(regressions) == 1 else 'tests'} now expect the old "
+                        "behaviour:")
+            lines += ["", "No longer matching:", ""]
+            lines += [f"- {case}" for case in regressions[:8]]
+            if len(regressions) > 8:
+                lines.append(f"- ...and {len(regressions) - 8} more")
+            lines += ["", "Approve if the policy is right and the tests need updating, or "
+                          "tell me what to change instead."]
+        elif tests:
+            lines += ["", "Everything else is untouched. Review it on the canvas, then approve."]
+        else:
+            lines += ["", "Everything else is untouched. Ask me to write a test suite if you "
+                          "want the change pinned down."]
+    else:
+        lines = [
+            f"Built **{name}** - {len(nodes)} "
+            f"{'node' if len(nodes) == 1 else 'nodes'}, "
+            f"{len(tests)} {'test' if len(tests) == 1 else 'tests'}, all passing.",
+            "",
+            "The graph is on the canvas. Review it there, then approve to keep it.",
+        ]
+        if nodes:
+            lines += ["", "Flow:", ""]
+            lines += [f"- {_describe(n)}" for n in nodes]
 
     return {
         "messages": [_assistant_message_from_llm("\n".join(lines))],
@@ -1318,6 +1491,13 @@ def route_after_intent(state: AgentState):
 
 def route_after_human_review(state: AgentState):
     if state.get("triage_status") == "APPROVED":
+        # Editing an existing policy is a patch, not a rebuild: regenerating it from a plan
+        # would mint new ids for every node and edge and lose whatever the model did not
+        # happen to re-emit.
+        if state.get("mode") == "EXISTING" and _is_non_empty_graph(
+            state.get("existing_jdm_json") or state.get("canvas_jdm_json") or ""
+        ):
+            return "patch_node"
         return "planner_node"
     else:
         # If the human review resulted in NEEDS_INFO, loop back to the correct triage AI!
@@ -1446,6 +1626,7 @@ workflow.add_node("triage_node", triage_node)
 workflow.add_node("modify_triage_node", modify_triage_node)
 workflow.add_node("human_triage_review_node", human_triage_review_node)
 workflow.add_node("planner_node", planner_node)
+workflow.add_node("patch_node", patch_node)
 workflow.add_node("builder_node", builder_node)
 workflow.add_node("output_node", output_node)
 workflow.add_node("human_final_approval_node", human_final_approval_node)
@@ -1483,6 +1664,7 @@ workflow.add_conditional_edges(
     # CRITICAL FIX: Explicit path map prevents silent termination!
     {
         "planner_node": "planner_node",
+        "patch_node": "patch_node",
         "modify_triage_node": "modify_triage_node",
         "triage_node": "triage_node"
     }
@@ -1491,6 +1673,8 @@ workflow.add_conditional_edges(
 # generation for new and existing policy
 # Planner feeds directly to Builder
 workflow.add_edge("planner_node", "builder_node")
+# The patch is applied, linted and tested inside the node, so it reports directly.
+workflow.add_edge("patch_node", "output_node")
 # The builder reports failure through build_status; either way the user sees the
 # result, so this is a plain edge rather than a router with one destination.
 workflow.add_edge("builder_node", "output_node")
