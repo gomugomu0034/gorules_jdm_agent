@@ -31,7 +31,12 @@ from typing import Any, Literal
 
 import zen
 
-Kind = Literal["dsl_parse", "structure", "expression", "engine", "assertion"]
+Kind = Literal["dsl_parse", "structure", "expression", "engine", "assertion", "lint"]
+
+# `error` blocks a build; `warning` is probably a bug but the graph still runs; `hint` is a
+# quality suggestion. Only errors gate the repair loop - a loop that refused to finish over
+# a style hint would never converge.
+Severity = Literal["error", "warning", "hint"]
 
 # Repair order, most fundamental first. There is no point telling a model its business
 # logic is wrong while the graph does not compile - it will "fix" the logic and the same
@@ -65,6 +70,21 @@ class Diagnostic:
     path: str | None = None
     line: int | None = None
     fix_hint: str = ""
+    severity: Severity = "error"
+
+    def as_dict(self) -> dict[str, Any]:
+        """Wire form. `TestRunResponse.results` is untyped, so this needs no model change."""
+        return {
+            "kind": self.kind,
+            "code": self.code,
+            "message": self.message,
+            "nodeId": self.node_id,
+            "nodeName": self.node_name,
+            "path": self.path,
+            "line": self.line,
+            "fix": self.fix_hint,
+            "severity": self.severity,
+        }
 
     def render(self) -> str:
         where = f' in node "{self.node_name}"' if self.node_name else ""

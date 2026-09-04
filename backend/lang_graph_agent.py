@@ -37,11 +37,10 @@ from backend.tools.markdown_dsl_parser import DslError, parse_markdown_dsl
 from backend.tools.diagnostics import (
     KIND_HEADINGS,
     Diagnostic,
-    check_expressions,
-    check_structure,
     format_for_llm,
     parse_engine_error,
 )
+from backend.tools.jdm_linter import blocking, lint
 from backend.tools.zen_evaluator import check_jdm_format, evaluate_against_zen, run_test_suite
 
 
@@ -336,6 +335,7 @@ class AgentState(TypedDict):
     build_status: str
     build_failed: bool
     build_attempts_used: int  # Repair budget spent so far, across re-entries to the builder
+    lint_findings: list  # Non-blocking lint warnings and hints on the built graph
     final_approval_status: str
     usecase_name: str
     mode: str  # "NEW" or "EXISTING"
@@ -348,7 +348,7 @@ class AgentState(TypedDict):
     canvas_jdm_json: Annotated[str, _latest]  # The graph on the canvas, unsaved edits included
     canvas_graph_id: Annotated[str, _latest]  # Database id, "" for a scratch canvas
     canvas_graph_name: Annotated[str, _latest]
-    intent: str  # "CREATE" | "MODIFY" | "TEST" | "EXPLAIN"
+    intent: str  # "CREATE" | "MODIFY" | "TEST" | "EXPLAIN" | "LINT"
     intent_confidence: float
     cancel_requested: Annotated[bool, _latest]
 
@@ -522,6 +522,17 @@ _TEST_RE = re.compile(
     r"\b(test|tests|testing|test case|test cases|run the suite|verify|validate|check that)\b",
     re.IGNORECASE,
 )
+# Matched before EXPLAIN and TEST: "check my policy" is a request to review it, not to
+# run its suite. Rules cover the common phrasings so this never has to reach the LLM -
+# which also matters on a rate-limited free tier.
+_LINT_RE = re.compile(
+    r"\b(lint|critique|code review|best practices?|"
+    r"well[ -]?built|well[ -]?structured|look(s)? (ok|okay|good|right|fine)|"
+    r"(any|what) (problems?|issues?|mistakes?)|anything wrong|what.s wrong|"
+    r"review (this|the|my)|(check|assess|audit) (the |this |my )?(graph|policy|quality|structure)|"
+    r"quality (check|control)|improve (this|the|my) (graph|policy))\b",
+    re.IGNORECASE,
+)
 _MODIFY_RE = re.compile(
     r"\b(add|change|modify|remove|delete|update|rename|fix|adjust|instead|also|tweak|extend|edit)\b",
     re.IGNORECASE,
@@ -563,6 +574,8 @@ def _classify_intent(text: str, has_graph: bool) -> tuple[str, float]:
     if not text:
         return "MODIFY", 0.3
 
+    if _LINT_RE.search(text):
+        return "LINT", 0.9
     if _EXPLAIN_RE.search(text):
         return "EXPLAIN", 0.9
     if _TEST_RE.search(text):
@@ -576,7 +589,7 @@ def _classify_intent(text: str, has_graph: bool) -> tuple[str, float]:
         raw = call_llm(PROMPT_INTENT, [HumanMessage(content=text)])
         parsed = json.loads(_extract_single_json(raw))
         intent = str(parsed.get("intent", "")).upper()
-        if intent in ("CREATE", "MODIFY", "TEST", "EXPLAIN"):
+        if intent in ("CREATE", "MODIFY", "TEST", "EXPLAIN", "LINT"):
             return intent, float(parsed.get("confidence", 0.5))
     except Exception as e:
         print(f"  --> [Intent]: LLM classification failed ({e}); defaulting.")
@@ -785,6 +798,67 @@ def _format_test_report_markdown(report: dict) -> str:
 
 
 # Step 1: Evaluate Requirement
+
+# Step 0c: Lint (static analysis of the open graph)
+_SEVERITY_TITLES = {
+    "error": "Must fix",
+    "warning": "Worth checking",
+    "hint": "Could be better",
+}
+
+
+def lint_node(state: AgentState):
+    """Report the graph's static findings. Deterministic - no LLM call.
+
+    The same checks that gate a build, run on demand against whatever is on the canvas.
+    """
+    print("\n[Lint]: Checking the open graph...")
+
+    raw = state.get("existing_jdm_json") or state.get("canvas_jdm_json") or ""
+    try:
+        graph = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError:
+        graph = None
+
+    if not graph or not graph.get("nodes"):
+        return {"messages": [_assistant_message_from_llm(
+            "There is no policy open to check. Build or open one first."
+        )]}
+
+    _emit({"type": "progress", "node": "lint_node", "attempt": 1, "max_attempts": 1,
+           "phase": "lint", "message": "Checking the graph against the quality rules"})
+
+    findings = lint(graph)
+    name = state.get("selected_file") or state.get("canvas_graph_name") or "this policy"
+
+    if not findings:
+        return {"messages": [_assistant_message_from_llm(
+            f"**{name}** passes every check - structure, expressions, and quality."
+        )]}
+
+    counts = {s: sum(1 for d in findings if d.severity == s) for s in ("error", "warning", "hint")}
+    headline = ", ".join(f"{n} {s}{'s' if n != 1 else ''}"
+                         for s, n in counts.items() if n)
+    body = [f"Checked **{name}**: {headline}.", ""]
+
+    for severity in ("error", "warning", "hint"):
+        group = [d for d in findings if d.severity == severity]
+        if not group:
+            continue
+        body.append(f"### {_SEVERITY_TITLES[severity]}")
+        for diagnostic in group:
+            where = f" *({diagnostic.node_name})*" if diagnostic.node_name else ""
+            body.append(f"- **{diagnostic.code}**{where} - {diagnostic.message}")
+            if diagnostic.fix_hint:
+                body.append(f"  - {diagnostic.fix_hint}")
+        body.append("")
+
+    if counts["error"]:
+        body.append("Ask me to fix any of these and I will update the policy.")
+
+    return {"messages": [_assistant_message_from_llm("\n".join(body).strip())]}
+
+
 def triage_node(state: AgentState):
     print(f"\n[Step 1: Triage]: Evaluating requirements using {ACTIVE_PROVIDER.upper()}...")
 
@@ -946,6 +1020,7 @@ def builder_node(state: AgentState):
     started = time.monotonic()
     attempts_used = 0
     last_feedback = ""
+    advisories: list = []
 
     for attempt in range(MAX_ATTEMPTS):
         attempts_used = attempt + 1
@@ -1025,14 +1100,17 @@ def builder_node(state: AgentState):
 
             parsed_jdm, parsed_tests = format_result
 
-            # Structure and syntax before behaviour. `create_decision` only deserializes,
-            # so a dangling edge, a missing input node or a malformed expression compiles
-            # cleanly here and only surfaces during evaluation - once per test case, as an
-            # opaque blob with no node attached. Checking first turns all of those into one
-            # diagnostic that names the node.
-            problems = check_structure(parsed_jdm) + check_expressions(parsed_jdm)
-            if problems:
-                raise RuntimeError(format_for_llm(problems))
+            # Lint before behaviour. `create_decision` only deserializes, so a dangling
+            # edge, a missing input node or a malformed expression compiles cleanly here
+            # and only surfaces during evaluation - once per test case, as an opaque blob
+            # with no node attached. Only errors block: a loop that refused to finish over
+            # a style hint would never converge, so warnings and hints travel with the
+            # result for the user to judge.
+            findings = lint(parsed_jdm)
+            blockers = blocking(findings)
+            if blockers:
+                raise RuntimeError(format_for_llm(blockers))
+            advisories = [d.as_dict() for d in findings]
 
             progress("evaluate", f"Running {len(parsed_tests)} test case(s) through the engine")
             is_success, eval_result = evaluate_against_zen(jdm_json, parsed_tests)
@@ -1048,6 +1126,7 @@ def builder_node(state: AgentState):
                 "evaluation_feedback": eval_result,
                 "usecase_name": usecase_name,
                 "build_status": "SUCCESS",
+                "lint_findings": advisories,
                 "build_attempts_used": spent_before + attempts_used,
                 "messages": new_messages  # Append debugging conversation to state
             }
@@ -1233,6 +1312,7 @@ def route_after_intent(state: AgentState):
         "MODIFY": "modify_triage_node",
         "TEST": "test_node",
         "EXPLAIN": "explain_node",
+        "LINT": "lint_node",
     }.get(state.get("intent", "CREATE"), "triage_node")
 
 
@@ -1361,6 +1441,7 @@ workflow = StateGraph(AgentState)
 workflow.add_node("intent_router_node", intent_router_node)
 workflow.add_node("explain_node", explain_node)
 workflow.add_node("test_node", test_node)
+workflow.add_node("lint_node", lint_node)
 workflow.add_node("triage_node", triage_node)
 workflow.add_node("modify_triage_node", modify_triage_node)
 workflow.add_node("human_triage_review_node", human_triage_review_node)
@@ -1390,6 +1471,7 @@ workflow.add_conditional_edges(
 # Read-only intents finish in one pass.
 workflow.add_edge("explain_node", END)
 workflow.add_edge("test_node", END)
+workflow.add_edge("lint_node", END)
 
 workflow.add_edge("modify_triage_node", "human_triage_review_node")
 workflow.add_edge("triage_node", "human_triage_review_node")

@@ -75,6 +75,25 @@ export type TestRunReport = {
   results: TestResult[];
 };
 
+export type LintSeverity = 'error' | 'warning' | 'hint';
+
+export type LintFinding = {
+  kind: string;
+  code: string;
+  message: string;
+  nodeId: string | null;
+  nodeName: string | null;
+  path: string | null;
+  line: number | null;
+  fix: string;
+  severity: LintSeverity;
+};
+
+export type LintReport = {
+  summary: Record<LintSeverity, number>;
+  findings: LintFinding[];
+};
+
 export type SimulationResponse = {
   result?: {
     performance: string | null;

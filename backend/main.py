@@ -12,7 +12,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from backend.api import auth, chat, exports, graphs, health, imports, simulate, tests
+from backend.api import auth, chat, exports, graphs, health, imports, lint, simulate, tests
 from backend.api.errors import register_error_handlers
 from backend.config import settings
 from backend import agent_runtime
@@ -105,4 +105,5 @@ app.include_router(graphs.router)
 app.include_router(imports.router)
 app.include_router(simulate.router)
 app.include_router(tests.router)
+app.include_router(lint.router)
 app.include_router(chat.router)

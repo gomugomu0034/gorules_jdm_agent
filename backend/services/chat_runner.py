@@ -34,6 +34,7 @@ NODE_LABELS = {
     "save_files_node": "Saving the policy",
     "explain_node": "Reading the graph",
     "test_node": "Running the test suite",
+    "lint_node": "Checking the graph for problems",
 }
 TOTAL_STEPS = 6
 
