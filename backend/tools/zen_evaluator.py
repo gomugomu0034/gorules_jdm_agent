@@ -16,6 +16,8 @@ from typing import Any
 
 import zen
 
+from backend.tools.diagnostics import diagnose, format_for_llm, parse_engine_error
+
 
 def check_jdm_format(jdm_content: str, tests_content: str) -> tuple[bool, any]:
     """
@@ -26,8 +28,21 @@ def check_jdm_format(jdm_content: str, tests_content: str) -> tuple[bool, any]:
     """
     try:
         parsed_jdm = json.loads(jdm_content)
-        parsed_tests = json.loads(tests_content)
+    except ValueError as exc:
+        return False, f"The compiled graph is not valid JSON: {exc}"
 
+    try:
+        parsed_tests = json.loads(tests_content)
+    except ValueError as exc:
+        # Seen in practice when the model omits the tests block entirely. Saying "expecting
+        # value: line 1 column 1" tells it nothing; naming the block does.
+        return False, (
+            f"The test cases could not be read as JSON ({exc}). Output them between "
+            "---TESTS STARTS--- and ---TESTS ENDS--- as a JSON array, where every case is "
+            '{"name": ..., "input": {...}, "expectedOutput": {...}}.'
+        )
+
+    try:
         if "nodes" not in parsed_jdm or "edges" not in parsed_jdm:
             return False, "JDM missing 'nodes' or 'edges'."
 
@@ -305,19 +320,24 @@ def _format_success(report: dict) -> str:
 def evaluate_against_zen(jdm_content: str, parsed_tests: list) -> tuple[bool, str]:
     """Compile the graph and run it against the test suite.
 
-    Signature is unchanged so ``builder_node`` keeps working as written: it
-    raises with this message and feeds it back to the LLM. The difference is
-    that failing assertions now count as failure, so the self-healing loop
-    repairs wrong logic rather than only crashes.
+    Signature is unchanged so ``builder_node`` keeps working as written: it raises with
+    this message and feeds it back to the LLM. What changed is the message. It used to be
+    the exception stringified, identical whatever went wrong; it is now a diagnostic that
+    names the failure's kind, the node responsible, and the change to make - derived from
+    the execution trace and from the JSON the engine's own errors already carry.
     """
+    graph = jdm_content if isinstance(jdm_content, dict) else json.loads(jdm_content)
+
     try:
-        report = run_test_suite(jdm_content, parsed_tests)
-    except Exception as e:  # noqa: BLE001
-        return False, str(e)
+        report = run_test_suite(jdm_content, parsed_tests, trace=True)
+    except Exception as exc:  # noqa: BLE001 - the graph itself would not run
+        return False, format_for_llm([parse_engine_error(exc, graph)])
 
     summary = report["summary"]
     if summary["failed"] or summary["errored"]:
-        return False, _format_failures_for_llm(report)
+        diagnostics = diagnose(graph, report)
+        # Never report a failure with nothing to act on.
+        return False, (format_for_llm(diagnostics) or _format_failures_for_llm(report))
 
     # A case with no `expectedOutput` is skipped rather than run, so a suite made entirely
     # of skips reports zero failures while asserting nothing - and the build would be

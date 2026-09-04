@@ -33,7 +33,15 @@ from backend.prompts.explain_node_prompt import PROMPT_EXPLAIN, PROMPT_EXPLAIN_U
 from backend.prompts.test_node_prompt import PROMPT_TEST, PROMPT_TEST_USER, PROMPT_TEST_REPORT
 from backend.prompts.intent_router_prompt import PROMPT_INTENT
 
-from backend.tools.markdown_dsl_parser import parse_markdown_dsl
+from backend.tools.markdown_dsl_parser import DslError, parse_markdown_dsl
+from backend.tools.diagnostics import (
+    KIND_HEADINGS,
+    Diagnostic,
+    check_expressions,
+    check_structure,
+    format_for_llm,
+    parse_engine_error,
+)
 from backend.tools.zen_evaluator import check_jdm_format, evaluate_against_zen, run_test_suite
 
 
@@ -897,6 +905,26 @@ def planner_node(state: AgentState):
     }
 
 
+def _repair_instruction(error: Exception) -> str:
+    """Turn whatever went wrong into one instruction the model can act on.
+
+    Everything used to arrive as `SYSTEM ERROR: {str(e)}`, so a parse error, a dangling
+    edge, a bad expression and a wrong business answer were indistinguishable - and none
+    of them said which node to look at.
+    """
+    if isinstance(error, DslError):
+        return format_for_llm([
+            Diagnostic(kind="dsl_parse", code="DSL_ERROR", message=problem)
+            for problem in error.problems
+        ])
+
+    text = str(error)
+    if any(text.startswith(heading) for heading in KIND_HEADINGS.values()):
+        return text  # already a rendered diagnostic, raised from inside the loop
+
+    return format_for_llm([parse_engine_error(error)])
+
+
 # Step 3: Builder (Generate JDM and Tests)
 def builder_node(state: AgentState):
     print("\n[Step 3: Builder/Evaluator]: Compiling & Testing Graph...")
@@ -917,6 +945,7 @@ def builder_node(state: AgentState):
     MAX_ATTEMPTS = max(1, _max_build_attempts() - spent_before)
     started = time.monotonic()
     attempts_used = 0
+    last_feedback = ""
 
     for attempt in range(MAX_ATTEMPTS):
         attempts_used = attempt + 1
@@ -995,6 +1024,16 @@ def builder_node(state: AgentState):
                 raise ValueError(f"Test JSON Format Error: {format_result}")
 
             parsed_jdm, parsed_tests = format_result
+
+            # Structure and syntax before behaviour. `create_decision` only deserializes,
+            # so a dangling edge, a missing input node or a malformed expression compiles
+            # cleanly here and only surfaces during evaluation - once per test case, as an
+            # opaque blob with no node attached. Checking first turns all of those into one
+            # diagnostic that names the node.
+            problems = check_structure(parsed_jdm) + check_expressions(parsed_jdm)
+            if problems:
+                raise RuntimeError(format_for_llm(problems))
+
             progress("evaluate", f"Running {len(parsed_tests)} test case(s) through the engine")
             is_success, eval_result = evaluate_against_zen(jdm_json, parsed_tests)
 
@@ -1014,14 +1053,19 @@ def builder_node(state: AgentState):
             }
 
         except Exception as e:
-            error_msg = f"SYSTEM ERROR:\n{str(e)}\n\nPlease fix the logic and output the corrected DSL and Test array."
+            last_feedback = _repair_instruction(e)
             print(f"  --> [Error Caught]: {str(e)[:100]}...")
-            context.append(HumanMessage(content=error_msg))
+            context.append(HumanMessage(content=last_feedback))
             continue  # Loop back and let the LLM try to fix it
 
     return {
         "build_status": "ERROR",
-        "evaluation_feedback": f"Failed to compile and test the Markdown DSL after {attempts_used} attempts.",
+        # Carry the real reason, not just a count. This is the only thing the user sees on
+        # a failed build, and the only thing the planner sees if the approval loop sends
+        # the turn back around - a bare "failed after N attempts" told neither anything.
+        "evaluation_feedback": last_feedback or (
+            f"Failed to compile and test the Markdown DSL after {attempts_used} attempts."
+        ),
         "build_attempts_used": spent_before + attempts_used,
         "messages": new_messages,
     }

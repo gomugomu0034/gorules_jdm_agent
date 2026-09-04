@@ -221,7 +221,12 @@ def test_the_builder_can_see_the_plan_it_is_repairing(monkeypatch):
     # and expected values, so asserting on "shippingFee" alone would pass either way.
     assert "# Structure" in context, "the repair call cannot see the DSL it must fix"
     assert "orderTotal > 500" in context, "specifically, the faulty expression itself"
-    assert "SYSTEM ERROR" in context, "and it must be told what went wrong"
+
+    # And it must be told what went wrong, in a form it can act on: the kind of failure,
+    # and the node responsible. A bare stringified exception named neither.
+    assert "THE GRAPH RUNS, BUT DECIDES THE WRONG THING" in context
+    assert "WRONG_VALUE" in context
+    assert 'in node "Fee"' in context, "the diagnostic must name the node that decided it"
 
 
 def test_the_repair_context_stays_out_of_the_chat(monkeypatch):
