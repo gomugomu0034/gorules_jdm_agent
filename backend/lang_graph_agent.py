@@ -1143,6 +1143,15 @@ def patch_node(state: AgentState):
     last_feedback = ""
 
     for attempt in range(attempts):
+        # The same cooperative stop the builder honours. Without it an edit could only ever
+        # be killed mid-call, which discards the turn instead of reporting it.
+        if state.get("cancel_requested") or _user_cancelled(state):
+            print("  --> [Patch]: Cancellation requested; stopping.")
+            return {
+                "build_status": "CANCELLED",
+                "evaluation_feedback": "The edit was cancelled before it was applied.",
+            }
+
         _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
                "max_attempts": attempts, "phase": "llm",
                "message": "Working out the smallest change" if attempt == 0

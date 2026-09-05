@@ -317,3 +317,27 @@ def test_a_question_interrupted_by_a_crash_can_still_be_answered(app_env, tmp_pa
         )
         assert answered.status_code == 202, "the answer must not be refused as NOT_AWAITING_INPUT"
         read_events(restarted, thread_id)
+
+
+def test_stopping_a_run_that_no_longer_exists_still_resolves_the_conversation(
+    app_env, tmp_path
+):
+    """Pressing Stop on a turn lost with a previous process must not be a no-op.
+
+    `status` is the only thing telling the client a turn is over, so a Stop that reports
+    "nothing to cancel" and changes nothing leaves the composer disabled behind a button
+    that appears broken - which is what a stuck `running` row used to look like.
+    """
+    with TestClient(app_env) as client:
+        thread_id = client.post("/api/chat/threads", json={}).json()["id"]
+        _force_status(tmp_path, thread_id, "running")
+
+        response = client.post(f"/api/chat/threads/{thread_id}/cancel")
+
+        assert response.status_code == 200
+        assert response.json()["cancelled"] is False, "there was genuinely no task to stop"
+        assert client.get(f"/api/chat/threads/{thread_id}").json()["status"] == "idle"
+
+        # And the stream is told, so a client that is watching settles without a reload.
+        events = client.get(f"/api/chat/threads/{thread_id}/events").json()["events"]
+        assert events[-1] == {**events[-1], "type": "done", "status": "cancelled"}

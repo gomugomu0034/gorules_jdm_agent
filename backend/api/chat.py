@@ -202,6 +202,10 @@ async def stream(
                 yield _frame(event)
         finally:
             event_bus.unsubscribe(thread_id, queue)
+            # Nobody is watching this run any more. That may mean the tab was closed, or
+            # only that it was reloaded, so this starts a grace period rather than
+            # stopping anything: see `watch_disconnect`.
+            chat_runner.watch_disconnect(thread_id)
 
     return StreamingResponse(
         generator(),

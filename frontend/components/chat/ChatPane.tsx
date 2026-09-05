@@ -8,6 +8,7 @@ import { useChatStore } from '../../stores/useChatStore';
 import { Button, EmptyState, cx } from '../ui';
 import { MarkdownMessage } from './MarkdownMessage';
 import { ProgressRail } from './ProgressRail';
+import { StopRunDialog } from './StopRunDialog';
 
 type Props = {
   canvas: DecisionGraphType;
@@ -29,8 +30,10 @@ const EXISTING_POLICY_SUGGESTIONS = [
 ];
 
 export function ChatPane({ canvas, graphId, graphName }: Props) {
-  const { messages, steps, pending, running, error, send, respond, cancel } = useChatStore();
+  const { messages, steps, pending, proposal, running, error, send, respond, cancel } =
+    useChatStore();
   const [draft, setDraft] = useState('');
+  const [confirmingStop, setConfirmingStop] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -178,7 +181,12 @@ export function ChatPane({ canvas, graphId, graphName }: Props) {
             className="max-h-40 flex-1 resize-none bg-transparent px-1.5 py-1 text-sm outline-none placeholder:text-fg-subtle disabled:opacity-60"
           />
           {running ? (
-            <Button size="sm" variant="ghost" icon={<Square size={12} />} onClick={() => void cancel()}>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<Square size={12} />}
+              onClick={() => setConfirmingStop(true)}
+            >
               Stop
             </Button>
           ) : (
@@ -198,6 +206,17 @@ export function ChatPane({ canvas, graphId, graphName }: Props) {
           Enter to send · Shift+Enter for a new line
         </p>
       </div>
+
+      <StopRunDialog
+        open={confirmingStop}
+        steps={steps}
+        hasProposal={Boolean(proposal)}
+        onClose={() => setConfirmingStop(false)}
+        onConfirm={() => {
+          setConfirmingStop(false);
+          void cancel();
+        }}
+      />
     </div>
   );
 }

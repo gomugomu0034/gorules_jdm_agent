@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from collections import defaultdict
 
@@ -41,12 +42,29 @@ NODE_LABELS = {
 # denominator produced "step 9 of 6". The count adapts to what the run has actually done.
 MIN_TOTAL_STEPS = 6
 
+# How long a run is given to notice the stop flag and return what it has before it is
+# killed outright. A node checks between attempts, so this only has to outlast the
+# bookkeeping around one - not the LLM call itself, which cannot be interrupted at all.
+CANCEL_GRACE_SECONDS = float(os.getenv("AGENT_CANCEL_GRACE", "3"))
+
+# How long a run keeps going with nobody watching it. A refresh and a closed tab are
+# indistinguishable from the server, so neither is obeyed on its own: the run is held for
+# this long in case a client comes back, which is what keeps `from_seq` replay meaningful.
+DISCONNECT_GRACE_SECONDS = float(os.getenv("AGENT_DISCONNECT_GRACE", "45"))
+
+# Runs are given this long to stop themselves when the process is going down, before they
+# are cancelled. Short: the point is ordering, not patience.
+SHUTDOWN_GRACE_SECONDS = float(os.getenv("AGENT_SHUTDOWN_GRACE", "5"))
+
 _runs: dict[str, asyncio.Task] = {}
 _locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 # Threads the user has asked to stop. Written by `request_cancel`, read by the agent's
 # long-running nodes between attempts so a run can end cleanly - reporting what it had -
 # instead of only ever being killed mid-step by `task.cancel()`, which discards the turn.
 _cancelled: set[str] = set()
+# Grace timers watching threads whose last client went away, so a second disconnect does
+# not stack a second timer and a reconnect can cancel the one already waiting.
+_abandoned: dict[str, asyncio.Task] = {}
 
 
 def is_cancelled(thread_id: str) -> bool:
@@ -66,19 +84,110 @@ async def request_cancel(thread_id: str) -> bool:
     """Ask a run to stop.
 
     The flag is set first so a node between steps can return a CANCELLED result with its
-    work intact; the hard cancel follows because an in-flight LLM call cannot be
-    interrupted and the user is entitled to a prompt stop either way.
+    work intact. The hard cancel still follows - an in-flight LLM call cannot be
+    interrupted, and the user is entitled to a prompt stop either way - but only after a
+    grace period, because cancelling in the same breath as raising the flag pre-empts the
+    cooperative path entirely and throws away the turn's work every time.
+
+    Returns promptly: the enforcement waits in the background rather than holding the
+    request open for it.
     """
     _cancelled.add(thread_id)
     task = _runs.get(thread_id)
-    if task and not task.done():
+    if task is None or task.done():
+        # Nothing in flight here. The thread may still be *recorded* as running - a run
+        # lost with a previous process - and the client has no other signal that a turn is
+        # over, so settle it rather than leaving a Stop button that does nothing.
+        await _settle_orphan(thread_id)
+        return False
+
+    asyncio.create_task(_enforce_cancel(thread_id, task))
+    return True
+
+
+async def _enforce_cancel(thread_id: str, task: asyncio.Task) -> None:
+    """Give the run a moment to stop itself; kill it if it will not."""
+    done, _ = await asyncio.wait({task}, timeout=CANCEL_GRACE_SECONDS)
+    if not done:
+        logger.info("Run on %s did not stop within the grace period; cancelling.", thread_id)
         task.cancel()
-        return True
-    return False
+
+
+async def _settle_orphan(thread_id: str) -> None:
+    """Resolve a thread recorded as running that this process is not running.
+
+    `status` is the only thing telling the client a turn has ended, so without this the
+    conversation stays disabled forever behind a Stop that can never take effect.
+    """
+    thread = await dao.get_thread(thread_id)
+    if not thread or thread["status"] != "running":
+        return
+    logger.info("Thread %s claimed to be running with no task behind it; settling.", thread_id)
+    await dao.set_thread_status(thread_id, "idle")
+    await event_bus.publish(
+        thread_id, str(uuid.uuid4()),
+        {"type": "done", "status": "cancelled"},
+    )
+
+
+async def stop_all() -> int:
+    """Stop every run this process owns. Called on the way down.
+
+    A run is an in-memory task and cannot outlive the process; the only question is whether
+    it stops tidily or is torn down mid-write. This has to happen *before* the checkpointer
+    closes, or a node writing a checkpoint meets a closed connection.
+    """
+    live = {tid: task for tid, task in _runs.items() if not task.done()}
+    if not live:
+        return 0
+
+    logger.info("Stopping %s in-flight run(s) before shutdown.", len(live))
+    _cancelled.update(live)
+    _, pending = await asyncio.wait(set(live.values()), timeout=SHUTDOWN_GRACE_SECONDS)
+    for task in pending:
+        task.cancel()
+    if pending:
+        # Let each one run its own cleanup - the handler is what records the turn as over.
+        await asyncio.wait(pending, timeout=SHUTDOWN_GRACE_SECONDS)
+    return len(live)
+
+
+def watch_disconnect(thread_id: str) -> None:
+    """Note that a client's event stream has gone away.
+
+    A refresh, a sleeping laptop and a closed tab are indistinguishable from here, so none
+    of them is obeyed on its own: the run is held for `DISCONNECT_GRACE_SECONDS` in case a
+    client comes back, and only stopped if none does. Cancelling on disconnect outright
+    would defeat the `from_seq` replay that deliberately lets a reload rejoin a long build.
+    """
+    if event_bus.subscriber_count(thread_id) or not is_running(thread_id):
+        return
+    if thread_id in _abandoned:
+        return
+    _abandoned[thread_id] = asyncio.create_task(_cancel_if_abandoned(thread_id))
+
+
+async def _cancel_if_abandoned(thread_id: str) -> None:
+    try:
+        await asyncio.sleep(DISCONNECT_GRACE_SECONDS)
+        if event_bus.subscriber_count(thread_id) or not is_running(thread_id):
+            return
+        logger.info(
+            "Nothing has watched %s for %ss; stopping its run.",
+            thread_id, DISCONNECT_GRACE_SECONDS,
+        )
+        await request_cancel(thread_id)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _abandoned.pop(thread_id, None)
 
 
 def _clear_cancel(thread_id: str) -> None:
     _cancelled.discard(thread_id)
+    timer = _abandoned.pop(thread_id, None)
+    if timer and not timer.done():
+        timer.cancel()
 
 
 def _canvas_state(canvas) -> dict:
@@ -128,7 +237,9 @@ async def _launch(thread_id: str, payload) -> str:
         raise ThreadBusy(thread_id)
 
     run_id = str(uuid.uuid4())
-    _cancelled.discard(thread_id)
+    # Clears the stop flag *and* any abandonment timer left by a client that dropped
+    # during the previous turn; otherwise it would fire into this one.
+    _clear_cancel(thread_id)
     await dao.set_thread_status(thread_id, "running")
 
     task = asyncio.create_task(_run(thread_id, run_id, payload))
@@ -204,7 +315,10 @@ async def _run(thread_id: str, run_id: str, payload) -> None:
         await _finish(thread_id, emit, "awaiting_input")
         return
 
-    await _finish(thread_id, emit, "completed")
+    # A run that stopped itself on request ended by agreement, not by finishing. Reporting
+    # it as "completed" would leave the user's own Stop looking like it did nothing.
+    stopped = state.values.get("build_status") == "CANCELLED"
+    await _finish(thread_id, emit, "cancelled" if stopped else "completed")
 
 
 async def _drive(graph, config, payload, emit, seen_messages, active, step) -> None:
