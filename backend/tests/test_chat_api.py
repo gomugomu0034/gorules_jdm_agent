@@ -13,7 +13,12 @@ from backend.tests.test_agent_flow import GOOD_DSL, TESTS, FakeLLM
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def app_env(tmp_path, monkeypatch):
+    """The configured app, not yet started.
+
+    Kept separate from `client` so a test can start it more than once against the same
+    database file, which is the only way to exercise what a restart does.
+    """
     monkeypatch.setenv("DB_PATH", str(tmp_path / "studio.db"))
     monkeypatch.setattr(agent, "_repo_path", lambda *p: tmp_path.joinpath(*p))
 
@@ -37,7 +42,12 @@ def client(tmp_path, monkeypatch):
 
     from backend.main import app
 
-    with TestClient(app) as c:
+    return app
+
+
+@pytest.fixture
+def client(app_env):
+    with TestClient(app_env) as c:
         yield c
 
 
@@ -203,3 +213,107 @@ def test_proposal_downloads_before_acceptance(client):
 def test_thread_not_found(client):
     assert client.get("/api/chat/threads/missing").status_code == 404
     assert client.get("/api/chat/threads/missing").json()["error"]["code"] == "THREAD_NOT_FOUND"
+
+
+# --------------------------------------------------------------------------
+# Surviving a restart
+#
+# A run is an in-memory asyncio.Task, but its status is written to SQLite. Nothing
+# reconciles the two after a crash, so a row still claiming `running` describes a task
+# that cannot exist - and the client believes it, disabling the composer and offering a
+# Stop button that will never find anything to cancel.
+# --------------------------------------------------------------------------
+
+def _force_status(tmp_path, thread_id: str, status: str) -> None:
+    """Leave the row exactly as a process killed mid-turn would have left it."""
+    import sqlite3
+
+    conn = sqlite3.connect(tmp_path / "studio.db")
+    with conn:
+        conn.execute("UPDATE chat_threads SET status = ? WHERE id = ?", (status, thread_id))
+    conn.close()
+
+
+def test_a_conversation_left_running_by_a_crash_is_released_on_restart(app_env, tmp_path):
+    with TestClient(app_env) as first:
+        thread_id = first.post("/api/chat/threads", json={}).json()["id"]
+        cookies = dict(first.cookies)
+
+    _force_status(tmp_path, thread_id, "running")
+
+    with TestClient(app_env) as restarted:
+        restarted.cookies.update(cookies)
+        state = restarted.get(f"/api/chat/threads/{thread_id}").json()
+
+        assert state["status"] == "idle", (
+            "the process that owned this run is gone, so the thread cannot still be running"
+        )
+        # The status is what the client gates its composer on, so releasing it has to
+        # leave the conversation genuinely usable rather than merely relabelled.
+        accepted = restarted.post(
+            f"/api/chat/threads/{thread_id}/messages",
+            json={"text": "Create a shipping policy.",
+                  "canvas": {"content": {"nodes": [], "edges": []}}},
+        )
+        assert accepted.status_code == 202
+
+
+def test_a_restart_releases_only_the_runs_that_died(app_env, tmp_path):
+    """A paused conversation is not a crashed one; only `running` is stale by definition."""
+    with TestClient(app_env) as first:
+        threads = {
+            status: first.post("/api/chat/threads", json={}).json()["id"]
+            for status in ("running", "awaiting_input", "error", "idle")
+        }
+        cookies = dict(first.cookies)
+        for status, thread_id in threads.items():
+            _force_status(tmp_path, thread_id, status)
+
+    with TestClient(app_env) as restarted:
+        restarted.cookies.update(cookies)
+        seen = {
+            status: restarted.get(f"/api/chat/threads/{tid}").json()["status"]
+            for status, tid in threads.items()
+        }
+
+    assert seen == {
+        "running": "idle",
+        "awaiting_input": "awaiting_input",
+        "error": "error",
+        "idle": "idle",
+    }
+
+
+def test_a_question_interrupted_by_a_crash_can_still_be_answered(app_env, tmp_path):
+    """Dying between the checkpoint write and the status write is the awkward case.
+
+    The agent really is waiting - the interrupt is in the checkpoint and survives - but the
+    row says `running`. Releasing it to `idle` would render the question with every answer
+    refused by `resume`, so the checkpoint has to win.
+    """
+    with TestClient(app_env) as first:
+        thread_id = first.post("/api/chat/threads", json={}).json()["id"]
+        first.post(
+            f"/api/chat/threads/{thread_id}/messages",
+            json={"text": "Create a shipping policy.",
+                  "canvas": {"content": {"nodes": [], "edges": []}}},
+        )
+        read_events(first, thread_id)
+        assert first.get(f"/api/chat/threads/{thread_id}").json()["status"] == "awaiting_input"
+        cookies = dict(first.cookies)
+
+    _force_status(tmp_path, thread_id, "running")
+
+    with TestClient(app_env) as restarted:
+        restarted.cookies.update(cookies)
+        state = restarted.get(f"/api/chat/threads/{thread_id}").json()
+
+        assert state["status"] == "awaiting_input"
+        assert state["pending_interrupt"]["options"], "the question itself must survive too"
+
+        answered = restarted.post(
+            f"/api/chat/threads/{thread_id}/resume",
+            json={"value": "Approve with above understanding & assumptions"},
+        )
+        assert answered.status_code == 202, "the answer must not be refused as NOT_AWAITING_INPUT"
+        read_events(restarted, thread_id)

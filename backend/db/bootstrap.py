@@ -116,6 +116,22 @@ async def seed_admin() -> None:
     logger.info("Admin user ready (%s).", settings.admin_email)
 
 
+async def reset_stale_runs() -> int:
+    """Release conversations pinned to `running` by a process that died mid-turn.
+
+    The run itself is an in-memory task and cannot outlive the process, so on a fresh boot
+    every `running` row is stale by definition. Left alone the row is permanent: the client
+    reads the status on load, disables the composer and offers a Stop that finds no task to
+    cancel, so the conversation can never be used again.
+    """
+    released = await dao.reset_running_threads()
+    if released:
+        logger.info(
+            "Released %s conversation(s) left mid-run by a previous process.", released
+        )
+    return released
+
+
 async def sweep_guests() -> int:
     """Delete guest data untouched for `guest_ttl_days`; cascades to children."""
     removed = await dao.delete_stale_guests(settings.guest_ttl_days)
@@ -197,6 +213,9 @@ def _warn_if_failing(name: str, content: dict, tests: list) -> None:
 async def bootstrap() -> None:
     await apply_schema()
     await migrate_owners()
+    # Before anything can be served: a request that arrives first would otherwise read a
+    # status describing a task from a process that no longer exists.
+    await reset_stale_runs()
     await seed_admin()
     # Runs on every boot, not just the first. `import_legacy_graphs` already skips any
     # graph the admin owns by that name, so this is idempotent - and gating it behind a
