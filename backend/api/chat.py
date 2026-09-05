@@ -85,6 +85,16 @@ async def get_thread(thread_id: str, owner: str = Depends(auth.get_owner)) -> Th
                 options=options,
                 kind="choice" if options else "text",
             )
+
+        # The checkpoint is the authority on whether the agent is waiting. A process that
+        # died between writing it and recording `awaiting_input` leaves a thread whose
+        # stored status disagrees - and `resume` trusts the stored status, so the pending
+        # question would render with every answer refused. Reconcile here, which is the
+        # one place both are already in hand, and the moment it matters: page load.
+        stale = pending is not None and thread["status"] != "awaiting_input"
+        if stale and not chat_runner.is_running(thread_id):
+            await dao.set_thread_status(thread_id, "awaiting_input")
+            thread = dict(thread, status="awaiting_input")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not read agent state for %s: %s", thread_id, exc)
 
@@ -121,6 +131,13 @@ async def send_message(
         run_id = await chat_runner.start_message(thread_id, body.text, body.canvas)
     except chat_runner.ThreadBusy:
         raise ApiError("THREAD_BUSY", "This conversation is already running.", 409) from None
+    except chat_runner.WorkspaceBusy as busy:
+        raise ApiError(
+            "WORKSPACE_BUSY",
+            f"Something else is already using the model for this policy ({busy}). "
+            "Wait for it to finish and ask again.",
+            409,
+        ) from None
     return RunAcceptedResponse(run_id=run_id)
 
 
@@ -192,6 +209,10 @@ async def stream(
                 yield _frame(event)
         finally:
             event_bus.unsubscribe(thread_id, queue)
+            # Nobody is watching this run any more. That may mean the tab was closed, or
+            # only that it was reloaded, so this starts a grace period rather than
+            # stopping anything: see `watch_disconnect`.
+            chat_runner.watch_disconnect(thread_id)
 
     return StreamingResponse(
         generator(),

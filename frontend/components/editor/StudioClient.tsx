@@ -6,8 +6,8 @@
 import type { DecisionGraphType, Simulation } from '@gorules/jdm-editor';
 import dynamic from 'next/dynamic';
 import { useRouter } from 'next/navigation';
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Group, Panel, Separator, useDefaultLayout } from 'react-resizable-panels';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Group, Panel, Separator, useDefaultLayout, useGroupRef } from 'react-resizable-panels';
 
 import { api } from '../../lib/api';
 import { useChatStore } from '../../stores/useChatStore';
@@ -79,10 +79,104 @@ export function StudioClient({ graphId }: { graphId: string | null }) {
   const [simulating, setSimulating] = useState(false);
   const [sidebarToken, setSidebarToken] = useState(0);
 
+  // The panels actually rendered right now, in order. The sidebar and the chat are
+  // toggleable, and the library requires the current set to be declared whenever panels
+  // are conditional: "Panel ids must match the Panels rendered within the Group during
+  // mount or the initial layout will be incorrect." Without it one storage key serves
+  // every combination, so a layout saved with the chat closed is restored into a group
+  // that has it open - and the group then never resolves a layout at all. Every panel
+  // stays on its `defaultSize` fallback with `flexGrow: 0`, the size the browser paints
+  // stops matching the size the library thinks it has, and the separator jams once the
+  // stored value reaches a `minSize`/`maxSize` bound the visible layout is nowhere near.
+  const panelIds = useMemo(
+    () => [...(sidebarOpen ? ['sidebar'] : []), 'canvas', ...(chatOpen ? ['chat'] : [])],
+    [sidebarOpen, chatOpen],
+  );
+
   // Persists the pane sizes per browser. An explicit storage shim is required
   // because the hook defaults to `localStorage`, which does not exist during
   // the server render of a direct page load.
-  const layout = useDefaultLayout({ id: 'jdm-studio-layout', storage: layoutStorage });
+  const { defaultLayout, ...persistLayout } = useDefaultLayout({
+    id: 'jdm-studio-layout',
+    panelIds,
+    storage: layoutStorage,
+  });
+
+  // The remembered layout is applied *after* mount rather than handed to the group as
+  // `defaultLayout`, which is what the library documents. Passing it there leaves the
+  // group holding a layout its own panels never receive: they stay on the `defaultSize`
+  // fallback, which renders a percentage `flex-basis` and a `flexGrow` of 0. Dragging then
+  // writes `flexGrow` over the top of that stale basis, so what the browser paints and
+  // what the library thinks it has drift apart - and the separator stops moving as soon as
+  // the stored value hits a bound the visible layout is nowhere near. Applying it once the
+  // panels are subscribed is what makes them adopt it.
+  const groupRef = useGroupRef();
+  const restored = useRef<string | null>(null);
+
+  useEffect(() => {
+    const signature = panelIds.join(':');
+    if (restored.current === signature) return;
+    restored.current = signature;
+    // Only a layout covering exactly the panels on screen can be applied; a stale one is
+    // left alone rather than partially written.
+    if (!defaultLayout || !panelIds.every((id) => typeof defaultLayout[id] === 'number')) return;
+
+    // Deferred by a frame, and guarded. Toggling a pane changes `panelIds` before the
+    // group has re-registered its own, and writing a layout for a set it has not adopted
+    // yet throws - which, unguarded, took the whole studio down with an error overlay.
+    // Restoring a remembered size is cosmetic; failing to must cost nothing more than the
+    // panes keeping the size they already have.
+    const frame = requestAnimationFrame(() => {
+      try {
+        groupRef.current?.setLayout(
+          Object.fromEntries(panelIds.map((id) => [id, defaultLayout[id]])),
+        );
+      } catch {
+        // The group holds a different set of panels than this layout describes.
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [defaultLayout, panelIds, groupRef]);
+
+  // The invariant everything above exists to hold: what the browser paints has to match
+  // what the library thinks it has. When they drift, `minSize` and `maxSize` are still
+  // enforced against *its* numbers, so the separator stops moving while the pane on screen
+  // is nowhere near the bound - the "stuck to a size" this was reported as. Reverting the
+  // fix above puts it 13 points out, and nothing about the page looks wrong until someone
+  // tries to drag, which is why it needs an assertion rather than an eye.
+  //
+  // Checked on every layout change, because that is when drift appears and when the
+  // authoritative layout is in hand. This repo has no browser-test harness, so the
+  // assertion lives where it will actually run: every dev session. Stripped from
+  // production builds.
+  const onLayoutChanged = useCallback(
+    (layout: Record<string, number>, meta: { isUserInteraction: boolean }) => {
+      persistLayout.onLayoutChanged?.(layout, meta);
+      if (process.env.NODE_ENV === 'production') return;
+      requestAnimationFrame(() => {
+        const total = document.querySelector<HTMLElement>('[data-group]')?.clientWidth;
+        if (!total) return;
+        const drifted = Object.entries(layout).flatMap(([id, expected]) => {
+          const el = document.getElementById(id);
+          if (!el) return [];
+          const painted = (el.getBoundingClientRect().width / total) * 100;
+          return Math.abs(painted - expected) > 1
+            ? [`${id}: ${painted.toFixed(1)}% painted vs ${expected.toFixed(1)}% stored`]
+            : [];
+        });
+        if (drifted.length) {
+          console.error(
+            '[studio] Panel layout has drifted from the layout the library is enforcing, so '
+              + 'the separator will jam before the panes reach their limits:\n  '
+              + drifted.join('\n  '),
+          );
+        }
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [persistLayout.onLayoutChanged],
+  );
+
   const openedThread = useRef<string | null>(null);
 
   useEffect(() => {
@@ -178,7 +272,14 @@ export function StudioClient({ graphId }: { graphId: string | null }) {
         onSaveDraft={() => setSaveOpen(true)}
       />
 
-      <Group orientation="horizontal" className="flex min-h-0 flex-1" {...layout}>
+      <Group
+        id="jdm-studio"
+        groupRef={groupRef}
+        orientation="horizontal"
+        className="flex min-h-0 flex-1"
+        {...persistLayout}
+        onLayoutChanged={onLayoutChanged}
+      >
         {sidebarOpen ? (
           <>
             <Panel id="sidebar" defaultSize="17%" minSize="180px" maxSize="34%">

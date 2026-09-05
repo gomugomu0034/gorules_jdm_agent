@@ -503,6 +503,22 @@ async def set_thread_status(thread_id: str, status: str) -> None:
         )
 
 
+async def reset_running_threads() -> int:
+    """Clear the `running` status left behind by a process that did not stop cleanly.
+
+    A run lives in an in-memory `asyncio.Task`, but its status is written to the database.
+    Nothing survives a crash or a `docker compose down` mid-run, so a row still claiming
+    `running` after a restart is describing a task that no longer exists - and the client
+    believes it, disabling the composer and showing a Stop button that can never resolve.
+
+    `updated_at` is deliberately left alone: nothing about the conversation changed, and
+    bumping it on every boot would reorder the thread list.
+    """
+    async with connection.write() as conn:
+        cur = await conn.execute("UPDATE chat_threads SET status = 'idle' WHERE status = 'running'")
+        return cur.rowcount or 0
+
+
 async def set_thread_graph(thread_id: str, graph_id: str | None) -> None:
     async with connection.write() as conn:
         await conn.execute(

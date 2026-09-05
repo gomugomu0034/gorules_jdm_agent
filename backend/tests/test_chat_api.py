@@ -13,7 +13,12 @@ from backend.tests.test_agent_flow import GOOD_DSL, TESTS, FakeLLM
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def app_env(tmp_path, monkeypatch):
+    """The configured app, not yet started.
+
+    Kept separate from `client` so a test can start it more than once against the same
+    database file, which is the only way to exercise what a restart does.
+    """
     monkeypatch.setenv("DB_PATH", str(tmp_path / "studio.db"))
     monkeypatch.setattr(agent, "_repo_path", lambda *p: tmp_path.joinpath(*p))
 
@@ -37,7 +42,12 @@ def client(tmp_path, monkeypatch):
 
     from backend.main import app
 
-    with TestClient(app) as c:
+    return app
+
+
+@pytest.fixture
+def client(app_env):
+    with TestClient(app_env) as c:
         yield c
 
 
@@ -203,3 +213,235 @@ def test_proposal_downloads_before_acceptance(client):
 def test_thread_not_found(client):
     assert client.get("/api/chat/threads/missing").status_code == 404
     assert client.get("/api/chat/threads/missing").json()["error"]["code"] == "THREAD_NOT_FOUND"
+
+
+# --------------------------------------------------------------------------
+# Surviving a restart
+#
+# A run is an in-memory asyncio.Task, but its status is written to SQLite. Nothing
+# reconciles the two after a crash, so a row still claiming `running` describes a task
+# that cannot exist - and the client believes it, disabling the composer and offering a
+# Stop button that will never find anything to cancel.
+# --------------------------------------------------------------------------
+
+def _force_status(tmp_path, thread_id: str, status: str) -> None:
+    """Leave the row exactly as a process killed mid-turn would have left it."""
+    import sqlite3
+
+    conn = sqlite3.connect(tmp_path / "studio.db")
+    with conn:
+        conn.execute("UPDATE chat_threads SET status = ? WHERE id = ?", (status, thread_id))
+    conn.close()
+
+
+def test_a_conversation_left_running_by_a_crash_is_released_on_restart(app_env, tmp_path):
+    with TestClient(app_env) as first:
+        thread_id = first.post("/api/chat/threads", json={}).json()["id"]
+        cookies = dict(first.cookies)
+
+    _force_status(tmp_path, thread_id, "running")
+
+    with TestClient(app_env) as restarted:
+        restarted.cookies.update(cookies)
+        state = restarted.get(f"/api/chat/threads/{thread_id}").json()
+
+        assert state["status"] == "idle", (
+            "the process that owned this run is gone, so the thread cannot still be running"
+        )
+        # The status is what the client gates its composer on, so releasing it has to
+        # leave the conversation genuinely usable rather than merely relabelled.
+        accepted = restarted.post(
+            f"/api/chat/threads/{thread_id}/messages",
+            json={"text": "Create a shipping policy.",
+                  "canvas": {"content": {"nodes": [], "edges": []}}},
+        )
+        assert accepted.status_code == 202
+
+
+def test_a_restart_releases_only_the_runs_that_died(app_env, tmp_path):
+    """A paused conversation is not a crashed one; only `running` is stale by definition."""
+    with TestClient(app_env) as first:
+        threads = {
+            status: first.post("/api/chat/threads", json={}).json()["id"]
+            for status in ("running", "awaiting_input", "error", "idle")
+        }
+        cookies = dict(first.cookies)
+        for status, thread_id in threads.items():
+            _force_status(tmp_path, thread_id, status)
+
+    with TestClient(app_env) as restarted:
+        restarted.cookies.update(cookies)
+        seen = {
+            status: restarted.get(f"/api/chat/threads/{tid}").json()["status"]
+            for status, tid in threads.items()
+        }
+
+    assert seen == {
+        "running": "idle",
+        "awaiting_input": "awaiting_input",
+        "error": "error",
+        "idle": "idle",
+    }
+
+
+def test_a_question_interrupted_by_a_crash_can_still_be_answered(app_env, tmp_path):
+    """Dying between the checkpoint write and the status write is the awkward case.
+
+    The agent really is waiting - the interrupt is in the checkpoint and survives - but the
+    row says `running`. Releasing it to `idle` would render the question with every answer
+    refused by `resume`, so the checkpoint has to win.
+    """
+    with TestClient(app_env) as first:
+        thread_id = first.post("/api/chat/threads", json={}).json()["id"]
+        first.post(
+            f"/api/chat/threads/{thread_id}/messages",
+            json={"text": "Create a shipping policy.",
+                  "canvas": {"content": {"nodes": [], "edges": []}}},
+        )
+        read_events(first, thread_id)
+        assert first.get(f"/api/chat/threads/{thread_id}").json()["status"] == "awaiting_input"
+        cookies = dict(first.cookies)
+
+    _force_status(tmp_path, thread_id, "running")
+
+    with TestClient(app_env) as restarted:
+        restarted.cookies.update(cookies)
+        state = restarted.get(f"/api/chat/threads/{thread_id}").json()
+
+        assert state["status"] == "awaiting_input"
+        assert state["pending_interrupt"]["options"], "the question itself must survive too"
+
+        answered = restarted.post(
+            f"/api/chat/threads/{thread_id}/resume",
+            json={"value": "Approve with above understanding & assumptions"},
+        )
+        assert answered.status_code == 202, "the answer must not be refused as NOT_AWAITING_INPUT"
+        read_events(restarted, thread_id)
+
+
+def test_stopping_a_run_that_no_longer_exists_still_resolves_the_conversation(
+    app_env, tmp_path
+):
+    """Pressing Stop on a turn lost with a previous process must not be a no-op.
+
+    `status` is the only thing telling the client a turn is over, so a Stop that reports
+    "nothing to cancel" and changes nothing leaves the composer disabled behind a button
+    that appears broken - which is what a stuck `running` row used to look like.
+    """
+    with TestClient(app_env) as client:
+        thread_id = client.post("/api/chat/threads", json={}).json()["id"]
+        _force_status(tmp_path, thread_id, "running")
+
+        response = client.post(f"/api/chat/threads/{thread_id}/cancel")
+
+        assert response.status_code == 200
+        assert response.json()["cancelled"] is False, "there was genuinely no task to stop"
+        assert client.get(f"/api/chat/threads/{thread_id}").json()["status"] == "idle"
+
+        # And the stream is told, so a client that is watching settles without a reload.
+        events = client.get(f"/api/chat/threads/{thread_id}/events").json()["events"]
+        assert events[-1] == {**events[-1], "type": "done", "status": "cancelled"}
+
+
+# --------------------------------------------------------------------------
+# Sharing one model between two surfaces
+#
+# The chat has always been serialised per thread and the inspectors are local, so three
+# panels open at once is fine. The exception is generating a test suite: it calls the model
+# directly, outside the agent's lock, so pressing it mid-build put two conversations on one
+# API key - and on a tier of 50 requests a day, one of them dies on a 429 the user has no
+# way to connect back to what they clicked.
+# --------------------------------------------------------------------------
+
+def _graph_with_thread(client, tmp_path):
+    """A saved policy and a chat thread bound to it, as the studio has open."""
+    graph_id = client.post(
+        "/api/graphs",
+        json={"name": "Shipping", "content": {"nodes": [], "edges": []}},
+    ).json()["id"]
+    thread_id = client.post("/api/chat/threads", json={"graph_id": graph_id}).json()["id"]
+    return graph_id, thread_id
+
+
+class StillRunning:
+    """A run in flight, as `is_running` sees one. Driving a real build here would finish
+    long before the assertion, and the point is the window while it is still going."""
+
+    def done(self) -> bool:
+        return False
+
+
+def test_generating_tests_is_refused_while_the_assistant_is_working(client, tmp_path):
+    from backend.services import chat_runner
+
+    graph_id, thread_id = _graph_with_thread(client, tmp_path)
+
+    chat_runner._runs[thread_id] = StillRunning()
+    try:
+        response = client.post(f"/api/graphs/{graph_id}/tests/generate")
+    finally:
+        chat_runner._runs.pop(thread_id, None)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "WORKSPACE_BUSY"
+    assert "assistant" in response.json()["error"]["message"]
+
+
+def test_the_assistant_is_refused_while_tests_are_being_generated(client, tmp_path):
+    from backend.services import chat_runner
+
+    graph_id, thread_id = _graph_with_thread(client, tmp_path)
+
+    chat_runner._generating.add(graph_id)
+    try:
+        response = client.post(
+            f"/api/chat/threads/{thread_id}/messages",
+            json={"text": "Add a rule for VIP customers.",
+                  "canvas": {"content": {"nodes": [], "edges": []}, "graph_id": graph_id}},
+        )
+    finally:
+        chat_runner._generating.discard(graph_id)
+
+    assert response.status_code == 409, "both directions have to be guarded, not just one"
+    assert response.json()["error"]["code"] == "WORKSPACE_BUSY"
+
+
+def test_the_guard_is_per_policy_not_global(client, tmp_path):
+    """Two policies open in two tabs must not block each other."""
+    from backend.services import chat_runner
+
+    _, thread_id = _graph_with_thread(client, tmp_path)
+
+    chat_runner._generating.add("some-other-graph")
+    try:
+        response = client.post(
+            f"/api/chat/threads/{thread_id}/messages",
+            json={"text": "Create a shipping policy.",
+                  "canvas": {"content": {"nodes": [], "edges": []}}},
+        )
+    finally:
+        chat_runner._generating.discard("some-other-graph")
+
+    assert response.status_code == 202
+    read_events(client, thread_id)
+
+
+def test_an_exhausted_quota_is_reported_as_a_quota_problem(client, tmp_path, monkeypatch):
+    """It is the likeliest failure on a free tier and the only one the user can act on, so
+    it must not arrive as a generic 502 about the agent being broken."""
+    from backend.lang_graph_agent import RateLimited
+    from backend.services import test_service
+
+    graph_id, _ = _graph_with_thread(client, tmp_path)
+
+    async def exhausted(_content):
+        raise RateLimited("free-models-per-day exceeded (resets at 2026-09-06T00:00Z)")
+
+    monkeypatch.setattr(test_service, "generate_test_suite", exhausted)
+    response = client.post(f"/api/graphs/{graph_id}/tests/generate")
+
+    assert response.status_code == 429
+    body = response.json()["error"]
+    assert body["code"] == "LLM_RATE_LIMITED"
+    assert "free-models-per-day" in body["message"], "the provider's own words say which limit"
+    assert "resets at" in body["message"]

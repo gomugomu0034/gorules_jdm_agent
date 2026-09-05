@@ -44,6 +44,19 @@ async def startup() -> None:
 
 async def shutdown() -> None:
     global _graph, _saver_cm
+
+    # Runs first, checkpointer second. A run is an in-memory task that cannot survive this
+    # process anyway, but closing the saver underneath one still mid-write leaves a
+    # half-written checkpoint behind for the next boot to read. Imported here rather than
+    # at module scope: chat_runner reaches back for the graph, and the cycle is only safe
+    # in one direction.
+    from backend.services import chat_runner
+
+    try:
+        await chat_runner.stop_all()
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not stop in-flight runs cleanly.", exc_info=True)
+
     if _saver_cm is not None:
         try:
             await _saver_cm.__aexit__(None, None, None)

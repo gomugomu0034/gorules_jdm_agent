@@ -74,15 +74,23 @@ LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
 AGENT_RUN_TIMEOUT_SECONDS = int(os.getenv("AGENT_RUN_TIMEOUT", "900"))
 
 
-def _max_build_attempts() -> int:
+# How many times the planner may be asked for a design before the turn gives up. A plan
+# that never arrives cannot be repaired by the builder, so retrying is the planner's job -
+# but only briefly: at temperature 0 the model is deterministic, so a retry is worth making
+# exactly as long as the input to it keeps changing.
+MAX_PLAN_ATTEMPTS = 2
+
+
+def _max_build_attempts(planner_calls: int = 1) -> int:
     """How many builder passes fit inside the run's wall clock.
 
     Attempt 0 spends no LLM call, so N attempts cost N-1 calls. The old fixed ceiling of 8
     could spend 960s against a 900s run budget - and when that budget fires, `asyncio.wait_for`
     discards the turn while this node has checkpointed nothing, losing every repair it made.
-    Leave room for the planner call that precedes the loop and the reporting that follows.
+    Leave room for the planner calls that precede the loop and the reporting that follows -
+    `planner_calls` is however many the turn actually spent, since a re-plan costs one more.
     """
-    usable = AGENT_RUN_TIMEOUT_SECONDS - LLM_TIMEOUT_SECONDS  # the planner's own call
+    usable = AGENT_RUN_TIMEOUT_SECONDS - max(1, planner_calls) * LLM_TIMEOUT_SECONDS
     return max(2, min(8, 1 + int(usable * 0.8) // max(LLM_TIMEOUT_SECONDS, 1)))
 
 # Gemini Config
@@ -284,6 +292,8 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
         data=json.dumps(payload),
         timeout=LLM_TIMEOUT_SECONDS,
     )
+    if response.status_code == 429:
+        raise RateLimited(_provider_message(response) or "The model provider is rate limiting us.")
     response.raise_for_status()
 
     response_json = response.json()
@@ -292,6 +302,36 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
         message.get("content", ""),
         reasoning_details=message.get("reasoning_details"),
     )
+
+
+class RateLimited(RuntimeError):
+    """The model provider refused the call because a quota is exhausted.
+
+    Worth its own type because it is the single most likely failure on a free tier and the
+    only one the user can act on - by waiting, or by pointing the app at a paid model. As a
+    generic error it reached the chat as "AGENT_ERROR: 429 Client Error: Too Many Requests",
+    with the provider's own explanation of *which* limit and *when it resets* thrown away
+    in `raise_for_status`.
+    """
+
+
+def _provider_message(response) -> str:
+    """The provider's own account of a refusal, if it gave one."""
+    try:
+        body = response.json()
+    except ValueError:
+        return (response.text or "").strip()[:300]
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        message = str(error.get("message") or "").strip()
+        # OpenRouter names the exhausted limit here, e.g. "free-models-per-day".
+        metadata = error.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("headers"):
+            reset = metadata["headers"].get("X-RateLimit-Reset")
+            if reset:
+                message = f"{message} (resets at {reset})".strip()
+        return message[:300]
+    return ""
 
 
 def call_llm(sys_prompt: str, messages: list) -> str:
@@ -331,6 +371,8 @@ class AgentState(TypedDict):
     triage_message: str
     triage_options: list
     graph_plan_dsl: str
+    plan_status: str  # "OK" once the planner produced a design; "EMPTY" when it produced none
+    plan_attempts_used: int  # Planner calls spent this turn; also sizes the builder's budget
     jdm_json: str
     test_suite_json: str
     evaluation_feedback: str
@@ -944,8 +986,63 @@ def human_triage_review_node(state: AgentState):
         }
 
 # Step 2: Planner (Expert Analyst)
+def _is_a_plan(dsl: str) -> bool:
+    """Does this reply contain a design at all, as opposed to prose or nothing?
+
+    The distinction decides who repairs it. A plan with mistakes in it - a dangling edge, a
+    bad cell - belongs to the builder, whose repair loop exists for exactly that and which
+    is better placed to fix one line than the planner is to start over. A reply with no DSL
+    skeleton is a different thing entirely: there is nothing to repair, and handing it on
+    spends the whole repair budget discovering that before reporting a builder failure for
+    what was really a planning one.
+    """
+    return bool(dsl.strip()) and "# Structure" in dsl and "# Nodes" in dsl
+
+
+# Given to the planner when its previous reply carried no design. At temperature 0 an
+# unchanged prompt returns an unchanged answer, so a bare retry is guaranteed to reproduce
+# the same non-answer - the second attempt only means anything because this is added to it.
+# Rendered through the same diagnostic channel the builder's repair loop uses, so a failure
+# reads the same way wherever in the pipeline it happened.
+_REPLAN_INSTRUCTION = format_for_llm([
+    Diagnostic(
+        kind="dsl_parse",
+        code="NO_PLAN",
+        message=(
+            "Your previous reply contained no graph plan - neither a `# Structure` section "
+            "nor a `# Nodes` section - so there was nothing to build from."
+        ),
+        fix_hint=(
+            "Emit the plan in the format described above: one `# Structure` section holding "
+            "a mermaid flowchart whose arrows define the edges, and one `# Nodes` section "
+            "with a `## <name>` block per node named in that flowchart. If the requirement "
+            "is too large to express at once, design only the main decision path - a request "
+            "node, one or two decision tables, a response node - and leave the rest out. A "
+            "partial plan can be extended; no plan cannot."
+        ),
+    )
+])
+
+
+def _no_plan_feedback(reply: str) -> str:
+    """What to show the user when the planner produced no design.
+
+    Its actual words matter here: a model that declines usually says why ("this needs data
+    the graph cannot reach"), and that is more useful than any summary of mine.
+    """
+    said = " ".join((reply or "").split())
+    if not said:
+        return "The planner returned an empty reply."
+    return f"The planner replied without a design:\n\n{said[:600]}"
+
+
 def planner_node(state: AgentState):
     print("\n[Step 2: Planner]: Generating DSL Implementation Plan...")
+
+    # Only *consecutive* failures count. Re-entering the planner after a design that worked
+    # - which is what a rejected final approval does - is a fresh start, not a third try.
+    retrying = state.get("plan_status") == "EMPTY"
+    spent = int(state.get("plan_attempts_used") or 0) if retrying else 0
 
     # If we are modifying an existing graph, inject it as a hidden system message
     # so the Planner knows not to start from scratch!
@@ -962,6 +1059,9 @@ def planner_node(state: AgentState):
 
         messages_for_planner.append(HumanMessage(content=injection))
 
+    if retrying:
+        messages_for_planner.append(HumanMessage(content=_REPLAN_INSTRUCTION))
+
     # Call your LLM using messages_for_planner instead of state["messages"]
     content = call_llm(PROMPT_PLANNER, messages_for_planner)
     print(f"planner node content: {content}")
@@ -973,8 +1073,24 @@ def planner_node(state: AgentState):
     if not test_suite_json:
         test_suite_json = "[]"
 
+    if not _is_a_plan(dsl_content):
+        print("  --> [Planner]: no design in the reply; the builder is not entered.")
+        return {
+            "graph_plan_dsl": dsl_content,
+            "plan_status": "EMPTY",
+            "plan_attempts_used": spent + 1,
+            # A failed re-plan must not leave the previous turn's graph in state: the
+            # reporter reads `jdm_json` and would otherwise announce a stale policy as
+            # though this turn had produced it.
+            "jdm_json": "",
+            "evaluation_feedback": _no_plan_feedback(content),
+            "messages": [_assistant_message_from_llm(content, internal=True)],
+        }
+
     return {
         "graph_plan_dsl": dsl_content,
+        "plan_status": "OK",
+        "plan_attempts_used": spent + 1,
         "test_suite_json": test_suite_json,
         "usecase_name": usecase_name,
         # The builder repairs what the planner wrote, so the plan has to be in the history
@@ -1059,6 +1175,15 @@ def patch_node(state: AgentState):
     last_feedback = ""
 
     for attempt in range(attempts):
+        # The same cooperative stop the builder honours. Without it an edit could only ever
+        # be killed mid-call, which discards the turn instead of reporting it.
+        if state.get("cancel_requested") or _user_cancelled(state):
+            print("  --> [Patch]: Cancellation requested; stopping.")
+            return {
+                "build_status": "CANCELLED",
+                "evaluation_feedback": "The edit was cancelled before it was applied.",
+            }
+
         _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
                "max_attempts": attempts, "phase": "llm",
                "message": "Working out the smallest change" if attempt == 0
@@ -1169,7 +1294,11 @@ def builder_node(state: AgentState):
     # the LLM to repair it. The budget lives in state, so re-entering the builder through
     # the final-approval loop cannot silently restart it and overrun the run's wall clock.
     spent_before = int(state.get("build_attempts_used") or 0)
-    MAX_ATTEMPTS = max(1, _max_build_attempts() - spent_before)
+    # A re-plan costs a whole LLM call out of the same wall clock, so the repair budget has
+    # to shrink by it; sizing the loop as though planning were always one call is how a run
+    # comes to be killed mid-repair with nothing checkpointed.
+    MAX_ATTEMPTS = max(1, _max_build_attempts(int(state.get("plan_attempts_used") or 1))
+                       - spent_before)
     started = time.monotonic()
     attempts_used = 0
     last_feedback = ""
@@ -1324,10 +1453,26 @@ def output_node(state: AgentState):
     # A failed build must say so. Reporting "all passing" over an empty graph
     # would be worse than useless: the canvas would stay blank while the chat
     # claimed success.
-    if status != "SUCCESS" or not nodes:
+    no_plan = state.get("plan_status") == "EMPTY"
+    if no_plan or status != "SUCCESS" or not nodes:
         feedback = (state.get("evaluation_feedback") or "").strip()
+        label = "Last error:"
         if status == "CANCELLED":
             body = ["Stopped before the graph was finished. Nothing was changed."]
+        elif no_plan:
+            # Naming the builder here would be a lie: it was never entered. The advice has
+            # to match the step that actually failed, which is the design, not the code.
+            body = [
+                f"I could not work out a graph structure for **{name}**.",
+                "",
+                "The planning step returned no design, so nothing was built or put on "
+                "the canvas.",
+                "",
+                "This usually means the requirement is carrying too much at once. Try "
+                "describing one decision at a time - what goes in, what comes out, and "
+                "the rule connecting them - and I can extend it from there.",
+            ]
+            label = "What the planner returned:"
         else:
             body = [
                 f"I could not build a working graph for **{name}**.",
@@ -1338,8 +1483,8 @@ def output_node(state: AgentState):
                 "Try narrowing the rules, or describe the inputs and the expected "
                 "decision for one concrete example.",
             ]
-            if feedback:
-                body += ["", "Last error:", "", "```", feedback[:600], "```"]
+        if feedback and status != "CANCELLED":
+            body += ["", label, "", "```", feedback[:600], "```"]
         return {
             "messages": [_assistant_message_from_llm("\n".join(body))],
             "build_failed": True,
@@ -1525,6 +1670,22 @@ def route_after_human_review(state: AgentState):
         return "triage_node"
 
 
+def route_after_planner(state: AgentState):
+    """A design the builder cannot use must never reach it.
+
+    The edge here used to be unconditional, so a planner reply with no plan in it went
+    straight on and the builder spent its entire repair budget asking the model to fix a
+    document that was never written - then reported a build failure for what was a planning
+    one. Re-planning is bounded because the retry only differs by the instruction added to
+    it; once that has been tried, more attempts are just the same call again.
+    """
+    if state.get("plan_status") != "EMPTY":
+        return "builder_node"
+    if int(state.get("plan_attempts_used") or 0) < MAX_PLAN_ATTEMPTS:
+        return "planner_node"
+    return "output_node"
+
+
 def route_after_final_approval(state: AgentState):
     if state.get("final_approval_status") == "APPROVED":
         return "save_files_node"
@@ -1690,8 +1851,18 @@ workflow.add_conditional_edges(
 )
 
 # generation for new and existing policy
-# Planner feeds directly to Builder
-workflow.add_edge("planner_node", "builder_node")
+# The builder is only reachable with a design in hand; without one the planner is asked
+# again, and if it still produces nothing the turn reports that rather than pretending
+# the failure happened downstream.
+workflow.add_conditional_edges(
+    "planner_node",
+    route_after_planner,
+    {
+        "builder_node": "builder_node",
+        "planner_node": "planner_node",
+        "output_node": "output_node",
+    },
+)
 # The patch is applied, linted and tested inside the node, so it reports directly.
 workflow.add_edge("patch_node", "output_node")
 # The builder reports failure through build_status; either way the user sees the

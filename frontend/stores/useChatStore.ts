@@ -178,7 +178,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const { threadId } = get();
     if (!threadId) return;
     try {
-      await api.cancelRun(threadId);
+      const { cancelled } = await api.cancelRun(threadId);
+      if (!cancelled) {
+        // There was no run to cancel - a turn lost with a previous process, most likely.
+        // The server settles its own record, but a client that is not on the stream would
+        // never hear about it and would sit here spinning behind a button that looks
+        // broken. Resolving locally costs nothing if the event does arrive: it is a
+        // last-write-wins of the same state.
+        set((s) => ({
+          running: false,
+          steps: s.steps.map((step) => ({ ...step, status: 'done' as const })),
+        }));
+      }
     } catch {
       // The done event settles the real state either way.
     }
