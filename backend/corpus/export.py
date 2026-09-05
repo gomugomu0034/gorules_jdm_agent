@@ -43,10 +43,17 @@ class Filters:
     since: str | None = None
     min_quality: float | None = None
     limit: int | None = None
+    source: str | None = None
 
     def where(self) -> tuple[str, list]:
         """SQL for the sample-level filters, as a clause and its arguments."""
-        clauses, args = ["s.error IS NULL"], []
+        # A sample whose system prompt cannot be resolved is not a training example - it
+        # is half of one, and a trainer would read the first user turn as the instruction.
+        clauses, args = ["s.error IS NULL",
+                         "s.prompt_hash IN (SELECT hash FROM prompts)"], []
+        if self.source:
+            clauses.append("s.run_id IN (SELECT run_id FROM runs WHERE source = ?)")
+            args.append(self.source)
         if self.node:
             clauses.append("s.node = ?")
             args.append(self.node)
@@ -286,6 +293,11 @@ def print_stats() -> None:
     print(f"corpus: {store.settings.corpus_db_file}\n")
     for key in ("runs", "samples", "prompts", "tool_results", "interactions", "labels"):
         print(f"  {key:16} {facts[key]:>8,}")
+        if key == "runs" and len(facts.get("runs_by_source") or {}) > 1:
+            # Only worth showing once there is more than one kind. A corpus of nothing but
+            # real use does not need to be told that.
+            for source, count in facts["runs_by_source"].items():
+                print(f"    {source:14} {count:>8,}")
     if facts.get("tokens"):
         print(f"  {'tokens':16} {facts['tokens']:>8,}")
     if facts.get("cost") is not None:
@@ -328,6 +340,8 @@ def main(argv: list[str] | None = None) -> int:
                                               "(a prefix is enough)")
     parser.add_argument("--model", help="substring match on the model that served the call")
     parser.add_argument("--since", help="ISO date, e.g. 2026-01-01")
+    parser.add_argument("--source", choices=["live", "replay", "backfill"],
+                        help="only runs from this source; live is real use of the studio")
     parser.add_argument("--min-quality", type=float,
                         help="1.0 keeps only samples that passed every objective check")
     parser.add_argument("--limit", type=int)
@@ -356,7 +370,8 @@ def main(argv: list[str] | None = None) -> int:
     rows = FORMATS[args.format](
         store._connect(),
         Filters(node=args.node, prompt_hash=args.prompt_hash, model=args.model,
-                since=args.since, min_quality=args.min_quality, limit=args.limit),
+                since=args.since, min_quality=args.min_quality, limit=args.limit,
+                source=args.source),
     )
     written = write(rows, args.out, scrub=not args.no_redact, bare=args.bare)
 

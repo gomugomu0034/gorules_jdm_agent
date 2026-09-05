@@ -30,6 +30,12 @@ CREATE TABLE IF NOT EXISTS runs (
   -- Hashed, never raw: a guest owner is `guest:<secrets.token_urlsafe(16)>`, which is the
   -- visitor's identity. The corpus needs to tell runs apart, not to know whose they were.
   owner_hash     TEXT NOT NULL DEFAULT '',
+  -- Where the run came from. `live` is a person using the studio; `replay` is the
+  -- harness driving scripted requirements to build volume; `backfill` is reconstructed
+  -- from conversations that predate this corpus. Exports can be held to one of them,
+  -- because a training split that silently mixes real use with synthetic drills is
+  -- measuring something nobody asked about.
+  source         TEXT NOT NULL DEFAULT 'live',
   intent         TEXT NOT NULL DEFAULT '',   -- CREATE | MODIFY | TEST | EXPLAIN | LINT
   mode           TEXT NOT NULL DEFAULT '',   -- NEW | EXISTING
   outcome        TEXT,                       -- completed | error | cancelled | NULL if in flight

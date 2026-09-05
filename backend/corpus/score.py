@@ -184,6 +184,10 @@ def summary() -> dict[str, Any]:
 
     return {
         "runs": one("SELECT COUNT(*) FROM runs"),
+        "runs_by_source": {
+            r["source"]: r["n"] for r in
+            _rows(conn, "SELECT source, COUNT(*) n FROM runs GROUP BY source ORDER BY n DESC")
+        },
         "samples": one("SELECT COUNT(*) FROM samples"),
         "prompts": one("SELECT COUNT(*) FROM prompts"),
         "tool_results": one("SELECT COUNT(*) FROM tool_results"),

@@ -96,6 +96,9 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "upstream_provider": "TEXT",
         "cost": "REAL",
     },
+    "runs": {
+        "source": "TEXT NOT NULL DEFAULT 'live'",
+    },
 }
 
 
@@ -200,13 +203,14 @@ def git_sha() -> str:
 
 @_never_fails
 def start_run(run_id: str, *, thread_id: str = "", graph_id: str | None = None,
-              owner_hash: str = "") -> None:
+              owner_hash: str = "", source: str = "live") -> None:
     with _lock:
         _connect().execute(
             "INSERT OR IGNORE INTO runs"
-            " (run_id, thread_id, graph_id, owner_hash, app_version, git_sha, started_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (run_id, thread_id, graph_id, owner_hash, settings.version, git_sha(), now()),
+            " (run_id, thread_id, graph_id, owner_hash, source, app_version, git_sha,"
+            "  started_at) VALUES (?,?,?,?,?,?,?,?)",
+            (run_id, thread_id, graph_id, owner_hash, source, settings.version, git_sha(),
+             now()),
         )
 
 

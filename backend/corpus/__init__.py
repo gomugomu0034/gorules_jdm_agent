@@ -54,6 +54,7 @@ def run_scope(
     thread_id: str = "",
     graph_id: str | None = None,
     owner: str | None = None,
+    source: str = "live",
 ) -> Iterator[RunContext | None]:
     """Mark everything inside as belonging to one turn.
 
@@ -79,6 +80,7 @@ def run_scope(
         thread_id=thread_id,
         graph_id=graph_id,
         owner_hash=context.owner_hash,
+        source=source,
     )
     token = bind(context)
     try:
