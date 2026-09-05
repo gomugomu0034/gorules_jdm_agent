@@ -167,6 +167,26 @@ body {
   width: 100%;
 }
 
+/*
+ * The editor's bottom drawer - Simulate, Tests, Problems - lives in an `auto` grid row
+ * with no drag handle of its own, so the user cannot resize it at all. Its own cap is a
+ * flat 500px, which takes 59% of the canvas on a 900px window and very nearly all of it
+ * on a laptop in a split screen: opening Problems to read one warning leaves the graph a
+ * strip. Capping it proportionally keeps the graph the larger half at any height, and the
+ * drawer scrolls within whatever it gets rather than being clipped, which is what
+ * `overflow-y: hidden` on the content was doing.
+ */
+.jdm-surface .grl-dg__panel {
+  /* A definite height, not just a cap: the row is `auto`, so a bare `max-height` lets the
+     drawer collapse to whatever its content happens to be - one warning would open a
+     150px sliver. */
+  height: min(420px, 45vh);
+  max-height: min(420px, 45vh);
+}
+.jdm-surface .grl-dg__panel__content {
+  overflow-y: auto;
+}
+
 @layer components {
   .focus-ring {
     @apply outline-none ring-offset-0 focus-visible:ring-2 focus-visible:ring-[var(--accent)];
