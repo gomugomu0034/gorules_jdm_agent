@@ -325,3 +325,181 @@ def test_every_key_sent_on_a_resume_can_be_written_twice():
         f"these keys travel on every resume but have no reducer: {unguarded}. "
         "Annotate them with `_latest`."
     )
+
+
+# --------------------------------------------------------------------------
+# A plan that never arrived
+#
+# The edge from planner to builder used to be unconditional, so a reply with no design in
+# it went straight on and the builder spent its whole repair budget asking the model to fix
+# a document that was never written - then reported a *build* failure for what was really a
+# planning one. That is the "cannot generate even after multiple tries" case.
+# --------------------------------------------------------------------------
+
+NO_PLAN_PROSE = (
+    "This requirement is quite involved. Before I can design the graph I would need to "
+    "know how the tiers interact with the regional overrides."
+)
+
+
+class PlannerFake(FakeLLM):
+    """Answers the planner and the builder differently.
+
+    `FakeLLM` deliberately treats them as one prompt, because in the normal flow they
+    produce the same document. These tests are about a planner reply the builder never gets
+    to see, so the two have to be separable - and the planner's replies go through raw,
+    since the point is that they are not in the expected format.
+    """
+
+    def __init__(self, planner_replies: list[str]):
+        super().__init__([])
+        self.planner_replies = list(planner_replies)
+        self.planner_prompts: list[list] = []
+
+    def __call__(self, sys_prompt: str, messages: list) -> str:
+        if sys_prompt is agent.PROMPT_PLANNER:
+            self.calls.append("planner")
+            self.planner_prompts.append(list(messages))
+            return self.planner_replies.pop(0) if self.planner_replies else ""
+        if sys_prompt is agent.PROMPT_BUILDER:
+            self.calls.append("builder")
+            return planner_payload(GOOD_DSL)
+        return super().__call__(sys_prompt, messages)
+
+
+def approved_run(monkeypatch, fake, tmp_path):
+    """Drive a CREATE turn through triage approval and into planning."""
+    monkeypatch.setattr(agent, "call_llm", fake)
+    monkeypatch.setattr(agent, "_repo_path", lambda *p: tmp_path.joinpath(*p))
+
+    graph = agent.build_graph()
+    config = new_thread()
+    drain(
+        graph,
+        {"messages": [HumanMessage(content="Build something complicated.")],
+         "canvas_jdm_json": ""},
+        config,
+    )
+    drain(graph, Command(resume="Approve with above understanding & assumptions"), config)
+    return graph, config
+
+
+@pytest.mark.parametrize("reply,label", [("", "an empty reply"), (NO_PLAN_PROSE, "prose")])
+def test_a_planner_that_produces_no_design_never_starts_a_build(
+    reply, label, monkeypatch, tmp_path
+):
+    fake = PlannerFake([reply, reply])
+    graph, config = approved_run(monkeypatch, fake, tmp_path)
+
+    assert "builder" not in fake.calls, (
+        f"{label} is not something the builder can repair; entering it burns the "
+        "whole budget discovering that"
+    )
+    values = graph.get_state(config).values
+    assert values["plan_status"] == "EMPTY"
+    assert values["build_failed"] is True
+    # No build ran, so there is no build status to report - which is the point. The turn
+    # must not end up on the approval gate offering a graph that was never made.
+    assert "build_status" not in values
+    assert not values.get("jdm_json")
+    assert pending_interrupt(graph, config) is None
+
+
+def test_the_second_attempt_is_told_why_the_first_was_rejected(monkeypatch, tmp_path):
+    """At temperature 0 an unchanged prompt returns an unchanged answer, so a bare retry
+    would reproduce the same non-answer. The added instruction is the whole point of it."""
+    fake = PlannerFake(["", ""])
+    approved_run(monkeypatch, fake, tmp_path)
+
+    assert len(fake.planner_prompts) == 2
+    first, second = (" ".join(str(m.content) for m in p) for p in fake.planner_prompts)
+
+    assert "NO_PLAN" in second
+    assert "# Structure" in second, "it must say what the missing shape looks like"
+    assert first != second, "an identical retry at temperature 0 is a wasted call"
+
+
+def test_replanning_is_bounded(monkeypatch, tmp_path):
+    fake = PlannerFake(["", "", "", ""])
+    graph, config = approved_run(monkeypatch, fake, tmp_path)
+
+    assert fake.calls.count("planner") == agent.MAX_PLAN_ATTEMPTS
+    assert graph.get_state(config).values["plan_attempts_used"] == agent.MAX_PLAN_ATTEMPTS
+
+
+def test_a_successful_replan_goes_on_to_build(monkeypatch, tmp_path):
+    """The retry has to actually be worth making."""
+    fake = PlannerFake([NO_PLAN_PROSE, planner_payload(GOOD_DSL)])
+    graph, config = approved_run(monkeypatch, fake, tmp_path)
+
+    values = graph.get_state(config).values
+    assert fake.calls.count("planner") == 2
+    assert values["plan_status"] == "OK"
+    assert values["build_status"] == "SUCCESS"
+    assert json.loads(values["jdm_json"])["nodes"]
+
+
+def test_a_failed_turn_does_not_leave_the_previous_graph_in_state(monkeypatch, tmp_path):
+    """`jdm_json` is what the studio announces as a proposal. A turn that designed nothing
+    must not hand back the last turn's policy as though it had just produced it."""
+    monkeypatch.setattr(agent, "call_llm", PlannerFake([NO_PLAN_PROSE]))
+
+    result = agent.planner_node({
+        "messages": [HumanMessage(content="Build something complicated.")],
+        "jdm_json": '{"nodes": [{"id": "stale"}], "edges": []}',
+    })
+
+    assert result["plan_status"] == "EMPTY"
+    assert result["jdm_json"] == ""
+
+
+def test_a_fresh_design_does_not_inherit_a_spent_retry_budget(monkeypatch):
+    """A rejected final approval re-enters the planner. That is a new attempt at a design,
+    not a third try at a failed one, and it must not start out of budget."""
+    monkeypatch.setattr(agent, "call_llm", PlannerFake([planner_payload(GOOD_DSL)]))
+
+    result = agent.planner_node({
+        "messages": [HumanMessage(content="Try again, differently.")],
+        "plan_status": "OK",
+        "plan_attempts_used": agent.MAX_PLAN_ATTEMPTS,
+    })
+
+    assert result["plan_attempts_used"] == 1
+
+
+def test_the_router_sends_a_design_on_and_holds_a_non_design_back():
+    assert agent.route_after_planner({"plan_status": "OK"}) == "builder_node"
+    assert agent.route_after_planner(
+        {"plan_status": "EMPTY", "plan_attempts_used": 1}) == "planner_node"
+    assert agent.route_after_planner(
+        {"plan_status": "EMPTY", "plan_attempts_used": agent.MAX_PLAN_ATTEMPTS}) == "output_node"
+    # An older thread, checkpointed before `plan_status` existed, still has a plan.
+    assert agent.route_after_planner({}) == "builder_node"
+
+
+@pytest.mark.parametrize("planner_calls", range(1, 4))
+def test_a_replan_shrinks_the_repair_budget_it_shares_a_clock_with(planner_calls):
+    """Every planner call is one fewer builder call the run can afford. Sizing the loop as
+    though planning were always a single call is how a run gets killed mid-repair.
+
+    Deliberately parametrised past `MAX_PLAN_ATTEMPTS`: this asserts the arithmetic holds
+    for the contract, so raising that cap cannot quietly overrun the run's wall clock.
+    """
+    budget = agent._max_build_attempts(planner_calls)
+    spent = (planner_calls + budget - 1) * agent.LLM_TIMEOUT_SECONDS
+
+    assert spent < agent.AGENT_RUN_TIMEOUT_SECONDS
+    assert budget <= agent._max_build_attempts(1)
+
+
+def test_a_turn_with_no_design_reports_the_step_that_actually_failed():
+    body = agent.output_node({
+        "plan_status": "EMPTY",
+        "usecase_name": "Tier Pricing",
+        "evaluation_feedback": "The planner replied without a design:\n\nI would need to know...",
+    })["messages"][0].content
+
+    assert "planning step" in body
+    assert "What the planner returned:" in body
+    assert "I would need to know" in body, "its own words say more than a summary would"
+    assert "test cases" not in body, "that describes a build failure; the build never ran"
