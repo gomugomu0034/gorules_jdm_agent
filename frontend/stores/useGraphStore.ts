@@ -39,6 +39,16 @@ type GraphState = {
   versions: VersionSummary[];
   tests: TestCase[];
   testReport: TestRunReport | null;
+  /**
+   * Bumped whenever the canvas changes. Panels record it when they run, so a report can
+   * say it describes an earlier version of the graph instead of quietly implying it is
+   * current - which is what happens when a suite is run, then the assistant's proposal is
+   * accepted underneath it.
+   */
+  revision: number;
+  testReportRevision: number | null;
+  /** A model call outside the agent; the chat composer waits on it. */
+  generatingTests: boolean;
   dirty: boolean;
   saving: boolean;
   /** A graph that exists only on the canvas: created by the agent or by
@@ -59,6 +69,7 @@ type GraphState = {
   loadTests: () => Promise<void>;
   saveTests: (tests: TestCase[]) => Promise<void>;
   runTests: () => Promise<TestRunReport | null>;
+  generateTests: () => Promise<string | null>;
   applyProposed: (content: DecisionGraphType) => void;
   /** Hold an agent proposal on the canvas without persisting it. */
   beginDraft: (content: DecisionGraphType, name: string, tests?: TestCase[]) => void;
@@ -90,6 +101,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   versions: [],
   tests: [],
   testReport: null,
+  revision: 0,
+  testReportRevision: null,
+  generatingTests: false,
   dirty: false,
   saving: false,
   isDraft: false,
@@ -112,6 +126,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         dirty: false,
         loading: false,
         testReport: null,
+        testReportRevision: null,
+        revision: get().revision + 1,
         isDraft: false,
         draftName: null,
         draftTests: [],
@@ -130,11 +146,11 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       // Only the first change after a load is absorbed, so a real edit is at
       // worst deferred to the next one rather than lost.
       settling = false;
-      set({ content });
+      set((s) => ({ content, revision: s.revision + 1 }));
       return;
     }
 
-    set({ content, dirty: true });
+    set((s) => ({ content, dirty: true, revision: s.revision + 1 }));
 
     // Debounced autosave. The backend coalesces consecutive autosaves inside a
     // minute, so dragging a node around does not create a version per frame.
@@ -195,7 +211,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     if (!graph) return;
     try {
       const { graph: restored } = await api.restoreVersion(graph.id, version);
-      set({ graph: restored, content: restored.content, dirty: false });
+      set((s) => ({ graph: restored, content: restored.content, dirty: false,
+                    revision: s.revision + 1, testReportRevision: null }));
       await get().refreshVersions();
     } catch (e) {
       set({ error: describe(e) });
@@ -239,11 +256,35 @@ export const useGraphStore = create<GraphState>((set, get) => ({
           ? await api.runAdhocTests(content, tests)
           : null
         : await api.runTests(graph.id, content);
-      if (report) set({ testReport: report });
+      if (report) set({ testReport: report, testReportRevision: get().revision });
       return report;
     } catch (e) {
       set({ error: describe(e) });
       return null;
+    }
+  },
+
+  /**
+   * Ask the model for a suite.
+   *
+   * Lives in the store rather than the panel because it is the one model call outside the
+   * agent, and the chat has to know it is happening: two conversations against one API key
+   * is two claims on the same daily quota. Returns an error message rather than throwing,
+   * so the panel can show it in place instead of an alert box.
+   */
+  generateTests: async () => {
+    const { graph } = get();
+    if (!graph || get().generatingTests) return null;
+    set({ generatingTests: true });
+    try {
+      const { tests } = await api.generateTests(graph.id);
+      await get().saveTests(tests);
+      await get().loadTests();
+      return null;
+    } catch (e) {
+      return describe(e);
+    } finally {
+      set({ generatingTests: false });
     }
   },
 
@@ -259,6 +300,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       tests,
       versions: [],
       testReport: null,
+      testReportRevision: null,
+      revision: get().revision + 1,
       dirty: true,
       error: null,
     });
@@ -303,6 +346,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       versions: [],
       tests: [],
       testReport: null,
+      testReportRevision: null,
+      revision: get().revision + 1,
       dirty: false,
       isDraft: true,
       draftName: null,
@@ -313,7 +358,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   },
 
   applyProposed: (content) => {
-    set({ content, dirty: false });
+    set((s) => ({ content, dirty: false, revision: s.revision + 1 }));
   },
 }));
 

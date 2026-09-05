@@ -110,12 +110,34 @@ async def run_adhoc_tests(body: RunTestsRequest) -> TestRunResponse:
 async def generate_tests(
     graph_id: str, request: Request, owner: str = Depends(auth.get_owner)
 ) -> TestListResponse:
-    """Generate a suite with the LLM. Returns without saving."""
+    """Generate a suite with the LLM. Returns without saving.
+
+    This is the only model call outside the agent's own serialisation, so it is the only
+    place two conversations could claim the same quota at once. Refused rather than
+    queued: a queue would hide the contention behind a spinner, where a 409 names it.
+    """
     graph = await require_graph(graph_id, owner=owner)
+    from backend.lang_graph_agent import RateLimited
+    from backend.services import chat_runner
     from backend.services.test_service import generate_test_suite
 
+    if await chat_runner.running_thread_for_graph(owner, graph_id):
+        raise ApiError(
+            "WORKSPACE_BUSY",
+            "The assistant is working on this policy. Wait for it to finish, or stop it, "
+            "then generate the tests.",
+            409,
+        )
+    if chat_runner.is_generating(graph_id):
+        raise ApiError(
+            "WORKSPACE_BUSY", "Tests are already being generated for this policy.", 409
+        )
+
     try:
-        tests = await generate_test_suite(graph["content"])
+        async with chat_runner.generating(graph_id):
+            tests = await generate_test_suite(graph["content"])
+    except RateLimited as exc:
+        raise ApiError("LLM_RATE_LIMITED", f"The model provider is rate limiting: {exc}", 429) from exc
     except Exception as exc:  # noqa: BLE001
         raise ApiError("LLM_ERROR", f"Could not generate tests: {exc}", 502) from exc
     return TestListResponse(tests=[TestCase(**t) for t in tests])

@@ -23,8 +23,9 @@ const LABELS: Record<LintSeverity, string> = {
 const ORDER: LintSeverity[] = ['error', 'warning', 'hint'];
 
 export function ProblemsPanel() {
-  const { graph, content } = useGraphStore();
+  const { graph, content, revision } = useGraphStore();
   const [findings, setFindings] = useState<LintFinding[] | null>(null);
+  const [checkedRevision, setCheckedRevision] = useState<number | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -37,12 +38,17 @@ export function ProblemsPanel() {
         ? await api.lintGraph(graph.id, content)
         : await api.lintContent(content);
       setFindings(report.findings);
+      // Stamped with the graph it describes: findings name specific nodes, and pointing at
+      // a node the user has since deleted is worse than saying nothing.
+      setCheckedRevision(revision);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not check this policy.');
     } finally {
       setRunning(false);
     }
-  }, [graph, content]);
+  }, [graph, content, revision]);
+
+  const stale = findings !== null && checkedRevision !== revision;
 
   // Check once when the panel is opened. It is not re-run on every keystroke:
   // linting compiles the graph, and a half-typed expression is not a finding
@@ -75,6 +81,12 @@ export function ProblemsPanel() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {stale ? (
+          <div className="border-b border-border bg-warning-subtle px-3 py-2 text-2xs text-warning">
+            The graph has changed since this check. Run it again for current findings.
+          </div>
+        ) : null}
+
         {running && findings === null ? (
           <div className="flex items-center justify-center gap-2 py-10 text-sm text-fg-subtle">
             <Spinner className="h-4 w-4" /> Checking

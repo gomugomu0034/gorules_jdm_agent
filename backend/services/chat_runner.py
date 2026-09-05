@@ -8,6 +8,7 @@ POST enqueues a task and returns 202; progress arrives on the thread's stream.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -75,9 +76,51 @@ class ThreadBusy(Exception):
     """Raised when a run is already in flight for this thread."""
 
 
+class WorkspaceBusy(Exception):
+    """Raised when other model-backed work is already running for this policy.
+
+    The agent has always been serialised per thread, and the read-only inspectors - run
+    tests, lint, simulate - are local, cheap and safely concurrent. What was not guarded is
+    the one other thing that calls the model: generating a test suite from the panel. Two
+    conversations against a single API key means two claims on the same quota, and on a
+    tier of 50 requests a day that is the difference between a build finishing and dying
+    on a 429 the user has no way to connect back to what they clicked.
+    """
+
+
 def is_running(thread_id: str) -> bool:
     task = _runs.get(thread_id)
     return task is not None and not task.done()
+
+
+# Graphs with model-backed work in flight that is not an agent run - today, test
+# generation. Kept here rather than in the API so both directions of the check read one
+# place: the agent asks before starting, and generation asks before starting.
+_generating: set[str] = set()
+
+
+def is_generating(graph_id: str) -> bool:
+    return bool(graph_id) and graph_id in _generating
+
+
+@contextlib.asynccontextmanager
+async def generating(graph_id: str):
+    """Marks a graph as having generation in flight for the duration of the block."""
+    _generating.add(graph_id)
+    try:
+        yield
+    finally:
+        _generating.discard(graph_id)
+
+
+async def running_thread_for_graph(owner: str, graph_id: str) -> str | None:
+    """The thread, if any, currently running the agent against this policy."""
+    if not graph_id:
+        return None
+    for thread in await dao.list_threads(owner, graph_id):
+        if is_running(thread["id"]):
+            return thread["id"]
+    return None
 
 
 async def request_cancel(thread_id: str) -> bool:
@@ -203,6 +246,9 @@ def _canvas_state(canvas) -> dict:
 
 async def start_message(thread_id: str, text: str, canvas) -> str:
     """Begin a new turn from a user message."""
+    graph_id = getattr(canvas, "graph_id", None) if canvas is not None else None
+    if graph_id and is_generating(graph_id):
+        raise WorkspaceBusy("test generation")
     _clear_cancel(thread_id)
     payload = {"messages": [HumanMessage(content=text)], "thread_id": thread_id,
                **_canvas_state(canvas)}
@@ -489,6 +535,10 @@ async def _finish(thread_id: str, emit, status: str) -> None:
 
 
 def _error_code(exc: Exception) -> str:
+    # Named separately because it is the most likely failure on a free tier and the only
+    # one the user can act on. As AGENT_ERROR it read as a bug in the agent.
+    if type(exc).__name__ == "RateLimited" or "429" in str(exc):
+        return "LLM_RATE_LIMITED"
     text = str(exc).lower()
     if "timeout" in text or "timed out" in text:
         return "LLM_TIMEOUT"

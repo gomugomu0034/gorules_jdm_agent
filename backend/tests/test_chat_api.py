@@ -341,3 +341,107 @@ def test_stopping_a_run_that_no_longer_exists_still_resolves_the_conversation(
         # And the stream is told, so a client that is watching settles without a reload.
         events = client.get(f"/api/chat/threads/{thread_id}/events").json()["events"]
         assert events[-1] == {**events[-1], "type": "done", "status": "cancelled"}
+
+
+# --------------------------------------------------------------------------
+# Sharing one model between two surfaces
+#
+# The chat has always been serialised per thread and the inspectors are local, so three
+# panels open at once is fine. The exception is generating a test suite: it calls the model
+# directly, outside the agent's lock, so pressing it mid-build put two conversations on one
+# API key - and on a tier of 50 requests a day, one of them dies on a 429 the user has no
+# way to connect back to what they clicked.
+# --------------------------------------------------------------------------
+
+def _graph_with_thread(client, tmp_path):
+    """A saved policy and a chat thread bound to it, as the studio has open."""
+    graph_id = client.post(
+        "/api/graphs",
+        json={"name": "Shipping", "content": {"nodes": [], "edges": []}},
+    ).json()["id"]
+    thread_id = client.post("/api/chat/threads", json={"graph_id": graph_id}).json()["id"]
+    return graph_id, thread_id
+
+
+class StillRunning:
+    """A run in flight, as `is_running` sees one. Driving a real build here would finish
+    long before the assertion, and the point is the window while it is still going."""
+
+    def done(self) -> bool:
+        return False
+
+
+def test_generating_tests_is_refused_while_the_assistant_is_working(client, tmp_path):
+    from backend.services import chat_runner
+
+    graph_id, thread_id = _graph_with_thread(client, tmp_path)
+
+    chat_runner._runs[thread_id] = StillRunning()
+    try:
+        response = client.post(f"/api/graphs/{graph_id}/tests/generate")
+    finally:
+        chat_runner._runs.pop(thread_id, None)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "WORKSPACE_BUSY"
+    assert "assistant" in response.json()["error"]["message"]
+
+
+def test_the_assistant_is_refused_while_tests_are_being_generated(client, tmp_path):
+    from backend.services import chat_runner
+
+    graph_id, thread_id = _graph_with_thread(client, tmp_path)
+
+    chat_runner._generating.add(graph_id)
+    try:
+        response = client.post(
+            f"/api/chat/threads/{thread_id}/messages",
+            json={"text": "Add a rule for VIP customers.",
+                  "canvas": {"content": {"nodes": [], "edges": []}, "graph_id": graph_id}},
+        )
+    finally:
+        chat_runner._generating.discard(graph_id)
+
+    assert response.status_code == 409, "both directions have to be guarded, not just one"
+    assert response.json()["error"]["code"] == "WORKSPACE_BUSY"
+
+
+def test_the_guard_is_per_policy_not_global(client, tmp_path):
+    """Two policies open in two tabs must not block each other."""
+    from backend.services import chat_runner
+
+    _, thread_id = _graph_with_thread(client, tmp_path)
+
+    chat_runner._generating.add("some-other-graph")
+    try:
+        response = client.post(
+            f"/api/chat/threads/{thread_id}/messages",
+            json={"text": "Create a shipping policy.",
+                  "canvas": {"content": {"nodes": [], "edges": []}}},
+        )
+    finally:
+        chat_runner._generating.discard("some-other-graph")
+
+    assert response.status_code == 202
+    read_events(client, thread_id)
+
+
+def test_an_exhausted_quota_is_reported_as_a_quota_problem(client, tmp_path, monkeypatch):
+    """It is the likeliest failure on a free tier and the only one the user can act on, so
+    it must not arrive as a generic 502 about the agent being broken."""
+    from backend.lang_graph_agent import RateLimited
+    from backend.services import test_service
+
+    graph_id, _ = _graph_with_thread(client, tmp_path)
+
+    async def exhausted(_content):
+        raise RateLimited("free-models-per-day exceeded (resets at 2026-09-06T00:00Z)")
+
+    monkeypatch.setattr(test_service, "generate_test_suite", exhausted)
+    response = client.post(f"/api/graphs/{graph_id}/tests/generate")
+
+    assert response.status_code == 429
+    body = response.json()["error"]
+    assert body["code"] == "LLM_RATE_LIMITED"
+    assert "free-models-per-day" in body["message"], "the provider's own words say which limit"
+    assert "resets at" in body["message"]

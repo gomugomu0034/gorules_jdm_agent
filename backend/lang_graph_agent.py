@@ -292,6 +292,8 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
         data=json.dumps(payload),
         timeout=LLM_TIMEOUT_SECONDS,
     )
+    if response.status_code == 429:
+        raise RateLimited(_provider_message(response) or "The model provider is rate limiting us.")
     response.raise_for_status()
 
     response_json = response.json()
@@ -300,6 +302,36 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
         message.get("content", ""),
         reasoning_details=message.get("reasoning_details"),
     )
+
+
+class RateLimited(RuntimeError):
+    """The model provider refused the call because a quota is exhausted.
+
+    Worth its own type because it is the single most likely failure on a free tier and the
+    only one the user can act on - by waiting, or by pointing the app at a paid model. As a
+    generic error it reached the chat as "AGENT_ERROR: 429 Client Error: Too Many Requests",
+    with the provider's own explanation of *which* limit and *when it resets* thrown away
+    in `raise_for_status`.
+    """
+
+
+def _provider_message(response) -> str:
+    """The provider's own account of a refusal, if it gave one."""
+    try:
+        body = response.json()
+    except ValueError:
+        return (response.text or "").strip()[:300]
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        message = str(error.get("message") or "").strip()
+        # OpenRouter names the exhausted limit here, e.g. "free-models-per-day".
+        metadata = error.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("headers"):
+            reset = metadata["headers"].get("X-RateLimit-Reset")
+            if reset:
+                message = f"{message} (resets at {reset})".strip()
+        return message[:300]
+    return ""
 
 
 def call_llm(sys_prompt: str, messages: list) -> str:

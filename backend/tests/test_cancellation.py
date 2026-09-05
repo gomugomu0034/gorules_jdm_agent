@@ -243,3 +243,38 @@ def test_a_new_turn_clears_a_timer_left_by_the_last_one(monkeypatch):
 
     assert not cancelled
     assert not timer_running
+
+
+# --------------------------------------------------------------------- sharing the quota
+
+def test_a_graph_with_no_generation_in_flight_is_not_busy():
+    assert chat_runner.is_generating("graph-1") is False
+    assert chat_runner.is_generating("") is False
+
+
+def test_generation_marks_the_graph_busy_only_while_it_runs():
+    async def scenario():
+        seen = []
+        async with chat_runner.generating("graph-1"):
+            seen.append(chat_runner.is_generating("graph-1"))
+            seen.append(chat_runner.is_generating("graph-2"))
+        seen.append(chat_runner.is_generating("graph-1"))
+        return seen
+
+    assert asyncio.run(scenario()) == [True, False, False], (
+        "the lease must cover exactly the graph it was taken for, and end with the block"
+    )
+
+
+def test_the_lease_is_released_even_when_generation_fails():
+    """Otherwise one 429 locks the policy out of the assistant for the rest of the session."""
+
+    async def scenario():
+        try:
+            async with chat_runner.generating("graph-1"):
+                raise RuntimeError("provider said no")
+        except RuntimeError:
+            pass
+        return chat_runner.is_generating("graph-1")
+
+    assert asyncio.run(scenario()) is False

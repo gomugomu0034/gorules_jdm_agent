@@ -131,6 +131,13 @@ async def send_message(
         run_id = await chat_runner.start_message(thread_id, body.text, body.canvas)
     except chat_runner.ThreadBusy:
         raise ApiError("THREAD_BUSY", "This conversation is already running.", 409) from None
+    except chat_runner.WorkspaceBusy as busy:
+        raise ApiError(
+            "WORKSPACE_BUSY",
+            f"Something else is already using the model for this policy ({busy}). "
+            "Wait for it to finish and ask again.",
+            409,
+        ) from None
     return RunAcceptedResponse(run_id=run_id)
 
 

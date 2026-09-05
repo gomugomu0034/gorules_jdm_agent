@@ -11,10 +11,10 @@ import {
 } from 'lucide-react';
 import { useState } from 'react';
 
-import { api } from '../../lib/api';
 import type { TestResult } from '../../lib/types';
+import { useChatStore } from '../../stores/useChatStore';
 import { useGraphStore } from '../../stores/useGraphStore';
-import { Badge, Button, EmptyState, Spinner, cx } from '../ui';
+import { Badge, Button, EmptyState, cx } from '../ui';
 
 const ICONS = {
   passed: <CheckCircle2 size={14} className="text-success" />,
@@ -24,9 +24,17 @@ const ICONS = {
 };
 
 export function TestRunnerPanel() {
-  const { graph, tests, testReport, runTests, saveTests, loadTests } = useGraphStore();
+  const {
+    graph, tests, testReport, revision, testReportRevision,
+    generatingTests, runTests, generateTests,
+  } = useGraphStore();
+  // Generating a suite is a model call, and so is a turn of the conversation. One API key
+  // means one quota, so they take it in turns rather than racing for it - and the button
+  // says so before the server has to refuse.
+  const agentRunning = useChatStore((s) => s.running);
+  const reviewing = useChatStore((s) => Boolean(s.proposal));
   const [running, setRunning] = useState(false);
-  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const run = async () => {
@@ -39,20 +47,13 @@ export function TestRunnerPanel() {
   };
 
   const generate = async () => {
-    if (!graph) return;
-    setGenerating(true);
-    try {
-      const { tests: generated } = await api.generateTests(graph.id);
-      await saveTests(generated);
-      await loadTests();
-    } catch (e) {
-      window.alert(e instanceof Error ? e.message : 'Could not generate tests.');
-    } finally {
-      setGenerating(false);
-    }
+    setError(await generateTests());
   };
 
   const summary = testReport?.summary;
+  // A report describes the graph it ran against. Accepting a proposal, or editing a cell,
+  // leaves it on screen describing something that no longer exists.
+  const stale = testReport !== null && testReportRevision !== revision;
 
   return (
     <div className="flex h-full flex-col bg-bg">
@@ -67,7 +68,20 @@ export function TestRunnerPanel() {
         >
           Run {tests.length > 0 ? `${tests.length} test${tests.length === 1 ? '' : 's'}` : 'tests'}
         </Button>
-        <Button size="sm" icon={<Sparkles size={12} />} onClick={generate} loading={generating}>
+        <Button
+          size="sm"
+          icon={<Sparkles size={12} />}
+          onClick={generate}
+          loading={generatingTests}
+          disabled={!graph || agentRunning || reviewing}
+          title={
+            agentRunning
+              ? 'The assistant is using the model right now'
+              : reviewing
+                ? 'Finish reviewing the proposed change first'
+                : undefined
+          }
+        >
           Generate
         </Button>
 
@@ -82,6 +96,18 @@ export function TestRunnerPanel() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto">
+        {error ? (
+          <div className="m-3 rounded border border-border bg-danger-subtle p-3 text-xs text-danger">
+            {error}
+          </div>
+        ) : null}
+
+        {stale ? (
+          <div className="border-b border-border bg-warning-subtle px-3 py-2 text-2xs text-warning">
+            The graph has changed since this run. These results describe an earlier version.
+          </div>
+        ) : null}
+
         {summary?.compile_error ? (
           <div className="m-3 rounded border border-border bg-danger-subtle p-3 text-xs text-danger">
             <p className="font-semibold">This graph does not compile</p>

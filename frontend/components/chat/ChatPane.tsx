@@ -5,6 +5,7 @@ import { AlertCircle, ArrowUp, Sparkles, Square } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
 import { useChatStore } from '../../stores/useChatStore';
+import { useGraphStore } from '../../stores/useGraphStore';
 import { Button, EmptyState, cx } from '../ui';
 import { MarkdownMessage } from './MarkdownMessage';
 import { ProgressRail } from './ProgressRail';
@@ -32,6 +33,10 @@ const EXISTING_POLICY_SUGGESTIONS = [
 export function ChatPane({ canvas, graphId, graphName }: Props) {
   const { messages, steps, pending, proposal, running, error, send, respond, cancel } =
     useChatStore();
+  // Generating a test suite is the one model call outside this conversation, and there is
+  // one API key behind both. Waiting for it costs a few seconds; racing it costs a request
+  // out of the daily allowance and usually a 429 for whichever call loses.
+  const generatingTests = useGraphStore((s) => s.generatingTests);
   const [draft, setDraft] = useState('');
   const [confirmingStop, setConfirmingStop] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -62,13 +67,13 @@ export function ChatPane({ canvas, graphId, graphName }: Props) {
 
   const submit = () => {
     const text = draft.trim();
-    if (!text || running) return;
+    if (!text || running || generatingTests) return;
     setDraft('');
     if (pending?.kind === 'text') void respond(text, canvasPayload);
     else void send(text, canvasPayload);
   };
 
-  const composerDisabled = running || pending?.kind === 'choice';
+  const composerDisabled = running || generatingTests || pending?.kind === 'choice';
 
   return (
     <div className="flex h-full flex-col border-l border-border bg-bg">
@@ -176,7 +181,9 @@ export function ChatPane({ canvas, graphId, graphName }: Props) {
                 ? 'Choose an option above'
                 : running
                   ? 'Working…'
-                  : 'Describe a change, or ask a question'
+                  : generatingTests
+                    ? 'Waiting for the test generator to finish…'
+                    : 'Describe a change, or ask a question'
             }
             className="max-h-40 flex-1 resize-none bg-transparent px-1.5 py-1 text-sm outline-none placeholder:text-fg-subtle disabled:opacity-60"
           />
