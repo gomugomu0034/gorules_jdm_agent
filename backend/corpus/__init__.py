@@ -19,7 +19,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from backend.corpus import store
+from backend.corpus import corrections, store
 from backend.corpus.context import RunContext, bind, current, hash_owner, observe, unbind
 
 __all__ = [
@@ -30,6 +30,9 @@ __all__ = [
     "new_run_id",
     "open_at_boot",
     "observe",
+    "answer_open_question",
+    "record_correction",
+    "record_interaction",
     "record_llm_call",
     "record_tool_result",
     "run_scope",
@@ -181,4 +184,82 @@ def record_tool_result(
         duration_ms=duration_ms,
         run_id=context.run_id if context else None,
         sample_id=context.last_sample_id if context else None,
+    )
+
+
+# --------------------------------------------------------------------------- humans
+
+def record_interaction(
+    *,
+    kind: str,
+    thread_id: str = "",
+    graph_id: str | None = None,
+    prompt: str | None = None,
+    options: list | None = None,
+    response: str | None = None,
+    detail: Any = None,
+    answered: bool = True,
+    run_id: str | None = None,
+) -> str | None:
+    """Record something a person did, against the run in scope if there is one.
+
+    `run_id` is for the caller that knows the turn but is not inside it: a requirement is
+    recorded by the request handler that launched the run, and the run's own scope lives
+    on the task, in a context this side of the call cannot see.
+    """
+    context = current()
+    return store.record_interaction(
+        kind=kind,
+        thread_id=thread_id or (context.thread_id if context else ""),
+        graph_id=graph_id if graph_id is not None else (context.graph_id if context else None),
+        prompt=prompt,
+        options=options,
+        response=response,
+        detail=detail,
+        answered=answered,
+        run_id=run_id or (context.run_id if context else None),
+        sample_id=context.last_sample_id if context else None,
+    )
+
+
+def answer_open_question(thread_id: str, response: str) -> bool:
+    """Attach a reply to the question this thread is waiting on, if it is waiting on one."""
+    return store.answer_open_question(thread_id, response) or False
+
+
+def record_correction(
+    *,
+    thread_id: str,
+    graph_id: str,
+    before: Any,
+    after: Any,
+    from_version: int | None = None,
+    to_version: int | None = None,
+) -> str | None:
+    """Record a person editing what the agent produced, if they changed anything real.
+
+    Both graphs are stored in full rather than referenced. The corpus exists precisely
+    because the studio's own record can be deleted, and a correction pair that stops being
+    readable when its policy is deleted would be worth nothing.
+    """
+    change = corrections.describe_change(before, after)
+    if change is None:
+        # Layout, or the editor's mount-time normalisation. Recording it would teach the
+        # model that correct output was corrected.
+        return None
+    if from_version is not None:
+        # Replace rather than accumulate: the same edit is re-recorded as it settles.
+        store.forget_correction(graph_id, from_version)
+    return record_interaction(
+        kind="correction",
+        thread_id=thread_id,
+        graph_id=graph_id,
+        response="edited the agent's graph",
+        detail={
+            "from_version": from_version,
+            "to_version": to_version,
+            "change": change,
+            "before": before,
+            "after": after,
+        },
     )

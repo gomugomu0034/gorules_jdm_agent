@@ -267,7 +267,15 @@ async def start_message(thread_id: str, text: str, canvas) -> str:
         )
         await dao.set_thread_graph(thread_id, canvas.graph_id)
 
-    return await _launch(thread_id, payload)
+    run_id = await _launch(thread_id, payload)
+    # What was actually asked for, in their own words. The prompt half of every training
+    # example, and until now it lived only in `chat_events`, which cascades away with the
+    # conversation it belongs to.
+    corpus.record_interaction(
+        kind="requirement", thread_id=thread_id, graph_id=graph_id, response=text,
+        run_id=run_id,
+    )
+    return run_id
 
 
 async def start_resume(thread_id: str, value: str, canvas) -> str:
@@ -276,7 +284,14 @@ async def start_resume(thread_id: str, value: str, canvas) -> str:
     The value is passed through byte for byte: the agent compares it against its
     own option strings, emoji included.
     """
-    return await _launch(thread_id, Command(resume=value, update=_canvas_state(canvas) or None))
+    run_id = await _launch(thread_id, Command(resume=value, update=_canvas_state(canvas) or None))
+    # Closes the question the previous turn left open. Asking and answering are two events
+    # a whole turn apart, and nothing connected them before.
+    if not corpus.answer_open_question(thread_id, value):
+        # No question was open - a resume that answers nothing is still the user speaking.
+        corpus.record_interaction(kind="requirement", thread_id=thread_id,
+                                  response=value, run_id=run_id)
+    return run_id
 
 
 async def _launch(thread_id: str, payload) -> str:
@@ -408,6 +423,15 @@ async def _execute_turn(thread_id: str, run_id: str, payload) -> None:
             "kind": "choice" if options else "text",
             "interrupt_id": run_id,
         })
+        # Opened unanswered: the reply arrives on the *next* turn, and `start_resume`
+        # closes this row when it does.
+        corpus.record_interaction(
+            kind="clarification",
+            thread_id=thread_id,
+            prompt=interrupt_payload.get("prompt", ""),
+            options=options,
+            answered=False,
+        )
         await _finish(thread_id, emit, "awaiting_input")
         return
 

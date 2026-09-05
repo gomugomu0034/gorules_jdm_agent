@@ -386,6 +386,90 @@ def record_tool_result(
     return values["tool_result_id"]
 
 
+@_never_fails
+def record_interaction(
+    *,
+    kind: str,
+    thread_id: str = "",
+    graph_id: str | None = None,
+    prompt: str | None = None,
+    options: list | None = None,
+    response: str | None = None,
+    detail: Any = None,
+    run_id: str | None = None,
+    sample_id: str | None = None,
+    answered: bool = True,
+) -> str | None:
+    """Record something a person did.
+
+    `answered=False` opens a question and leaves `answered_at` NULL, so the reply that
+    arrives a whole turn later can be matched to it by `answer_open_question`.
+    """
+    stamp = now()
+    values: dict[str, Any] = {
+        "interaction_id": str(uuid.uuid4()),
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+        "kind": kind,
+        "prompt": prompt,
+        "options_json": json.dumps(options, ensure_ascii=False, default=str) if options else None,
+        "response": response,
+        "responds_to_sample": sample_id,
+        "detail_json": json.dumps(detail, ensure_ascii=False, default=str) if detail is not None else None,
+        "asked_at": stamp,
+        "answered_at": stamp if answered else None,
+    }
+    with _lock:
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" * len(values))
+        _connect().execute(
+            f"INSERT INTO interactions ({columns}, seq) VALUES ({placeholders},"
+            " (SELECT COALESCE(MAX(seq), 0) + 1 FROM interactions WHERE run_id = ?))",
+            (*values.values(), run_id),
+        )
+    return values["interaction_id"]
+
+
+@_never_fails
+def forget_correction(graph_id: str, from_version: int) -> int:
+    """Drop any correction already recorded for this agent version.
+
+    A person's edit is not one event. Consecutive autosaves coalesce into a single version
+    row whose content keeps changing, so the correction is re-recorded as it settles and
+    the earlier, partial snapshot has to go - otherwise the corpus holds a half-finished
+    edit alongside the finished one and cannot tell which is which.
+    """
+    with _lock:
+        cur = _connect().execute(
+            "DELETE FROM interactions WHERE kind = 'correction' AND graph_id = ?"
+            " AND json_extract(detail_json, '$.from_version') = ?",
+            (graph_id, from_version),
+        )
+        return cur.rowcount or 0
+
+
+@_never_fails
+def answer_open_question(thread_id: str, response: str, *, run_id: str | None = None) -> bool:
+    """Attach a reply to the question this thread is waiting on.
+
+    The question and its answer arrive as two events a whole turn apart, with the studio
+    holding nothing that connects them. Matching on "the newest unanswered question for
+    this thread" survives a restart, which an in-memory pairing would not - and a paused
+    conversation outliving the process is exactly what the checkpointer is for.
+    """
+    with _lock:
+        cur = _connect().execute(
+            "UPDATE interactions SET response = ?, answered_at = ?"
+            " WHERE interaction_id = ("
+            "   SELECT interaction_id FROM interactions"
+            "   WHERE thread_id = ? AND kind = 'clarification' AND answered_at IS NULL"
+            "   ORDER BY asked_at DESC LIMIT 1)",
+            (response, now(), thread_id),
+        )
+        return bool(cur.rowcount)
+
+
 def _prompt_kind(node: str) -> str:
     """`planner_node` -> `planner`. Just a readable label on the prompts table."""
     return node.removesuffix("_node") or node

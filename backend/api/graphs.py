@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query, Response, status
 
-from backend import auth
+from backend import auth, corpus
 from backend.api.errors import ApiError, not_found
 from backend.db import dao
 from backend.models.api import (
@@ -134,6 +134,7 @@ async def update_graph(
         author="user",
         is_autosave=body.autosave,
     )
+    await _note_correction(graph_id, body.content, version)
     if body.name is not None or body.description is not None:
         await dao.update_graph_meta(
             graph_id, name=body.name, description=body.description, owner=owner
@@ -141,6 +142,36 @@ async def update_graph(
 
     return SaveGraphResponse(
         graph=await _detail(await require_graph(graph_id, owner=owner)), version=version
+    )
+
+
+async def _note_correction(graph_id: str, content: dict, version: int) -> None:
+    """Record a person editing what the agent wrote.
+
+    Someone looking at the model's output on a real artifact and changing it is the most
+    expensive training signal there is, and the studio already knew about it - the author
+    column on `graph_versions` has said `agent` or `user` all along.
+
+    Compared against the latest *agent* version rather than simply the previous one, so a
+    long edit that settles across several autosaves is still paired with the output it was
+    correcting. `record_correction` returns without writing when nothing behavioural
+    changed, which is what keeps a node being dragged out of the corpus.
+    """
+    try:
+        origin = await dao.latest_agent_version(graph_id)
+    except Exception:  # noqa: BLE001
+        # Telemetry never fails a save.
+        return
+    if origin is None:
+        return
+
+    corpus.record_correction(
+        thread_id=origin.get("thread_id") or "",
+        graph_id=graph_id,
+        before=origin["content"],
+        after=content,
+        from_version=origin["version"],
+        to_version=version,
     )
 
 

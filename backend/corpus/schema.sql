@@ -129,3 +129,37 @@ CREATE TABLE IF NOT EXISTS tool_results (
 CREATE INDEX IF NOT EXISTS idx_tool_results_run    ON tool_results(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_tool_results_sample ON tool_results(sample_id);
 CREATE INDEX IF NOT EXISTS idx_tool_results_tool   ON tool_results(tool, ok);
+
+-- The human's side of the conversation, and their verdict on what came back.
+--
+-- Four things, all of which the studio already knew and none of which it kept:
+--
+--   requirement   what was actually asked for, in the user's own words
+--   clarification the question the agent asked and the answer it got, as a pair -
+--                 they arrive as two unrelated events a whole turn apart
+--   approval      the proposal was taken onto the canvas
+--   rejection     it was not, and why - the reason was returned to the client and
+--                 stored nowhere at all
+--   correction    a person edited the graph the agent had just written. This is the
+--                 most expensive training signal there is and it was already sitting
+--                 in `graph_versions.author`, waiting to be read.
+CREATE TABLE IF NOT EXISTS interactions (
+  interaction_id     TEXT PRIMARY KEY,
+  run_id             TEXT,
+  thread_id          TEXT,
+  graph_id           TEXT,
+  seq                INTEGER NOT NULL DEFAULT 0,
+  kind               TEXT NOT NULL,
+  prompt             TEXT,                  -- what the agent asked, when it asked
+  options_json       TEXT,                  -- the choices it offered
+  response           TEXT,                  -- what the person said or chose
+  -- The model output being judged. For a clarification that is the reply that raised
+  -- the question; for an approval or correction, the graph that was proposed.
+  responds_to_sample TEXT,
+  detail_json        TEXT,                  -- rejection reason, before/after, diff
+  asked_at           TEXT,
+  answered_at        TEXT                   -- NULL while a question is still open
+);
+CREATE INDEX IF NOT EXISTS idx_interactions_run    ON interactions(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_interactions_thread ON interactions(thread_id, asked_at);
+CREATE INDEX IF NOT EXISTS idx_interactions_kind   ON interactions(kind, answered_at);
