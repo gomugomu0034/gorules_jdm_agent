@@ -18,6 +18,7 @@ from backend.api import (
 from backend.api.errors import register_error_handlers
 from backend.config import settings
 from backend import agent_runtime
+from backend import corpus
 from backend.db import bootstrap, connection
 
 logging.basicConfig(
@@ -40,11 +41,16 @@ async def lifespan(app: FastAPI):
             "it) whenever the API restarts. Set it in backend/.env."
         )
     await agent_runtime.startup()
+    # Opened at boot rather than lazily on the first model call, so a misconfigured path
+    # or an unwritable directory is reported here instead of silently costing the first
+    # few samples of the session.
+    corpus.open_at_boot()
     logger.info("%s %s ready (db=%s)", settings.app_name, settings.version, settings.db_path)
     try:
         yield
     finally:
         await agent_runtime.shutdown()
+        corpus.store.close()
         await connection.disconnect()
 
 

@@ -310,6 +310,35 @@ async def list_versions(graph_id: str) -> list[dict[str, Any]]:
     return out
 
 
+async def latest_agent_version(graph_id: str) -> dict[str, Any] | None:
+    """The most recent version the agent wrote, if any.
+
+    Used to pair an agent's output with the edits a person then made to it. Looking for the
+    latest agent version rather than simply the previous one matters because consecutive
+    user autosaves coalesce into a single row: the human's edit keeps changing under a
+    version number that was already created, and only the agent version stays put.
+    """
+    async with connection.read() as conn:
+        cur = await conn.execute(
+            "SELECT version, content, thread_id, created_at FROM graph_versions"
+            " WHERE graph_id = ? AND author = 'agent' ORDER BY version DESC LIMIT 1",
+            (graph_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    try:
+        content = json.loads(row["content"])
+    except json.JSONDecodeError:
+        return None
+    return {
+        "version": row["version"],
+        "content": content,
+        "thread_id": row["thread_id"],
+        "created_at": row["created_at"],
+    }
+
+
 async def get_version(graph_id: str, version: int) -> dict[str, Any] | None:
     async with connection.read() as conn:
         cur = await conn.execute(

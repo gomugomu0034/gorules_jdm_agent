@@ -1,0 +1,85 @@
+# Requirements to drive through the agent headlessly, to build corpus volume and to
+# measure against.
+#
+# Chosen to span real difficulty rather than to be easy. A set the agent passes every
+# time measures nothing: the samples worth training on are the ones where it struggles,
+# and the repair loop only produces preference pairs when something actually fails.
+#
+# `answers` scripts the replies to the agent's clarification questions, in order. The
+# harness falls back to approving when the script runs out, so a requirement that asks
+# nothing needs no answers at all.
+#
+# Add your own. The file is only a starting set - a corpus of your own policies will
+# always beat a corpus of these.
+
+- id: shipping-flat
+  difficulty: simple
+  # One threshold, one fallback. The shape the model gets right nearly always, and the
+  # baseline that says the pipeline is working at all.
+  text: >-
+    Shipping fee policy: free shipping on orders over $50, otherwise a $6 flat fee.
+
+- id: ticket-discount
+  difficulty: simple
+  text: >-
+    Ticket discount policy: students get 20% off, seniors 25% off, members 10% off.
+    Nobody gets more than one discount - take the largest that applies.
+
+- id: refund-window
+  difficulty: moderate
+  # Two dimensions that interact. A single table can still carry it, so the linter's
+  # MONOLITHIC_GRAPH hint is the interesting signal here rather than a failure.
+  text: >-
+    Refund policy based on how old the order is and the customer tier: within 30 days
+    everyone gets a full refund; 31 to 90 days, gold customers get full and everyone
+    else gets store credit; past 90 days, no refund except for gold, who get store
+    credit.
+
+- id: shipping-bands
+  difficulty: moderate
+  # The requirement in the plan's own verification step. Three dimensions and an
+  # override, which is where a single decision table stops being the right answer.
+  text: >-
+    Shipping cost by weight band, delivery zone and membership tier, with free shipping
+    on any order over $150 regardless of the other rules. Weight bands are under 1kg,
+    1 to 5kg, and over 5kg. Zones are domestic, regional and international. Members pay
+    20% less than the listed rate.
+
+- id: loan-scoring
+  difficulty: hard
+  # Wants decomposition: validate, then score, then band the score into a decision.
+  # A single table cannot express the arithmetic, so this exercises expression nodes.
+  text: >-
+    Loan approval: reject outright if the applicant is under 18 or the requested amount
+    is over 500000. Otherwise compute a score from credit rating, annual income and
+    existing debt, then approve above 700, refer between 500 and 700, and decline below
+    500. Approved loans get a rate that depends on the score band.
+
+- id: insurance-premium
+  difficulty: hard
+  # Deliberately underspecified: "risk factors" is not a rule. The agent should ask,
+  # which is what makes this a clarification sample rather than a build sample.
+  text: >-
+    Work out an insurance premium from the vehicle, the driver's history and a set of
+    risk factors, applying any discounts the customer qualifies for.
+  answers:
+    - >-
+      Vehicle value bands under 10000, 10000 to 30000, over 30000. Driver history is
+      the number of claims in the last 5 years. Risk factors are age under 25 and
+      annual mileage over 20000. Discounts are 10% for no claims and 5% for multi-policy.
+
+- id: pricing-with-tax
+  difficulty: hard
+  # Ordering matters and is easy to get wrong: discount before tax, not after.
+  text: >-
+    Order pricing: apply the customer's tier discount to the subtotal, then add sales
+    tax by destination state, then add shipping. Tax applies to the discounted amount,
+    not the original. Orders shipping to OR and NH have no sales tax.
+
+- id: leave-entitlement
+  difficulty: moderate
+  # Accrual plus caps plus a carry-over rule - three interacting numeric rules.
+  text: >-
+    Annual leave entitlement: 20 days base, plus one extra day for every two full years
+    of service, capped at 30 days total. Part-time staff get it pro-rated by their
+    contracted hours. Up to 5 unused days carry over into the next year.

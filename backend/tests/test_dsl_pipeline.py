@@ -185,7 +185,7 @@ def test_the_builder_can_see_the_plan_it_is_repairing(monkeypatch):
     seen: list[list] = []
     plans = [BROKEN_DSL, GOOD_DSL]
 
-    def fake_llm(sys_prompt, messages):
+    def fake_llm(sys_prompt, messages, **_attribution):
         if sys_prompt is agent.PROMPT_BUILDER:
             seen.append(list(messages))
             return planner_payload(plans.pop(0) if plans else GOOD_DSL)

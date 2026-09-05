@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
-from backend import auth
+from backend import auth, corpus
 from backend.api.errors import ApiError, not_found
 from backend.api.exports import export_response
 from backend.db import dao
@@ -271,6 +271,10 @@ async def accept_proposal(
     else:
         # Draft: nothing is stored yet. The client holds the content and saves
         # it later through POST /api/graphs once the user has named it.
+        corpus.record_interaction(
+            kind="approval", thread_id=thread_id, graph_id=None,
+            response="accepted", detail={"name": name, "draft": True},
+        )
         await dao.clear_proposal(thread_id)
         return {
             "graph_id": None,
@@ -284,6 +288,10 @@ async def accept_proposal(
     if proposal["tests"]:
         await dao.replace_tests(graph_id, proposal["tests"])
 
+    corpus.record_interaction(
+        kind="approval", thread_id=thread_id, graph_id=graph_id,
+        response="accepted", detail={"version": version, "name": name, "draft": False},
+    )
     await dao.clear_proposal(thread_id)
     return {"graph_id": graph_id, "version": version, "draft": False}
 
@@ -292,9 +300,19 @@ async def accept_proposal(
 async def reject_proposal(
     thread_id: str, body: RejectProposalRequest, owner: str = Depends(auth.get_owner)
 ) -> dict:
-    await require_thread(thread_id, owner)
-    if await dao.get_proposal(thread_id) is None:
+    thread = await require_thread(thread_id, owner)
+    proposal = await dao.get_proposal(thread_id)
+    if proposal is None:
         raise ApiError("NO_PROPOSAL", "There is nothing to reject on this thread.", 404)
+    # The reason was echoed back to the client and stored nowhere. A rejected proposal with
+    # the reason attached is the negative half of a preference pair; without the reason it
+    # is only a shrug.
+    corpus.record_interaction(
+        kind="rejection", thread_id=thread_id, graph_id=thread.get("graph_id"),
+        response=body.reason or "rejected",
+        detail={"reason": body.reason, "usecase_name": proposal["usecase_name"],
+                "jdm": proposal["jdm"]},
+    )
     await dao.clear_proposal(thread_id)
     return {"rejected": True, "reason": body.reason}
 

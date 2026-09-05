@@ -19,6 +19,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
 from backend.config import settings
+from backend import corpus
 from backend.db import dao
 from backend.services import event_bus
 
@@ -266,7 +267,15 @@ async def start_message(thread_id: str, text: str, canvas) -> str:
         )
         await dao.set_thread_graph(thread_id, canvas.graph_id)
 
-    return await _launch(thread_id, payload)
+    run_id = await _launch(thread_id, payload)
+    # What was actually asked for, in their own words. The prompt half of every training
+    # example, and until now it lived only in `chat_events`, which cascades away with the
+    # conversation it belongs to.
+    corpus.record_interaction(
+        kind="requirement", thread_id=thread_id, graph_id=graph_id, response=text,
+        run_id=run_id,
+    )
+    return run_id
 
 
 async def start_resume(thread_id: str, value: str, canvas) -> str:
@@ -275,7 +284,14 @@ async def start_resume(thread_id: str, value: str, canvas) -> str:
     The value is passed through byte for byte: the agent compares it against its
     own option strings, emoji included.
     """
-    return await _launch(thread_id, Command(resume=value, update=_canvas_state(canvas) or None))
+    run_id = await _launch(thread_id, Command(resume=value, update=_canvas_state(canvas) or None))
+    # Closes the question the previous turn left open. Asking and answering are two events
+    # a whole turn apart, and nothing connected them before.
+    if not corpus.answer_open_question(thread_id, value):
+        # No question was open - a resume that answers nothing is still the user speaking.
+        corpus.record_interaction(kind="requirement", thread_id=thread_id,
+                                  response=value, run_id=run_id)
+    return run_id
 
 
 async def _launch(thread_id: str, payload) -> str:
@@ -294,7 +310,49 @@ async def _launch(thread_id: str, payload) -> str:
     return run_id
 
 
+async def _observe_identity(thread_id: str) -> None:
+    """Note which graph and owner the finished turn belonged to.
+
+    Read from the thread row rather than the payload, because a resume arrives as a
+    `Command` with no canvas state on it - and afterwards rather than before, for two
+    reasons. It is more accurate: a turn that starts on a blank canvas can attach a graph
+    part-way through. And it keeps a database read off the front of the turn, where it
+    delayed the first event long enough that a client polling for one could still be
+    seeing the *previous* turn's log.
+    """
+    try:
+        thread = await dao.get_thread(thread_id)
+    except Exception:  # noqa: BLE001
+        return
+    if thread is not None:
+        corpus.observe(graph_id=thread.get("graph_id"),
+                       owner_hash=corpus.hash_owner(thread.get("owner_id")))
+
+
 async def _run(thread_id: str, run_id: str, payload) -> None:
+    """Execute one turn inside a corpus scope, so every model call it makes is attributed.
+
+    The scope has to be entered here rather than deeper in: LangGraph dispatches sync nodes
+    through `copy_context()`, so a context variable set on this task is visible inside the
+    worker thread each node runs on - but only if it was set before the graph was streamed.
+    Entering it costs no await, so the turn starts exactly as promptly as it did before.
+    """
+    with corpus.run_scope(run_id, thread_id=thread_id):
+        try:
+            await _execute_turn(thread_id, run_id, payload)
+        finally:
+            try:
+                await _observe_identity(thread_id)
+            except asyncio.CancelledError:
+                # A hard stop arriving mid-read still has to cancel the task. Swallowing
+                # it here would make the run silently uncancellable.
+                raise
+            except Exception:  # noqa: BLE001
+                # Telemetry must never be what turns a finished turn into a failed one.
+                pass
+
+
+async def _execute_turn(thread_id: str, run_id: str, payload) -> None:
     """Execute one turn, translating graph activity into events."""
     from backend.agent_runtime import get_graph
 
@@ -343,6 +401,13 @@ async def _run(thread_id: str, run_id: str, payload) -> None:
 
     # Decide how the turn ended.
     state = await graph.aget_state(config)
+    # Only knowable now: the router settles the intent, and the artifact is whatever the
+    # turn built. Both are what make a sample filterable later.
+    corpus.observe(
+        intent=state.values.get("intent"),
+        mode=state.values.get("mode"),
+        final_jdm=state.values.get("jdm_json"),
+    )
     interrupt_payload = _pending_interrupt(state)
 
     # A freshly built graph is announced as soon as it exists - which is at the
@@ -358,6 +423,15 @@ async def _run(thread_id: str, run_id: str, payload) -> None:
             "kind": "choice" if options else "text",
             "interrupt_id": run_id,
         })
+        # Opened unanswered: the reply arrives on the *next* turn, and `start_resume`
+        # closes this row when it does.
+        corpus.record_interaction(
+            kind="clarification",
+            thread_id=thread_id,
+            prompt=interrupt_payload.get("prompt", ""),
+            options=options,
+            answered=False,
+        )
         await _finish(thread_id, emit, "awaiting_input")
         return
 
@@ -530,6 +604,9 @@ async def _record_proposal(thread_id: str, values: dict, emit) -> None:
 
 
 async def _finish(thread_id: str, emit, status: str) -> None:
+    # Every terminal path goes through here, including the timeout and error branches that
+    # return before the state read - which is why the outcome is noted here and not there.
+    corpus.observe(outcome=status)
     await dao.set_thread_status(thread_id, status if status == "awaiting_input" else "idle")
     await emit({"type": "done", "status": status})
 

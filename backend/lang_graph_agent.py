@@ -4,6 +4,9 @@ import re
 import os
 import tempfile
 from pathlib import Path
+from contextlib import contextmanager
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TypedDict, Annotated
 from dotenv import load_dotenv
 import requests
@@ -34,6 +37,7 @@ from backend.prompts.test_node_prompt import PROMPT_TEST, PROMPT_TEST_USER, PROM
 from backend.prompts.intent_router_prompt import PROMPT_INTENT
 from backend.prompts.patch_node_prompt import PROMPT_PATCH, PROMPT_PATCH_USER
 
+from backend import corpus
 from backend.tools.markdown_dsl_parser import DslError, parse_markdown_dsl
 from backend.tools.diagnostics import (
     KIND_HEADINGS,
@@ -43,7 +47,7 @@ from backend.tools.diagnostics import (
 )
 from backend.tools.jdm_linter import blocking, lint
 from backend.tools.jdm_patch import PatchError, apply_patch, describe as describe_patch
-from backend.tools.zen_evaluator import check_jdm_format, evaluate_against_zen, run_test_suite
+from backend.tools.zen_evaluator import check_jdm_format, evaluate, run_test_suite
 
 
 
@@ -160,13 +164,119 @@ except Exception as _exc:  # noqa: BLE001
 # ==========================================
 
 
+@dataclass(frozen=True)
+class CallMetadata:
+    """What the provider said about a call, beyond the text it returned.
+
+    Every provider already sends this and every provider path used to throw it away. It is
+    what makes a corpus row answerable: which model actually produced this, what did it
+    cost, and can I look the generation up with the provider later.
+
+    `model` is the model that *served* the request, which is not always the one asked for -
+    OpenRouter routes, and Gemini resolves an alias like `gemini-flash-latest` to a dated
+    version. Recording only the request would attribute a sample to the wrong model.
+    """
+
+    model: str = ""
+    generation_id: str = ""
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    # Only OpenRouter reports these: which upstream actually ran the model, and what the
+    # call cost. The others leave both unset rather than have them guessed at.
+    upstream_provider: str = ""
+    cost: float | None = None
+
+
 class LLMResponse(str):
     """String-like LLM output that can carry provider metadata alongside content."""
 
-    def __new__(cls, content: str, reasoning_details=None):
-        obj = str.__new__(cls, content)
+    def __new__(cls, content: str | None, reasoning_details=None,
+                meta: "CallMetadata | None" = None):
+        # `content or ""` because a provider may answer with a null content - a pure
+        # refusal, or a reply that was all reasoning and no text. `str.__new__(cls, None)`
+        # would quietly produce the four-character string "None" and hand it downstream to
+        # be parsed as a design.
+        obj = str.__new__(cls, content or "")
         obj.reasoning_details = reasoning_details
+        obj.meta = meta or CallMetadata()
         return obj
+
+
+def _int(value) -> int | None:
+    """Token counts arrive as ints, as None, and occasionally as strings."""
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _float(value) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _openai_metadata(response) -> CallMetadata:
+    """Metadata from an OpenAI-shaped response: LiteLLM and Hugging Face's router.
+
+    Every field is read defensively. `usage` is optional in the OpenAI schema and several
+    community endpoints behind the HF router omit it, so a missing block has to mean
+    "unknown", never an exception on the path of every model call.
+    """
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "completion_tokens_details", None)
+    return CallMetadata(
+        model=getattr(response, "model", "") or "",
+        generation_id=getattr(response, "id", "") or "",
+        prompt_tokens=_int(getattr(usage, "prompt_tokens", None)),
+        completion_tokens=_int(getattr(usage, "completion_tokens", None)),
+        reasoning_tokens=_int(getattr(details, "reasoning_tokens", None)),
+    )
+
+
+def _openai_reasoning(message):
+    """The thinking trace, under whichever name the provider chose for it.
+
+    Not part of the OpenAI schema, so the SDK parks it in `model_extra`. Providers have
+    each picked a different key: `reasoning_content` (DeepSeek), `reasoning` (several
+    others), `reasoning_details` (OpenRouter's shape, which some proxies mirror).
+    """
+    extra = getattr(message, "model_extra", None) or {}
+    for key in ("reasoning_details", "reasoning_content", "reasoning"):
+        value = extra.get(key)
+        if value:
+            return value
+    return None
+
+
+def _gemini_metadata(response) -> CallMetadata:
+    usage = getattr(response, "usage_metadata", None)
+    return CallMetadata(
+        model=getattr(response, "model_version", "") or "",
+        generation_id=getattr(response, "response_id", "") or "",
+        prompt_tokens=_int(getattr(usage, "prompt_token_count", None)),
+        completion_tokens=_int(getattr(usage, "candidates_token_count", None)),
+        reasoning_tokens=_int(getattr(usage, "thoughts_token_count", None)),
+    )
+
+
+def _gemini_reasoning(response):
+    """Gemini returns thinking as ordinary parts flagged `thought=True`.
+
+    Only present when the model is asked for them, which this code deliberately does not
+    do: `thinking_config` is rejected outright by models that do not support thinking, and
+    silently breaking the Gemini path to collect telemetry is the wrong trade. The
+    `thoughts_token_count` in usage still records that thinking happened either way.
+    """
+    thoughts = []
+    for candidate in getattr(response, "candidates", None) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            if getattr(part, "thought", False) and getattr(part, "text", None):
+                thoughts.append({"type": "reasoning.text", "text": part.text})
+    return thoughts or None
 
 
 def _assistant_message_from_llm(
@@ -220,7 +330,11 @@ def _call_gemini(sys_prompt: str, messages: list) -> str:
     response = gemini_client.models.generate_content(
         model=GOOGLE_MODEL, contents=gemini_messages, config=config
     )
-    return response.text
+    return LLMResponse(
+        response.text,
+        reasoning_details=_gemini_reasoning(response),
+        meta=_gemini_metadata(response),
+    )
 
 
 def _call_litellm(sys_prompt: str, messages: list) -> str:
@@ -230,7 +344,12 @@ def _call_litellm(sys_prompt: str, messages: list) -> str:
         timeout=LLM_TIMEOUT_SECONDS,
         temperature=LLM_TEMPERATURE,
     )
-    return response.choices[0].message.content
+    message = response.choices[0].message
+    return LLMResponse(
+        message.content,
+        reasoning_details=_openai_reasoning(message),
+        meta=_openai_metadata(response),
+    )
 
 
 def _call_huggingface(sys_prompt: str, messages: list) -> str:
@@ -255,7 +374,12 @@ def _call_huggingface(sys_prompt: str, messages: list) -> str:
         timeout=LLM_TIMEOUT_SECONDS,
         temperature=LLM_TEMPERATURE,
     )
-    return response.choices[0].message.content
+    message = response.choices[0].message
+    return LLMResponse(
+        message.content,
+        reasoning_details=_openai_reasoning(message),
+        meta=_openai_metadata(response),
+    )
 
 
 def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
@@ -298,9 +422,27 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
 
     response_json = response.json()
     message = response_json["choices"][0]["message"]
+    usage = response_json.get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
     return LLMResponse(
-        message.get("content", ""),
+        message.get("content"),
         reasoning_details=message.get("reasoning_details"),
+        meta=CallMetadata(
+            # OpenRouter routes: the model that answered is often not the one asked for,
+            # and on the free tier it can change between two calls in the same turn.
+            model=str(response_json.get("model") or ""),
+            generation_id=str(response_json.get("id") or ""),
+            prompt_tokens=_int(usage.get("prompt_tokens")),
+            completion_tokens=_int(usage.get("completion_tokens")),
+            reasoning_tokens=_int(details.get("reasoning_tokens")),
+            # Which upstream ran it - DeepInfra, Together, and so on. Two samples from the
+            # same model name are not necessarily from the same deployment of it.
+            upstream_provider=str(response_json.get("provider") or ""),
+            # Confirmed against a live response: the cost is in the body, so knowing what a
+            # run cost needs no second call to the /generation endpoint. Free-tier models
+            # report 0.
+            cost=_float(usage.get("cost")),
+        ),
     )
 
 
@@ -334,10 +476,7 @@ def _provider_message(response) -> str:
     return ""
 
 
-def call_llm(sys_prompt: str, messages: list) -> str:
-    """Routes the request to the active LLM provider and returns the string response."""
-    if LLM_INIT_ERROR:
-        raise RuntimeError(LLM_INIT_ERROR)
+def _dispatch(sys_prompt: str, messages: list):
     if ACTIVE_PROVIDER == "gemini":
         return _call_gemini(sys_prompt, messages)
     elif ACTIVE_PROVIDER == "litellm":
@@ -347,6 +486,104 @@ def call_llm(sys_prompt: str, messages: list) -> str:
     elif ACTIVE_PROVIDER == "openrouter":
         return _call_openrouter(sys_prompt, messages)
     raise ValueError(f"Unsupported LLM_PROVIDER: {ACTIVE_PROVIDER}")
+
+
+def _active_model() -> str:
+    """The model this provider was asked for.
+
+    Only ever a *request*: OpenRouter may route to something else, and recording what
+    actually served the call is Phase 2's job.
+    """
+    return {
+        "gemini": GOOGLE_MODEL,
+        "litellm": LITELLM_MODEL_NAME,
+        "huggingface": HUGGINGFACE_MODEL_NAME,
+        "openrouter": OPENROUTER_MODEL_NAME,
+    }.get(ACTIVE_PROVIDER) or ""
+
+
+def _messages_for_corpus(messages: list) -> list[dict]:
+    """The request in canonical role/content form, system prompt excluded.
+
+    Not `_format_chat_messages`: that renders per provider and inlines the system prompt,
+    which the corpus stores once by hash rather than on every row. The `internal` flag is
+    kept because it marks the builder's own retry context - the difference between a first
+    attempt and a repair is exactly what makes these samples worth having.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            out.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            entry = {"role": "assistant", "content": msg.content}
+            extra = getattr(msg, "additional_kwargs", None) or {}
+            if extra.get("internal"):
+                entry["internal"] = True
+            if extra.get("reasoning_details") is not None:
+                entry["reasoning_details"] = extra["reasoning_details"]
+            out.append(entry)
+    return out
+
+
+def call_llm(sys_prompt: str, messages: list, *, node: str = "unknown",
+             attempt: int = 1, purpose: str = "") -> str:
+    """Routes the request to the active LLM provider and returns the string response.
+
+    Also the one place every model call in the codebase is recorded for fine-tuning.
+    `node` is the attribution that made that possible: without it the planner, builder,
+    triage and patch calls are indistinguishable at the point of the call, and a corpus
+    you cannot split by task is one you cannot train a planner on.
+
+    Capture never affects the result. `backend.corpus` swallows its own failures, and the
+    provider's return value is passed back untouched - `_call_openrouter` returns an
+    `LLMResponse` carrying reasoning, and stringifying it here would silently drop the
+    model's thinking from every downstream turn.
+    """
+    if LLM_INIT_ERROR:
+        raise RuntimeError(LLM_INIT_ERROR)
+
+    started = time.monotonic()
+    common = {
+        "node": node,
+        "attempt": attempt,
+        "purpose": purpose,
+        "system_prompt": sys_prompt,
+        "messages": _messages_for_corpus(messages),
+        "provider": ACTIVE_PROVIDER,
+        "model_requested": _active_model(),
+        "temperature": LLM_TEMPERATURE,
+        "reasoning_enabled": ACTIVE_PROVIDER == "openrouter" and OPENROUTER_REASONING_ENABLED,
+    }
+
+    try:
+        response = _dispatch(sys_prompt, messages)
+    except Exception as exc:
+        # A refusal is a sample too: a rate limit, a timeout and a malformed request are
+        # all things worth being able to count later.
+        corpus.record_llm_call(
+            **common,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+
+    # `getattr` rather than `response.meta`: a provider path could return a bare string,
+    # and so does every test fake that stubs one out.
+    meta = getattr(response, "meta", None) or CallMetadata()
+    corpus.record_llm_call(
+        **common,
+        completion=str(response),
+        reasoning=getattr(response, "reasoning_details", None),
+        latency_ms=int((time.monotonic() - started) * 1000),
+        model_served=meta.model,
+        generation_id=meta.generation_id,
+        prompt_tokens=meta.prompt_tokens,
+        completion_tokens=meta.completion_tokens,
+        reasoning_tokens=meta.reasoning_tokens,
+        upstream_provider=meta.upstream_provider,
+        cost=meta.cost,
+    )
+    return response
 
 
 # ==========================================
@@ -427,6 +664,57 @@ def _emit(event: dict) -> None:
         writer(event)
     except Exception:
         pass
+
+
+@contextmanager
+def _tool_run(tool: str, *, node: str, attempt: int = 1):
+    """Time a deterministic tool and record its verdict, whether or not it raised.
+
+    Every stage of a build is a check some model output either passes or fails, and until
+    now only the last one survived - `evaluation_feedback` held one string and each attempt
+    overwrote the one before. Recorded per attempt, a failing attempt and the passing one
+    that follows it are a preference pair with a machine-checkable reason attached, which
+    is the single most valuable thing this pipeline produces and was being thrown away.
+
+    Yields a handle whose `diagnostics` and `output` the caller fills in. An exception
+    marks the run failed and is re-raised untouched: the repair loop is driven by these
+    exceptions, so swallowing one here would change what the agent does.
+    """
+    handle = SimpleNamespace(diagnostics=None, output=None)
+    started = time.monotonic()
+
+    def elapsed() -> int:
+        return int((time.monotonic() - started) * 1000)
+
+    try:
+        yield handle
+    except Exception as exc:
+        corpus.record_tool_result(
+            tool=tool, node=node, attempt=attempt, ok=False, duration_ms=elapsed(),
+            diagnostics=handle.diagnostics or _diagnostics_from_error(exc),
+            output=handle.output,
+            error=f"{type(exc).__name__}: {exc}"[:4000],
+        )
+        raise
+    corpus.record_tool_result(
+        tool=tool, node=node, attempt=attempt, ok=True, duration_ms=elapsed(),
+        diagnostics=handle.diagnostics, output=handle.output,
+    )
+
+
+def _diagnostics_from_error(exc: BaseException) -> list[dict] | None:
+    """Structure out of the exceptions the tools raise, where they carry any.
+
+    `DslError` collects every problem in the document rather than stopping at the first,
+    so it is already a list; the rest carry only a message, and inventing structure for
+    those would be worse than recording none.
+    """
+    if isinstance(exc, DslError):
+        return [{"kind": "dsl_parse", "code": "DSL_ERROR", "message": problem}
+                for problem in exc.problems]
+    if isinstance(exc, PatchError):
+        return [{"kind": "patch", "code": "PATCH_ERROR", "message": str(exc)}]
+    return None
 
 
 def _debug_write(dsl_content: str) -> None:
@@ -635,7 +923,7 @@ def _classify_intent(text: str, has_graph: bool) -> tuple[str, float]:
         return "MODIFY", 0.85
 
     try:
-        raw = call_llm(PROMPT_INTENT, [HumanMessage(content=text)])
+        raw = call_llm(PROMPT_INTENT, [HumanMessage(content=text)], node="intent_router_node")
         parsed = json.loads(_extract_single_json(raw))
         intent = str(parsed.get("intent", "")).upper()
         if intent in ("CREATE", "MODIFY", "TEST", "EXPLAIN", "LINT"):
@@ -684,7 +972,7 @@ def explain_node(state: AgentState):
     user_prompt = _inject_jdm(PROMPT_EXPLAIN_USER, existing_jdm)
 
     messages = [HumanMessage(content=user_prompt)]
-    explanation = call_llm(PROMPT_EXPLAIN, messages)
+    explanation = call_llm(PROMPT_EXPLAIN, messages, node="explain_node")
 
     # 4. Format the final UI Message
     # Notice the mandatory empty lines inside the <details> tags to ensure Streamlit parses the markdown correctly!
@@ -717,7 +1005,7 @@ def modify_triage_node(state: AgentState):
     prompt = _inject_jdm(PROMPT_MODIFY_TRIAGE, existing_jdm)
     # Call the LLM with the custom modification prompt + the conversation history
     # Note: Replace call_llm with however your function is named
-    response_text = call_llm(prompt, state["messages"])
+    response_text = call_llm(prompt, state["messages"], node="modify_triage_node")
     clean_json = _extract_single_json(response_text)
     try:
         parsed = json.loads(clean_json)
@@ -765,7 +1053,8 @@ def test_node(state: AgentState):
         _emit({"type": "progress", "node": "test_node", "attempt": 1, "max_attempts": 1,
                "phase": "llm", "message": "Writing test cases for this policy"})
         user_prompt = _inject_jdm(PROMPT_TEST_USER, existing_jdm)
-        content = call_llm(PROMPT_TEST, [HumanMessage(content=user_prompt)])
+        content = call_llm(PROMPT_TEST, [HumanMessage(content=user_prompt)],
+                           node="test_node", purpose="generate_suite")
         test_suite_json = _extract_bounded_text(
             content, "---TESTS STARTS---", "---TESTS ENDS---", strip_lang="json"
         ) or "[]"
@@ -788,7 +1077,9 @@ def test_node(state: AgentState):
            "phase": "evaluate", "message": f"Running {len(parsed_tests)} test case(s)"})
 
     try:
-        report = run_test_suite(existing_jdm, parsed_tests)
+        with _tool_run("run_tests", node="test_node") as run:
+            report = run_test_suite(existing_jdm, parsed_tests)
+            run.output = report.get("summary")
     except Exception as e:
         return {
             "test_suite_json": test_suite_json,
@@ -877,7 +1168,11 @@ def lint_node(state: AgentState):
     _emit({"type": "progress", "node": "lint_node", "attempt": 1, "max_attempts": 1,
            "phase": "lint", "message": "Checking the graph against the quality rules"})
 
-    findings = lint(graph)
+    with _tool_run("lint", node="lint_node") as run:
+        findings = lint(graph)
+        run.diagnostics = [d.as_dict() for d in findings]
+        run.output = {f"{s}s": sum(1 for d in findings if d.severity == s)
+                      for s in ("error", "warning", "hint")}
     name = state.get("selected_file") or state.get("canvas_graph_name") or "this policy"
 
     if not findings:
@@ -911,7 +1206,7 @@ def lint_node(state: AgentState):
 def triage_node(state: AgentState):
     print(f"\n[Step 1: Triage]: Evaluating requirements using {ACTIVE_PROVIDER.upper()}...")
 
-    response_text = call_llm(PROMPT_TRIAGE, state["messages"])
+    response_text = call_llm(PROMPT_TRIAGE, state["messages"], node="triage_node")
     clean_json = _extract_single_json(response_text)
 
     try:
@@ -1063,7 +1358,8 @@ def planner_node(state: AgentState):
         messages_for_planner.append(HumanMessage(content=_REPLAN_INSTRUCTION))
 
     # Call your LLM using messages_for_planner instead of state["messages"]
-    content = call_llm(PROMPT_PLANNER, messages_for_planner)
+    content = call_llm(PROMPT_PLANNER, messages_for_planner, node="planner_node",
+                       attempt=spent + 1, purpose="replan" if retrying else "plan")
     print(f"planner node content: {content}")
 
     # Use the robust extraction
@@ -1072,6 +1368,17 @@ def planner_node(state: AgentState):
     # Fallback to empty array if tests weren't found
     if not test_suite_json:
         test_suite_json = "[]"
+
+    # The planner's own verdict on its reply. "The model answered with prose instead of a
+    # design" is a distinct and common failure, and one a corpus should be able to count.
+    corpus.record_tool_result(
+        tool="extract_plan", node="planner_node", attempt=spent + 1,
+        ok=_is_a_plan(dsl_content),
+        output={"dsl_chars": len(dsl_content or ""),
+                "tests": test_suite_json != "[]",
+                "named": bool(usecase_name)},
+        error=None if _is_a_plan(dsl_content) else "the reply carried no DSL skeleton",
+    )
 
     if not _is_a_plan(dsl_content):
         print("  --> [Planner]: no design in the reply; the builder is not entered.")
@@ -1189,20 +1496,34 @@ def patch_node(state: AgentState):
                "message": "Working out the smallest change" if attempt == 0
                           else f"Revising the edit after attempt {attempt}"})
 
-        content = call_llm(PROMPT_PATCH, context)
+        content = call_llm(PROMPT_PATCH, context, node="patch_node",
+                           attempt=attempt + 1,
+                           purpose="patch" if attempt == 0 else "repair")
         new_messages.append(_assistant_message_from_llm(content, internal=True))
         context.append(_assistant_message_from_llm(content))
 
         block = _extract_bounded_text(content, "---OPS STARTS---", "---OPS ENDS---", strip_lang="json")
         if not block:
             block = _fenced_block(content, "json")
+        # Recorded directly rather than through `_tool_run`: this failure continues the
+        # loop instead of raising, so there is no exception for the helper to catch.
         try:
             operations = json.loads(block) if block.strip() else []
         except json.JSONDecodeError as exc:
+            corpus.record_tool_result(
+                tool="extract_ops", node="patch_node", attempt=attempt + 1, ok=False,
+                error=f"JSONDecodeError: {exc}",
+                diagnostics=[{"kind": "dsl_parse", "code": "OPS_NOT_JSON",
+                              "message": str(exc)}],
+            )
             last_feedback = (f"The edit operations were not valid JSON ({exc}). Output a JSON "
                              "array between ---OPS STARTS--- and ---OPS ENDS---.")
             context.append(HumanMessage(content=last_feedback))
             continue
+        corpus.record_tool_result(
+            tool="extract_ops", node="patch_node", attempt=attempt + 1,
+            ok=bool(operations), output={"operations": len(operations)},
+        )
 
         if not operations:
             return {
@@ -1220,11 +1541,19 @@ def patch_node(state: AgentState):
             _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
                    "max_attempts": attempts, "phase": "parse",
                    "message": f"Applying {len(operations)} change(s)"})
-            patched = apply_patch(graph, operations)
+            with _tool_run("apply_patch", node="patch_node", attempt=attempt + 1) as run:
+                patched = apply_patch(graph, operations)
+                # The ops themselves, which are the edit the model proposed. This is the
+                # only record of what it wanted to change if the patch is then rejected.
+                run.output = {"operations": operations,
+                              "applied": describe_patch(operations)}
 
-            blockers = blocking(lint(patched))
-            if blockers:
-                raise RuntimeError(format_for_llm(blockers))
+            with _tool_run("lint", node="patch_node", attempt=attempt + 1) as run:
+                findings = lint(patched)
+                run.diagnostics = [d.as_dict() for d in findings]
+                blockers = blocking(findings)
+                if blockers:
+                    raise RuntimeError(format_for_llm(blockers))
 
             _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
                    "max_attempts": attempts, "phase": "evaluate",
@@ -1234,11 +1563,19 @@ def patch_node(state: AgentState):
             # asked for a behaviour change, so the cases that pinned the old behaviour are
             # *supposed* to disagree - retrying would have the agent fight the request it
             # was given. Report which ones moved and let the approval gate decide.
-            report = run_test_suite(json.dumps(patched), tests, trace=True) if tests else None
-            regressions = [
-                r["name"] for r in (report or {}).get("results", [])
-                if r["status"] in ("failed", "errored")
-            ]
+            with _tool_run("run_tests", node="patch_node", attempt=attempt + 1) as run:
+                report = run_test_suite(json.dumps(patched), tests, trace=True) if tests else None
+                regressions = [
+                    r["name"] for r in (report or {}).get("results", [])
+                    if r["status"] in ("failed", "errored")
+                ]
+                run.output = {"summary": (report or {}).get("summary"),
+                              "regressions": regressions}
+                # Deliberately not raised on a regression, so this records as ok. The edit
+                # applied cleanly; a behaviour change is *supposed* to move the cases that
+                # pinned the old behaviour, and scoring that as a tool failure would teach
+                # the corpus that doing what the user asked is a mistake. Which cases moved
+                # is in `output`, for a scorer to weigh later.
             result = "" if report is None else json.dumps(report["summary"])
 
             return {
@@ -1335,7 +1672,10 @@ def builder_node(state: AgentState):
             print(f"  --> [Attempt {attempt}]: Calling LLM to fix errors...")
             progress("llm", f"Revising the graph after attempt {attempt}")
 
-            content = call_llm(PROMPT_BUILDER, context)
+            # `attempt + 1` matches the number the progress event shows the user, so a
+            # corpus row can be lined up against what they actually saw happen.
+            content = call_llm(PROMPT_BUILDER, context, node="builder_node",
+                               attempt=attempt + 1, purpose="repair")
             new_messages.append(_assistant_message_from_llm(content, internal=True))
             context.append(_assistant_message_from_llm(content))
 
@@ -1367,20 +1707,25 @@ def builder_node(state: AgentState):
         _debug_write(dsl_content)
 
         # --- COMPILATION & TESTING ---
+        # Each stage is recorded per attempt. `stage` numbers them as the user saw them,
+        # so a corpus row lines up with the progress events for the same attempt.
+        stage = attempt + 1
         try:
             print("  --> [Tool Call]: Compiling Markdown DSL to JSON")
             progress("parse", "Compiling the plan into a decision graph")
-            jdm_dict = parse_markdown_dsl(dsl_content)
-            jdm_json = json.dumps(jdm_dict)
-
+            with _tool_run("parse_dsl", node="builder_node", attempt=stage) as run:
+                jdm_dict = parse_markdown_dsl(dsl_content)
+                jdm_json = json.dumps(jdm_dict)
+                run.output = {"nodes": len(jdm_dict.get("nodes", [])),
+                              "edges": len(jdm_dict.get("edges", []))}
 
             # Now Evaluate against Zen Engine
             progress("compile", "Checking the graph and test suite structure")
-            is_valid, format_result = check_jdm_format(jdm_json, test_suite_json)
-            if not is_valid:
-                raise ValueError(f"Test JSON Format Error: {format_result}")
-
-            parsed_jdm, parsed_tests = format_result
+            with _tool_run("check_format", node="builder_node", attempt=stage):
+                is_valid, format_result = check_jdm_format(jdm_json, test_suite_json)
+                if not is_valid:
+                    raise ValueError(f"Test JSON Format Error: {format_result}")
+                parsed_jdm, parsed_tests = format_result
 
             # Lint before behaviour. `create_decision` only deserializes, so a dangling
             # edge, a missing input node or a malformed expression compiles cleanly here
@@ -1388,17 +1733,28 @@ def builder_node(state: AgentState):
             # with no node attached. Only errors block: a loop that refused to finish over
             # a style hint would never converge, so warnings and hints travel with the
             # result for the user to judge.
-            findings = lint(parsed_jdm)
-            blockers = blocking(findings)
-            if blockers:
-                raise RuntimeError(format_for_llm(blockers))
-            advisories = [d.as_dict() for d in findings]
+            with _tool_run("lint", node="builder_node", attempt=stage) as run:
+                findings = lint(parsed_jdm)
+                advisories = [d.as_dict() for d in findings]
+                # Every finding, not only the blocking ones: a graph that merely warns is
+                # worse training data than one that lints clean, and the difference is
+                # invisible if only errors are kept.
+                run.diagnostics = advisories
+                run.output = {"errors": sum(1 for d in findings if d.severity == "error"),
+                              "warnings": sum(1 for d in findings if d.severity == "warning"),
+                              "hints": sum(1 for d in findings if d.severity == "hint")}
+                blockers = blocking(findings)
+                if blockers:
+                    raise RuntimeError(format_for_llm(blockers))
 
             progress("evaluate", f"Running {len(parsed_tests)} test case(s) through the engine")
-            is_success, eval_result = evaluate_against_zen(jdm_json, parsed_tests)
-
-            if not is_success:
-                raise RuntimeError(eval_result)
+            with _tool_run("run_tests", node="builder_node", attempt=stage) as run:
+                evaluation = evaluate(jdm_json, parsed_tests)
+                eval_result = evaluation.feedback
+                run.diagnostics = evaluation.as_diagnostic_dicts()
+                run.output = evaluation.summary or None
+                if not evaluation.ok:
+                    raise RuntimeError(eval_result)
 
             # SUCCESS! Break the loop and return
             print("  --> Tests Passed!")

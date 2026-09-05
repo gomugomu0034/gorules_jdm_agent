@@ -61,10 +61,17 @@ def read_events(client, thread_id: str, from_seq: int = 0, timeout: float = 30.0
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # The status check is what makes this safe on a *resume*. `from_seq` defaults to 0,
+        # so the log still carries the previous turn's `done`, and waiting only for a
+        # trailing `done` returns the moment the new turn is launched but has not yet
+        # emitted anything - handing the caller a stale log that looks complete.
+        # `_launch` sets `running` before it returns its 202, so by the time a caller gets
+        # here the status is already the authority on whether a turn is in flight.
+        status = client.get(f"/api/chat/threads/{thread_id}").json()["status"]
         events = client.get(
             f"/api/chat/threads/{thread_id}/events?from_seq={from_seq}"
         ).json()["events"]
-        if events and events[-1]["type"] == "done":
+        if status != "running" and events and events[-1]["type"] == "done":
             return events
         time.sleep(0.05)
     raise AssertionError(f"Turn on {thread_id} did not finish within {timeout}s")
