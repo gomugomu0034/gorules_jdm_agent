@@ -31,6 +31,7 @@ __all__ = [
     "open_at_boot",
     "observe",
     "record_llm_call",
+    "record_tool_result",
     "run_scope",
     "store",
 ]
@@ -122,7 +123,7 @@ def record_llm_call(
     keeping, and lands with a NULL `run_id` rather than being dropped.
     """
     context = current()
-    return store.record_sample(
+    sample_id = store.record_sample(
         node=node,
         system_prompt=system_prompt,
         messages=messages,
@@ -144,4 +145,40 @@ def record_llm_call(
         upstream_provider=upstream_provider,
         cost=cost,
         run_id=context.run_id if context else None,
+    )
+    if context is not None and sample_id is not None:
+        # So the tool verdicts that follow know which output they are judging.
+        context.last_sample_id = sample_id
+    return sample_id
+
+
+def record_tool_result(
+    *,
+    tool: str,
+    node: str,
+    ok: bool,
+    attempt: int = 1,
+    diagnostics: list | None = None,
+    output: Any = None,
+    error: str | None = None,
+    duration_ms: int | None = None,
+) -> str | None:
+    """Record what a deterministic tool decided about the run's most recent model output.
+
+    Attribution is by position rather than by argument: the tools run immediately after
+    the call whose output they inspect, and the builder's first attempt deliberately
+    inspects the planner's DSL without making a call of its own.
+    """
+    context = current()
+    return store.record_tool_result(
+        tool=tool,
+        node=node,
+        ok=ok,
+        attempt=attempt,
+        diagnostics=diagnostics,
+        output=output,
+        error=error,
+        duration_ms=duration_ms,
+        run_id=context.run_id if context else None,
+        sample_id=context.last_sample_id if context else None,
     )

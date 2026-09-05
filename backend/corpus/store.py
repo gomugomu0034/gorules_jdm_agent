@@ -338,6 +338,54 @@ def record_sample(
     return sample_id
 
 
+@_never_fails
+def record_tool_result(
+    *,
+    tool: str,
+    node: str,
+    ok: bool,
+    attempt: int = 1,
+    diagnostics: list | None = None,
+    output: Any = None,
+    error: str | None = None,
+    duration_ms: int | None = None,
+    run_id: str | None = None,
+    sample_id: str | None = None,
+) -> str | None:
+    """Record what a deterministic tool made of a model's output.
+
+    The objective half of the corpus. A sample the linter rejected and a sample it passed
+    are different training data, and knowing which is which needs no human.
+    """
+    values: dict[str, Any] = {
+        "tool_result_id": str(uuid.uuid4()),
+        "run_id": run_id,
+        "sample_id": sample_id,
+        "node": node,
+        "attempt": attempt,
+        "tool": tool,
+        "ok": int(ok),
+        "diagnostics_json": (
+            json.dumps(diagnostics, ensure_ascii=False, default=str) if diagnostics else None
+        ),
+        "output_json": (
+            json.dumps(output, ensure_ascii=False, default=str) if output is not None else None
+        ),
+        "error": error,
+        "duration_ms": duration_ms,
+        "created_at": now(),
+    }
+    with _lock:
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" * len(values))
+        _connect().execute(
+            f"INSERT INTO tool_results ({columns}, seq) VALUES ({placeholders},"
+            " (SELECT COALESCE(MAX(seq), 0) + 1 FROM tool_results WHERE run_id = ?))",
+            (*values.values(), run_id),
+        )
+    return values["tool_result_id"]
+
+
 def _prompt_kind(node: str) -> str:
     """`planner_node` -> `planner`. Just a readable label on the prompts table."""
     return node.removesuffix("_node") or node

@@ -94,3 +94,38 @@ CREATE TABLE IF NOT EXISTS samples (
 CREATE INDEX IF NOT EXISTS idx_samples_run     ON samples(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_samples_node    ON samples(node, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_samples_prompt  ON samples(prompt_hash);
+
+-- What the deterministic tools decided about a model's output.
+--
+-- This is what turns a run from one training example into several with a machine-checkable
+-- verdict on each. The builder's repair loop produces a failing attempt and then a passing
+-- one against the same task; kept apart with the reason each was rejected, that is a
+-- preference pair with no human labelling in it.
+--
+-- `sample_id` is the model call being judged, which is not always the call made in the
+-- same breath: the builder's first attempt validates the *planner's* DSL without asking
+-- the model anything, so its verdicts attribute to the planner's sample. That falls out of
+-- pointing at whichever sample the run produced most recently.
+--
+-- `diagnostics_json` holds structured `Diagnostic` records rather than `format_for_llm`'s
+-- prose. The prose is written for the model to read; the structure is what a corpus can be
+-- filtered and counted on.
+CREATE TABLE IF NOT EXISTS tool_results (
+  tool_result_id   TEXT PRIMARY KEY,
+  run_id           TEXT,
+  sample_id        TEXT,                     -- -> samples.sample_id
+  seq              INTEGER NOT NULL DEFAULT 0,
+  node             TEXT NOT NULL,
+  attempt          INTEGER NOT NULL DEFAULT 1,
+  -- extract_plan | parse_dsl | check_format | lint | run_tests | apply_patch
+  tool             TEXT NOT NULL,
+  ok               INTEGER NOT NULL,
+  diagnostics_json TEXT,
+  output_json      TEXT,                     -- test summary, patch log, counts
+  error            TEXT,
+  duration_ms      INTEGER,
+  created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_results_run    ON tool_results(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_tool_results_sample ON tool_results(sample_id);
+CREATE INDEX IF NOT EXISTS idx_tool_results_tool   ON tool_results(tool, ok);

@@ -36,6 +36,11 @@ class RunContext:
     graph_id: str | None = None
     owner_hash: str = ""
     observed: dict = field(default_factory=dict)
+    # The most recent model output in this run, and so the one a tool verdict is about.
+    # Not always the call made in the same breath: the builder's first attempt validates
+    # the *planner's* DSL without asking the model anything, and its verdicts belong to
+    # the planner's sample. Pointing at the latest sample gets that right by construction.
+    last_sample_id: str | None = None
 
 
 def current() -> RunContext | None:

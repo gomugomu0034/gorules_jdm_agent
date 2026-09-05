@@ -4,7 +4,9 @@ import re
 import os
 import tempfile
 from pathlib import Path
+from contextlib import contextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TypedDict, Annotated
 from dotenv import load_dotenv
 import requests
@@ -45,7 +47,7 @@ from backend.tools.diagnostics import (
 )
 from backend.tools.jdm_linter import blocking, lint
 from backend.tools.jdm_patch import PatchError, apply_patch, describe as describe_patch
-from backend.tools.zen_evaluator import check_jdm_format, evaluate_against_zen, run_test_suite
+from backend.tools.zen_evaluator import check_jdm_format, evaluate, run_test_suite
 
 
 
@@ -664,6 +666,57 @@ def _emit(event: dict) -> None:
         pass
 
 
+@contextmanager
+def _tool_run(tool: str, *, node: str, attempt: int = 1):
+    """Time a deterministic tool and record its verdict, whether or not it raised.
+
+    Every stage of a build is a check some model output either passes or fails, and until
+    now only the last one survived - `evaluation_feedback` held one string and each attempt
+    overwrote the one before. Recorded per attempt, a failing attempt and the passing one
+    that follows it are a preference pair with a machine-checkable reason attached, which
+    is the single most valuable thing this pipeline produces and was being thrown away.
+
+    Yields a handle whose `diagnostics` and `output` the caller fills in. An exception
+    marks the run failed and is re-raised untouched: the repair loop is driven by these
+    exceptions, so swallowing one here would change what the agent does.
+    """
+    handle = SimpleNamespace(diagnostics=None, output=None)
+    started = time.monotonic()
+
+    def elapsed() -> int:
+        return int((time.monotonic() - started) * 1000)
+
+    try:
+        yield handle
+    except Exception as exc:
+        corpus.record_tool_result(
+            tool=tool, node=node, attempt=attempt, ok=False, duration_ms=elapsed(),
+            diagnostics=handle.diagnostics or _diagnostics_from_error(exc),
+            output=handle.output,
+            error=f"{type(exc).__name__}: {exc}"[:4000],
+        )
+        raise
+    corpus.record_tool_result(
+        tool=tool, node=node, attempt=attempt, ok=True, duration_ms=elapsed(),
+        diagnostics=handle.diagnostics, output=handle.output,
+    )
+
+
+def _diagnostics_from_error(exc: BaseException) -> list[dict] | None:
+    """Structure out of the exceptions the tools raise, where they carry any.
+
+    `DslError` collects every problem in the document rather than stopping at the first,
+    so it is already a list; the rest carry only a message, and inventing structure for
+    those would be worse than recording none.
+    """
+    if isinstance(exc, DslError):
+        return [{"kind": "dsl_parse", "code": "DSL_ERROR", "message": problem}
+                for problem in exc.problems]
+    if isinstance(exc, PatchError):
+        return [{"kind": "patch", "code": "PATCH_ERROR", "message": str(exc)}]
+    return None
+
+
 def _debug_write(dsl_content: str) -> None:
     """Persist the DSL under inspection. Never fatal."""
     target = Path(os.getenv("DEBUG_DIR") or tempfile.gettempdir()) / "debug_graph.md"
@@ -1024,7 +1077,9 @@ def test_node(state: AgentState):
            "phase": "evaluate", "message": f"Running {len(parsed_tests)} test case(s)"})
 
     try:
-        report = run_test_suite(existing_jdm, parsed_tests)
+        with _tool_run("run_tests", node="test_node") as run:
+            report = run_test_suite(existing_jdm, parsed_tests)
+            run.output = report.get("summary")
     except Exception as e:
         return {
             "test_suite_json": test_suite_json,
@@ -1113,7 +1168,11 @@ def lint_node(state: AgentState):
     _emit({"type": "progress", "node": "lint_node", "attempt": 1, "max_attempts": 1,
            "phase": "lint", "message": "Checking the graph against the quality rules"})
 
-    findings = lint(graph)
+    with _tool_run("lint", node="lint_node") as run:
+        findings = lint(graph)
+        run.diagnostics = [d.as_dict() for d in findings]
+        run.output = {f"{s}s": sum(1 for d in findings if d.severity == s)
+                      for s in ("error", "warning", "hint")}
     name = state.get("selected_file") or state.get("canvas_graph_name") or "this policy"
 
     if not findings:
@@ -1310,6 +1369,17 @@ def planner_node(state: AgentState):
     if not test_suite_json:
         test_suite_json = "[]"
 
+    # The planner's own verdict on its reply. "The model answered with prose instead of a
+    # design" is a distinct and common failure, and one a corpus should be able to count.
+    corpus.record_tool_result(
+        tool="extract_plan", node="planner_node", attempt=spent + 1,
+        ok=_is_a_plan(dsl_content),
+        output={"dsl_chars": len(dsl_content or ""),
+                "tests": test_suite_json != "[]",
+                "named": bool(usecase_name)},
+        error=None if _is_a_plan(dsl_content) else "the reply carried no DSL skeleton",
+    )
+
     if not _is_a_plan(dsl_content):
         print("  --> [Planner]: no design in the reply; the builder is not entered.")
         return {
@@ -1435,13 +1505,25 @@ def patch_node(state: AgentState):
         block = _extract_bounded_text(content, "---OPS STARTS---", "---OPS ENDS---", strip_lang="json")
         if not block:
             block = _fenced_block(content, "json")
+        # Recorded directly rather than through `_tool_run`: this failure continues the
+        # loop instead of raising, so there is no exception for the helper to catch.
         try:
             operations = json.loads(block) if block.strip() else []
         except json.JSONDecodeError as exc:
+            corpus.record_tool_result(
+                tool="extract_ops", node="patch_node", attempt=attempt + 1, ok=False,
+                error=f"JSONDecodeError: {exc}",
+                diagnostics=[{"kind": "dsl_parse", "code": "OPS_NOT_JSON",
+                              "message": str(exc)}],
+            )
             last_feedback = (f"The edit operations were not valid JSON ({exc}). Output a JSON "
                              "array between ---OPS STARTS--- and ---OPS ENDS---.")
             context.append(HumanMessage(content=last_feedback))
             continue
+        corpus.record_tool_result(
+            tool="extract_ops", node="patch_node", attempt=attempt + 1,
+            ok=bool(operations), output={"operations": len(operations)},
+        )
 
         if not operations:
             return {
@@ -1459,11 +1541,19 @@ def patch_node(state: AgentState):
             _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
                    "max_attempts": attempts, "phase": "parse",
                    "message": f"Applying {len(operations)} change(s)"})
-            patched = apply_patch(graph, operations)
+            with _tool_run("apply_patch", node="patch_node", attempt=attempt + 1) as run:
+                patched = apply_patch(graph, operations)
+                # The ops themselves, which are the edit the model proposed. This is the
+                # only record of what it wanted to change if the patch is then rejected.
+                run.output = {"operations": operations,
+                              "applied": describe_patch(operations)}
 
-            blockers = blocking(lint(patched))
-            if blockers:
-                raise RuntimeError(format_for_llm(blockers))
+            with _tool_run("lint", node="patch_node", attempt=attempt + 1) as run:
+                findings = lint(patched)
+                run.diagnostics = [d.as_dict() for d in findings]
+                blockers = blocking(findings)
+                if blockers:
+                    raise RuntimeError(format_for_llm(blockers))
 
             _emit({"type": "progress", "node": "patch_node", "attempt": attempt + 1,
                    "max_attempts": attempts, "phase": "evaluate",
@@ -1473,11 +1563,19 @@ def patch_node(state: AgentState):
             # asked for a behaviour change, so the cases that pinned the old behaviour are
             # *supposed* to disagree - retrying would have the agent fight the request it
             # was given. Report which ones moved and let the approval gate decide.
-            report = run_test_suite(json.dumps(patched), tests, trace=True) if tests else None
-            regressions = [
-                r["name"] for r in (report or {}).get("results", [])
-                if r["status"] in ("failed", "errored")
-            ]
+            with _tool_run("run_tests", node="patch_node", attempt=attempt + 1) as run:
+                report = run_test_suite(json.dumps(patched), tests, trace=True) if tests else None
+                regressions = [
+                    r["name"] for r in (report or {}).get("results", [])
+                    if r["status"] in ("failed", "errored")
+                ]
+                run.output = {"summary": (report or {}).get("summary"),
+                              "regressions": regressions}
+                # Deliberately not raised on a regression, so this records as ok. The edit
+                # applied cleanly; a behaviour change is *supposed* to move the cases that
+                # pinned the old behaviour, and scoring that as a tool failure would teach
+                # the corpus that doing what the user asked is a mistake. Which cases moved
+                # is in `output`, for a scorer to weigh later.
             result = "" if report is None else json.dumps(report["summary"])
 
             return {
@@ -1609,20 +1707,25 @@ def builder_node(state: AgentState):
         _debug_write(dsl_content)
 
         # --- COMPILATION & TESTING ---
+        # Each stage is recorded per attempt. `stage` numbers them as the user saw them,
+        # so a corpus row lines up with the progress events for the same attempt.
+        stage = attempt + 1
         try:
             print("  --> [Tool Call]: Compiling Markdown DSL to JSON")
             progress("parse", "Compiling the plan into a decision graph")
-            jdm_dict = parse_markdown_dsl(dsl_content)
-            jdm_json = json.dumps(jdm_dict)
-
+            with _tool_run("parse_dsl", node="builder_node", attempt=stage) as run:
+                jdm_dict = parse_markdown_dsl(dsl_content)
+                jdm_json = json.dumps(jdm_dict)
+                run.output = {"nodes": len(jdm_dict.get("nodes", [])),
+                              "edges": len(jdm_dict.get("edges", []))}
 
             # Now Evaluate against Zen Engine
             progress("compile", "Checking the graph and test suite structure")
-            is_valid, format_result = check_jdm_format(jdm_json, test_suite_json)
-            if not is_valid:
-                raise ValueError(f"Test JSON Format Error: {format_result}")
-
-            parsed_jdm, parsed_tests = format_result
+            with _tool_run("check_format", node="builder_node", attempt=stage):
+                is_valid, format_result = check_jdm_format(jdm_json, test_suite_json)
+                if not is_valid:
+                    raise ValueError(f"Test JSON Format Error: {format_result}")
+                parsed_jdm, parsed_tests = format_result
 
             # Lint before behaviour. `create_decision` only deserializes, so a dangling
             # edge, a missing input node or a malformed expression compiles cleanly here
@@ -1630,17 +1733,28 @@ def builder_node(state: AgentState):
             # with no node attached. Only errors block: a loop that refused to finish over
             # a style hint would never converge, so warnings and hints travel with the
             # result for the user to judge.
-            findings = lint(parsed_jdm)
-            blockers = blocking(findings)
-            if blockers:
-                raise RuntimeError(format_for_llm(blockers))
-            advisories = [d.as_dict() for d in findings]
+            with _tool_run("lint", node="builder_node", attempt=stage) as run:
+                findings = lint(parsed_jdm)
+                advisories = [d.as_dict() for d in findings]
+                # Every finding, not only the blocking ones: a graph that merely warns is
+                # worse training data than one that lints clean, and the difference is
+                # invisible if only errors are kept.
+                run.diagnostics = advisories
+                run.output = {"errors": sum(1 for d in findings if d.severity == "error"),
+                              "warnings": sum(1 for d in findings if d.severity == "warning"),
+                              "hints": sum(1 for d in findings if d.severity == "hint")}
+                blockers = blocking(findings)
+                if blockers:
+                    raise RuntimeError(format_for_llm(blockers))
 
             progress("evaluate", f"Running {len(parsed_tests)} test case(s) through the engine")
-            is_success, eval_result = evaluate_against_zen(jdm_json, parsed_tests)
-
-            if not is_success:
-                raise RuntimeError(eval_result)
+            with _tool_run("run_tests", node="builder_node", attempt=stage) as run:
+                evaluation = evaluate(jdm_json, parsed_tests)
+                eval_result = evaluation.feedback
+                run.diagnostics = evaluation.as_diagnostic_dicts()
+                run.output = evaluation.summary or None
+                if not evaluation.ok:
+                    raise RuntimeError(eval_result)
 
             # SUCCESS! Break the loop and return
             print("  --> Tests Passed!")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
@@ -317,40 +318,76 @@ def _format_success(report: dict) -> str:
     return "\n".join(lines)
 
 
-def evaluate_against_zen(jdm_content: str, parsed_tests: list) -> tuple[bool, str]:
+@dataclass
+class Evaluation:
+    """The outcome of running a graph against its suite, prose and structure both.
+
+    `feedback` is written for the model to read and repair from. `diagnostics` and `report`
+    are the same finding as data - which node, which code, which cases moved - and are what
+    the training corpus records, because prose cannot be filtered or counted.
+    """
+
+    ok: bool
+    feedback: str
+    diagnostics: list = field(default_factory=list)
+    report: dict | None = None
+
+    @property
+    def summary(self) -> dict:
+        return (self.report or {}).get("summary", {})
+
+    def as_diagnostic_dicts(self) -> list[dict]:
+        return [d.as_dict() for d in self.diagnostics]
+
+
+def evaluate(jdm_content: str, parsed_tests: list) -> Evaluation:
     """Compile the graph and run it against the test suite.
 
-    Signature is unchanged so ``builder_node`` keeps working as written: it raises with
-    this message and feeds it back to the LLM. What changed is the message. It used to be
-    the exception stringified, identical whatever went wrong; it is now a diagnostic that
-    names the failure's kind, the node responsible, and the change to make - derived from
-    the execution trace and from the JSON the engine's own errors already carry.
+    The message it produces used to be the exception stringified, identical whatever went
+    wrong; it is now a diagnostic that names the failure's kind, the node responsible, and
+    the change to make - derived from the execution trace and from the JSON the engine's
+    own errors already carry.
     """
     graph = jdm_content if isinstance(jdm_content, dict) else json.loads(jdm_content)
 
     try:
         report = run_test_suite(jdm_content, parsed_tests, trace=True)
     except Exception as exc:  # noqa: BLE001 - the graph itself would not run
-        return False, format_for_llm([parse_engine_error(exc, graph)])
+        failure = parse_engine_error(exc, graph)
+        return Evaluation(False, format_for_llm([failure]), [failure])
 
     summary = report["summary"]
     if summary["failed"] or summary["errored"]:
         diagnostics = diagnose(graph, report)
         # Never report a failure with nothing to act on.
-        return False, (format_for_llm(diagnostics) or _format_failures_for_llm(report))
+        return Evaluation(
+            False,
+            format_for_llm(diagnostics) or _format_failures_for_llm(report),
+            diagnostics,
+            report,
+        )
 
     # A case with no `expectedOutput` is skipped rather than run, so a suite made entirely
     # of skips reports zero failures while asserting nothing - and the build would be
     # declared SUCCESS on the strength of it. Nothing proven is not the same as passing.
     if summary["total"] and not summary["passed"]:
-        return False, (
+        return Evaluation(
+            False,
             f"NO ASSERTIONS RAN: {summary['skipped']} of {summary['total']} test cases were "
             "skipped because they have no \"expectedOutput\", so the graph was never actually "
             "checked.\n\n"
             "Rewrite the suite so every case is an object with \"name\", \"input\" and "
             "\"expectedOutput\", where \"expectedOutput\" holds the fields the graph must "
             "return for that input. Matching is by subset, so assert only the fields the "
-            "policy decides - you do not need to repeat the input fields."
+            "policy decides - you do not need to repeat the input fields.",
+            [],
+            report,
         )
 
-    return True, _format_success(report)
+    return Evaluation(True, _format_success(report), [], report)
+
+
+def evaluate_against_zen(jdm_content: str, parsed_tests: list) -> tuple[bool, str]:
+    """`evaluate` as the pair it used to return, for callers that want only the verdict."""
+    result = evaluate(jdm_content, parsed_tests)
+    return result.ok, result.feedback
