@@ -108,6 +108,13 @@ def record_llm_call(
     error: str | None = None,
     attempt: int = 1,
     purpose: str = "",
+    model_served: str = "",
+    generation_id: str = "",
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    reasoning_tokens: int | None = None,
+    upstream_provider: str = "",
+    cost: float | None = None,
 ) -> str | None:
     """Record one model call against the run in scope, if there is one.
 
@@ -129,5 +136,12 @@ def record_llm_call(
         error=error,
         attempt=attempt,
         purpose=purpose,
+        model_served=model_served,
+        generation_id=generation_id,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        upstream_provider=upstream_provider,
+        cost=cost,
         run_id=context.run_id if context else None,
     )

@@ -60,8 +60,9 @@ CREATE TABLE IF NOT EXISTS prompts (
 -- One row per model call. This is the training unit; everything else exists to group it
 -- or to score it.
 --
--- The columns for provider metadata that Phase 2 fills - model_served, the token counts,
--- generation_id - are declared here and left NULL, so that phase is purely additive.
+-- Columns a given provider does not report stay NULL rather than being faked: `cost` and
+-- `upstream_provider` only come back from OpenRouter, and `usage` is optional in the
+-- OpenAI schema, so several endpoints behind the Hugging Face router omit it entirely.
 CREATE TABLE IF NOT EXISTS samples (
   sample_id         TEXT PRIMARY KEY,
   run_id            TEXT,                    -- NULL for a call made outside an agent turn
@@ -73,15 +74,19 @@ CREATE TABLE IF NOT EXISTS samples (
   messages_json     TEXT NOT NULL,           -- the request, system prompt excluded
   completion        TEXT,                    -- raw, before extraction strips it
   reasoning_json    TEXT,                    -- the model's thinking, when the provider returns it
-  provider          TEXT NOT NULL DEFAULT '',
+  provider          TEXT NOT NULL DEFAULT '',   -- the gateway called: openrouter, gemini, ...
+  upstream_provider TEXT,                    -- who actually ran it behind a gateway
   model_requested   TEXT NOT NULL DEFAULT '',
-  model_served      TEXT,                    -- phase 2: differs under OpenRouter routing
+  model_served      TEXT,                    -- differs under OpenRouter routing
   temperature       REAL,
   reasoning_enabled INTEGER NOT NULL DEFAULT 0,
-  prompt_tokens     INTEGER,                 -- phase 2
-  completion_tokens INTEGER,                 -- phase 2
-  reasoning_tokens  INTEGER,                 -- phase 2
-  generation_id     TEXT,                    -- phase 2
+  prompt_tokens     INTEGER,
+  completion_tokens INTEGER,
+  reasoning_tokens  INTEGER,
+  generation_id     TEXT,
+  -- What the call actually cost, when the provider says. OpenRouter returns this in the
+  -- response body; the others do not report cost at all and leave it NULL.
+  cost              REAL,
   latency_ms        INTEGER,
   error             TEXT,                    -- set when the call raised; completion is then NULL
   created_at        TEXT NOT NULL

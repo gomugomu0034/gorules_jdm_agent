@@ -86,6 +86,28 @@ def _never_fails(fn):
     return wrapper
 
 
+# Columns added after an earlier version of the schema was already in use. `schema.sql`
+# creates tables with IF NOT EXISTS, which does nothing at all to a table that already
+# exists - so a corpus written by an earlier build keeps its old shape unless the missing
+# columns are added explicitly. Kept as data rather than a list of ALTER statements so
+# later phases extend it by adding a line.
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "samples": {
+        "upstream_provider": "TEXT",
+        "cost": "REAL",
+    },
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in columns.items():
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+                logger.info("Corpus: added %s.%s", table, name)
+
+
 def _connect() -> sqlite3.Connection:
     """Open the corpus database, creating the file and schema on first use."""
     global _conn
@@ -98,6 +120,7 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_FILE.read_text(encoding="utf-8"))
+    _ensure_columns(conn)
     _conn = conn
     logger.info("Training corpus at %s", path)
     return conn
@@ -257,31 +280,60 @@ def record_sample(
     error: str | None = None,
     attempt: int = 1,
     purpose: str = "",
+    model_served: str = "",
+    generation_id: str = "",
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    reasoning_tokens: int | None = None,
+    upstream_provider: str = "",
+    cost: float | None = None,
     run_id: str | None = None,
 ) -> str | None:
     """Record one model call. Returns the sample id, or None if capture is off."""
     sample_id = str(uuid.uuid4())
+    # Built from a mapping rather than parallel lists of columns and `?` placeholders.
+    # Phases 3 to 5 keep adding to this table, and hand-counting placeholders is how a
+    # column and its value silently drift apart - which SQLite reports as
+    # "N values for N+1 columns" only if you are lucky enough to be off by one.
+    values: dict[str, Any] = {
+        "sample_id": sample_id,
+        "run_id": run_id,
+        "node": node,
+        "attempt": attempt,
+        "purpose": purpose,
+        "messages_json": json.dumps(messages, ensure_ascii=False, default=str),
+        "completion": completion,
+        "reasoning_json": (
+            json.dumps(reasoning, ensure_ascii=False, default=str)
+            if reasoning is not None else None
+        ),
+        "provider": provider,
+        "upstream_provider": upstream_provider or None,
+        "model_requested": model_requested,
+        "model_served": model_served or None,
+        "temperature": temperature,
+        "reasoning_enabled": int(reasoning_enabled),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "generation_id": generation_id or None,
+        "cost": cost,
+        "latency_ms": latency_ms,
+        "error": error,
+        "created_at": now(),
+    }
+
     with _lock:
         conn = _connect()
-        prompt_hash = _remember_prompt(conn, system_prompt, _prompt_kind(node))
+        values["prompt_hash"] = _remember_prompt(conn, system_prompt, _prompt_kind(node))
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" * len(values))
         conn.execute(
-            "INSERT INTO samples ("
-            "  sample_id, run_id, seq, node, attempt, purpose, prompt_hash, messages_json,"
-            "  completion, reasoning_json, provider, model_requested, temperature,"
-            "  reasoning_enabled, latency_ms, error, created_at"
-            ") VALUES (?,?,"
-            # Assigned inside the INSERT so concurrent writers cannot pick the same
-            # number. With run_id NULL the subquery matches nothing and yields 1.
-            "  (SELECT COALESCE(MAX(seq), 0) + 1 FROM samples WHERE run_id = ?),"
-            "  ?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                sample_id, run_id, run_id, node, attempt, purpose, prompt_hash,
-                json.dumps(messages, ensure_ascii=False, default=str),
-                completion,
-                json.dumps(reasoning, ensure_ascii=False, default=str) if reasoning is not None else None,
-                provider, model_requested, temperature, int(reasoning_enabled),
-                latency_ms, error, now(),
-            ),
+            f"INSERT INTO samples ({columns}, seq) VALUES ({placeholders},"
+            # Assigned inside the INSERT so two writers cannot pick the same number.
+            # With run_id NULL the subquery matches nothing and yields 1.
+            " (SELECT COALESCE(MAX(seq), 0) + 1 FROM samples WHERE run_id = ?))",
+            (*values.values(), run_id),
         )
     return sample_id
 

@@ -4,6 +4,7 @@ import re
 import os
 import tempfile
 from pathlib import Path
+from dataclasses import dataclass
 from typing import TypedDict, Annotated
 from dotenv import load_dotenv
 import requests
@@ -161,13 +162,119 @@ except Exception as _exc:  # noqa: BLE001
 # ==========================================
 
 
+@dataclass(frozen=True)
+class CallMetadata:
+    """What the provider said about a call, beyond the text it returned.
+
+    Every provider already sends this and every provider path used to throw it away. It is
+    what makes a corpus row answerable: which model actually produced this, what did it
+    cost, and can I look the generation up with the provider later.
+
+    `model` is the model that *served* the request, which is not always the one asked for -
+    OpenRouter routes, and Gemini resolves an alias like `gemini-flash-latest` to a dated
+    version. Recording only the request would attribute a sample to the wrong model.
+    """
+
+    model: str = ""
+    generation_id: str = ""
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    # Only OpenRouter reports these: which upstream actually ran the model, and what the
+    # call cost. The others leave both unset rather than have them guessed at.
+    upstream_provider: str = ""
+    cost: float | None = None
+
+
 class LLMResponse(str):
     """String-like LLM output that can carry provider metadata alongside content."""
 
-    def __new__(cls, content: str, reasoning_details=None):
-        obj = str.__new__(cls, content)
+    def __new__(cls, content: str | None, reasoning_details=None,
+                meta: "CallMetadata | None" = None):
+        # `content or ""` because a provider may answer with a null content - a pure
+        # refusal, or a reply that was all reasoning and no text. `str.__new__(cls, None)`
+        # would quietly produce the four-character string "None" and hand it downstream to
+        # be parsed as a design.
+        obj = str.__new__(cls, content or "")
         obj.reasoning_details = reasoning_details
+        obj.meta = meta or CallMetadata()
         return obj
+
+
+def _int(value) -> int | None:
+    """Token counts arrive as ints, as None, and occasionally as strings."""
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _float(value) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _openai_metadata(response) -> CallMetadata:
+    """Metadata from an OpenAI-shaped response: LiteLLM and Hugging Face's router.
+
+    Every field is read defensively. `usage` is optional in the OpenAI schema and several
+    community endpoints behind the HF router omit it, so a missing block has to mean
+    "unknown", never an exception on the path of every model call.
+    """
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "completion_tokens_details", None)
+    return CallMetadata(
+        model=getattr(response, "model", "") or "",
+        generation_id=getattr(response, "id", "") or "",
+        prompt_tokens=_int(getattr(usage, "prompt_tokens", None)),
+        completion_tokens=_int(getattr(usage, "completion_tokens", None)),
+        reasoning_tokens=_int(getattr(details, "reasoning_tokens", None)),
+    )
+
+
+def _openai_reasoning(message):
+    """The thinking trace, under whichever name the provider chose for it.
+
+    Not part of the OpenAI schema, so the SDK parks it in `model_extra`. Providers have
+    each picked a different key: `reasoning_content` (DeepSeek), `reasoning` (several
+    others), `reasoning_details` (OpenRouter's shape, which some proxies mirror).
+    """
+    extra = getattr(message, "model_extra", None) or {}
+    for key in ("reasoning_details", "reasoning_content", "reasoning"):
+        value = extra.get(key)
+        if value:
+            return value
+    return None
+
+
+def _gemini_metadata(response) -> CallMetadata:
+    usage = getattr(response, "usage_metadata", None)
+    return CallMetadata(
+        model=getattr(response, "model_version", "") or "",
+        generation_id=getattr(response, "response_id", "") or "",
+        prompt_tokens=_int(getattr(usage, "prompt_token_count", None)),
+        completion_tokens=_int(getattr(usage, "candidates_token_count", None)),
+        reasoning_tokens=_int(getattr(usage, "thoughts_token_count", None)),
+    )
+
+
+def _gemini_reasoning(response):
+    """Gemini returns thinking as ordinary parts flagged `thought=True`.
+
+    Only present when the model is asked for them, which this code deliberately does not
+    do: `thinking_config` is rejected outright by models that do not support thinking, and
+    silently breaking the Gemini path to collect telemetry is the wrong trade. The
+    `thoughts_token_count` in usage still records that thinking happened either way.
+    """
+    thoughts = []
+    for candidate in getattr(response, "candidates", None) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            if getattr(part, "thought", False) and getattr(part, "text", None):
+                thoughts.append({"type": "reasoning.text", "text": part.text})
+    return thoughts or None
 
 
 def _assistant_message_from_llm(
@@ -221,7 +328,11 @@ def _call_gemini(sys_prompt: str, messages: list) -> str:
     response = gemini_client.models.generate_content(
         model=GOOGLE_MODEL, contents=gemini_messages, config=config
     )
-    return response.text
+    return LLMResponse(
+        response.text,
+        reasoning_details=_gemini_reasoning(response),
+        meta=_gemini_metadata(response),
+    )
 
 
 def _call_litellm(sys_prompt: str, messages: list) -> str:
@@ -231,7 +342,12 @@ def _call_litellm(sys_prompt: str, messages: list) -> str:
         timeout=LLM_TIMEOUT_SECONDS,
         temperature=LLM_TEMPERATURE,
     )
-    return response.choices[0].message.content
+    message = response.choices[0].message
+    return LLMResponse(
+        message.content,
+        reasoning_details=_openai_reasoning(message),
+        meta=_openai_metadata(response),
+    )
 
 
 def _call_huggingface(sys_prompt: str, messages: list) -> str:
@@ -256,7 +372,12 @@ def _call_huggingface(sys_prompt: str, messages: list) -> str:
         timeout=LLM_TIMEOUT_SECONDS,
         temperature=LLM_TEMPERATURE,
     )
-    return response.choices[0].message.content
+    message = response.choices[0].message
+    return LLMResponse(
+        message.content,
+        reasoning_details=_openai_reasoning(message),
+        meta=_openai_metadata(response),
+    )
 
 
 def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
@@ -299,9 +420,27 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
 
     response_json = response.json()
     message = response_json["choices"][0]["message"]
+    usage = response_json.get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
     return LLMResponse(
-        message.get("content", ""),
+        message.get("content"),
         reasoning_details=message.get("reasoning_details"),
+        meta=CallMetadata(
+            # OpenRouter routes: the model that answered is often not the one asked for,
+            # and on the free tier it can change between two calls in the same turn.
+            model=str(response_json.get("model") or ""),
+            generation_id=str(response_json.get("id") or ""),
+            prompt_tokens=_int(usage.get("prompt_tokens")),
+            completion_tokens=_int(usage.get("completion_tokens")),
+            reasoning_tokens=_int(details.get("reasoning_tokens")),
+            # Which upstream ran it - DeepInfra, Together, and so on. Two samples from the
+            # same model name are not necessarily from the same deployment of it.
+            upstream_provider=str(response_json.get("provider") or ""),
+            # Confirmed against a live response: the cost is in the body, so knowing what a
+            # run cost needs no second call to the /generation endpoint. Free-tier models
+            # report 0.
+            cost=_float(usage.get("cost")),
+        ),
     )
 
 
@@ -426,11 +565,21 @@ def call_llm(sys_prompt: str, messages: list, *, node: str = "unknown",
         )
         raise
 
+    # `getattr` rather than `response.meta`: a provider path could return a bare string,
+    # and so does every test fake that stubs one out.
+    meta = getattr(response, "meta", None) or CallMetadata()
     corpus.record_llm_call(
         **common,
         completion=str(response),
         reasoning=getattr(response, "reasoning_details", None),
         latency_ms=int((time.monotonic() - started) * 1000),
+        model_served=meta.model,
+        generation_id=meta.generation_id,
+        prompt_tokens=meta.prompt_tokens,
+        completion_tokens=meta.completion_tokens,
+        reasoning_tokens=meta.reasoning_tokens,
+        upstream_provider=meta.upstream_provider,
+        cost=meta.cost,
     )
     return response
 
