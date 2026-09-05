@@ -163,3 +163,23 @@ CREATE TABLE IF NOT EXISTS interactions (
 CREATE INDEX IF NOT EXISTS idx_interactions_run    ON interactions(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_interactions_thread ON interactions(thread_id, asked_at);
 CREATE INDEX IF NOT EXISTS idx_interactions_kind   ON interactions(kind, answered_at);
+
+-- Quality judgements, derived rather than observed.
+--
+-- Kept apart from the facts they are derived from, and stamped with the scorer that
+-- produced them, because standards move: what counts as a sample worth training on in a
+-- month's time is not what counts today. Rebuilding these is a re-run, not a migration,
+-- and an old label stays comparable because it says which scorer wrote it.
+CREATE TABLE IF NOT EXISTS labels (
+  label_id       TEXT PRIMARY KEY,
+  sample_id      TEXT,                       -- NULL for a run-level judgement
+  run_id         TEXT,
+  name           TEXT NOT NULL,              -- parsed_ok | lint_clean | tests_passed | ...
+  value          REAL NOT NULL,              -- 1/0 for a yes-or-no, otherwise a count
+  detail         TEXT,
+  scorer_version TEXT NOT NULL,
+  computed_at    TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_labels_unique
+  ON labels(COALESCE(sample_id, ''), COALESCE(run_id, ''), name, scorer_version);
+CREATE INDEX IF NOT EXISTS idx_labels_name ON labels(name, value);
