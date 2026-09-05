@@ -62,8 +62,14 @@ class FakeLLM:
     def __init__(self, dsl_sequence: list[str]):
         self.dsl_sequence = list(dsl_sequence)
         self.calls: list[str] = []
+        # What each call said it was. `call_llm` takes this so every model call can be
+        # attributed to the node that made it; recording it here lets a test assert the
+        # attribution without standing up a provider.
+        self.nodes: list[str] = []
 
-    def __call__(self, sys_prompt: str, messages: list) -> str:
+    def __call__(self, sys_prompt: str, messages: list, *, node: str = "unknown",
+                 attempt: int = 1, purpose: str = "") -> str:
+        self.nodes.append(node)
         # Match on prompt identity; substring sniffing is too fragile because
         # these prompts share a lot of vocabulary.
         if sys_prompt is agent.PROMPT_INTENT:
@@ -356,15 +362,19 @@ class PlannerFake(FakeLLM):
         self.planner_replies = list(planner_replies)
         self.planner_prompts: list[list] = []
 
-    def __call__(self, sys_prompt: str, messages: list) -> str:
+    def __call__(self, sys_prompt: str, messages: list, *, node: str = "unknown",
+                 attempt: int = 1, purpose: str = "") -> str:
         if sys_prompt is agent.PROMPT_PLANNER:
+            self.nodes.append(node)
             self.calls.append("planner")
             self.planner_prompts.append(list(messages))
             return self.planner_replies.pop(0) if self.planner_replies else ""
         if sys_prompt is agent.PROMPT_BUILDER:
+            self.nodes.append(node)
             self.calls.append("builder")
             return planner_payload(GOOD_DSL)
-        return super().__call__(sys_prompt, messages)
+        return super().__call__(sys_prompt, messages, node=node, attempt=attempt,
+                                purpose=purpose)
 
 
 def approved_run(monkeypatch, fake, tmp_path):

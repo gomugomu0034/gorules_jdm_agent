@@ -23,8 +23,12 @@ async def generate_test_suite(content: dict) -> list[dict]:
     existing_jdm = json.dumps(content)
     user_prompt = PROMPT_TEST_USER.format(existing_jdm=existing_jdm)
 
+    # Reached straight from the API as well as from the agent, so it is the one model call
+    # that can happen with no agent turn around it. `api/tests.py` opens a corpus run scope
+    # for the API path; from the agent it inherits the turn's own.
     raw = await anyio.to_thread.run_sync(
-        lambda: call_llm(PROMPT_TEST, [HumanMessage(content=user_prompt)])
+        lambda: call_llm(PROMPT_TEST, [HumanMessage(content=user_prompt)],
+                         node="test_generation", purpose="generate_suite")
     )
     text = _extract_bounded_text(
         raw, "---TESTS STARTS---", "---TESTS ENDS---", strip_lang="json"

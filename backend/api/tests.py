@@ -5,7 +5,7 @@ from __future__ import annotations
 import anyio
 from fastapi import APIRouter, Depends, Request, Response, status
 
-from backend import auth
+from backend import auth, corpus
 from backend.api.errors import ApiError
 from backend.api.graphs import require_graph
 from backend.db import dao
@@ -134,8 +134,18 @@ async def generate_tests(
         )
 
     try:
+        # Its own corpus run: reached straight from the API, so there is no agent turn to
+        # attribute the call to, and a sample with no run at all loses the graph it was
+        # generated for.
         async with chat_runner.generating(graph_id):
-            tests = await generate_test_suite(graph["content"])
+            with corpus.run_scope(corpus.new_run_id(), graph_id=graph_id, owner=owner):
+                corpus.observe(intent="TEST", mode="EXISTING")
+                try:
+                    tests = await generate_test_suite(graph["content"])
+                    corpus.observe(outcome="completed")
+                except BaseException:
+                    corpus.observe(outcome="error")
+                    raise
     except RateLimited as exc:
         raise ApiError("LLM_RATE_LIMITED", f"The model provider is rate limiting: {exc}", 429) from exc
     except Exception as exc:  # noqa: BLE001

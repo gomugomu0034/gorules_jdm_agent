@@ -1,0 +1,91 @@
+-- Training-corpus schema.
+--
+-- Deliberately a separate database file from `studio.db`. Three reasons, in order of
+-- weight:
+--
+--   1. `chat_events` is ON DELETE CASCADE from `chat_threads`, so the studio's own record
+--      of a run is destroyed when a user tidies up their chat list. A corpus accumulated
+--      over months cannot hang off a row the UI invites people to delete.
+--   2. It is the unit you hand to a training run, so it wants to be one file to copy.
+--   3. It can be written with plain synchronous sqlite3 from the worker thread the LLM
+--      call already runs on - no event loop, no contention with the app's aiosqlite pool.
+--
+-- The cost is no foreign keys across the boundary: run/thread/graph ids are opaque
+-- strings here. That is the right trade. A corpus must not break because the graph it
+-- describes was deleted.
+--
+-- Applied with executescript() on every boot, so every statement is idempotent. Later
+-- phases add their tables to this same file.
+
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=5000;
+
+-- One row per agent turn. Opened when the turn starts and completed when it ends, so a
+-- run left with outcome NULL is one whose process died mid-turn - itself a signal worth
+-- keeping rather than repairing.
+CREATE TABLE IF NOT EXISTS runs (
+  run_id         TEXT PRIMARY KEY,
+  thread_id      TEXT NOT NULL,
+  graph_id       TEXT,
+  -- Hashed, never raw: a guest owner is `guest:<secrets.token_urlsafe(16)>`, which is the
+  -- visitor's identity. The corpus needs to tell runs apart, not to know whose they were.
+  owner_hash     TEXT NOT NULL DEFAULT '',
+  intent         TEXT NOT NULL DEFAULT '',   -- CREATE | MODIFY | TEST | EXPLAIN | LINT
+  mode           TEXT NOT NULL DEFAULT '',   -- NEW | EXISTING
+  outcome        TEXT,                       -- completed | error | cancelled | NULL if in flight
+  app_version    TEXT NOT NULL DEFAULT '',
+  git_sha        TEXT NOT NULL DEFAULT '',
+  final_jdm_hash TEXT,                       -- the artifact the turn settled on
+  started_at     TEXT NOT NULL,
+  ended_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_thread  ON runs(thread_id);
+
+-- System prompts, content-addressed.
+--
+-- PROMPT_PLANNER renders to 46KB and PROMPT_BUILDER to 32KB, and a single turn can spend
+-- five calls. Stored inline that is megabytes of duplication per hundred runs. Stored by
+-- hash it is one row - and the hash doubles as the prompt's version, which is what lets a
+-- training set be filtered to one instruction set instead of silently mixing several.
+CREATE TABLE IF NOT EXISTS prompts (
+  hash          TEXT PRIMARY KEY,            -- sha256 of `text`
+  kind          TEXT NOT NULL DEFAULT '',    -- planner | builder | triage | patch | ...
+  text          TEXT NOT NULL,
+  chars         INTEGER NOT NULL DEFAULT 0,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at  TEXT NOT NULL
+);
+
+-- One row per model call. This is the training unit; everything else exists to group it
+-- or to score it.
+--
+-- The columns for provider metadata that Phase 2 fills - model_served, the token counts,
+-- generation_id - are declared here and left NULL, so that phase is purely additive.
+CREATE TABLE IF NOT EXISTS samples (
+  sample_id         TEXT PRIMARY KEY,
+  run_id            TEXT,                    -- NULL for a call made outside an agent turn
+  seq               INTEGER NOT NULL DEFAULT 0,
+  node              TEXT NOT NULL,           -- the attribution that did not exist before
+  attempt           INTEGER NOT NULL DEFAULT 1,
+  purpose           TEXT NOT NULL DEFAULT '',
+  prompt_hash       TEXT,                    -- -> prompts.hash
+  messages_json     TEXT NOT NULL,           -- the request, system prompt excluded
+  completion        TEXT,                    -- raw, before extraction strips it
+  reasoning_json    TEXT,                    -- the model's thinking, when the provider returns it
+  provider          TEXT NOT NULL DEFAULT '',
+  model_requested   TEXT NOT NULL DEFAULT '',
+  model_served      TEXT,                    -- phase 2: differs under OpenRouter routing
+  temperature       REAL,
+  reasoning_enabled INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens     INTEGER,                 -- phase 2
+  completion_tokens INTEGER,                 -- phase 2
+  reasoning_tokens  INTEGER,                 -- phase 2
+  generation_id     TEXT,                    -- phase 2
+  latency_ms        INTEGER,
+  error             TEXT,                    -- set when the call raised; completion is then NULL
+  created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_samples_run     ON samples(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_samples_node    ON samples(node, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_samples_prompt  ON samples(prompt_hash);

@@ -19,6 +19,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
 from backend.config import settings
+from backend import corpus
 from backend.db import dao
 from backend.services import event_bus
 
@@ -294,7 +295,49 @@ async def _launch(thread_id: str, payload) -> str:
     return run_id
 
 
+async def _observe_identity(thread_id: str) -> None:
+    """Note which graph and owner the finished turn belonged to.
+
+    Read from the thread row rather than the payload, because a resume arrives as a
+    `Command` with no canvas state on it - and afterwards rather than before, for two
+    reasons. It is more accurate: a turn that starts on a blank canvas can attach a graph
+    part-way through. And it keeps a database read off the front of the turn, where it
+    delayed the first event long enough that a client polling for one could still be
+    seeing the *previous* turn's log.
+    """
+    try:
+        thread = await dao.get_thread(thread_id)
+    except Exception:  # noqa: BLE001
+        return
+    if thread is not None:
+        corpus.observe(graph_id=thread.get("graph_id"),
+                       owner_hash=corpus.hash_owner(thread.get("owner_id")))
+
+
 async def _run(thread_id: str, run_id: str, payload) -> None:
+    """Execute one turn inside a corpus scope, so every model call it makes is attributed.
+
+    The scope has to be entered here rather than deeper in: LangGraph dispatches sync nodes
+    through `copy_context()`, so a context variable set on this task is visible inside the
+    worker thread each node runs on - but only if it was set before the graph was streamed.
+    Entering it costs no await, so the turn starts exactly as promptly as it did before.
+    """
+    with corpus.run_scope(run_id, thread_id=thread_id):
+        try:
+            await _execute_turn(thread_id, run_id, payload)
+        finally:
+            try:
+                await _observe_identity(thread_id)
+            except asyncio.CancelledError:
+                # A hard stop arriving mid-read still has to cancel the task. Swallowing
+                # it here would make the run silently uncancellable.
+                raise
+            except Exception:  # noqa: BLE001
+                # Telemetry must never be what turns a finished turn into a failed one.
+                pass
+
+
+async def _execute_turn(thread_id: str, run_id: str, payload) -> None:
     """Execute one turn, translating graph activity into events."""
     from backend.agent_runtime import get_graph
 
@@ -343,6 +386,13 @@ async def _run(thread_id: str, run_id: str, payload) -> None:
 
     # Decide how the turn ended.
     state = await graph.aget_state(config)
+    # Only knowable now: the router settles the intent, and the artifact is whatever the
+    # turn built. Both are what make a sample filterable later.
+    corpus.observe(
+        intent=state.values.get("intent"),
+        mode=state.values.get("mode"),
+        final_jdm=state.values.get("jdm_json"),
+    )
     interrupt_payload = _pending_interrupt(state)
 
     # A freshly built graph is announced as soon as it exists - which is at the
@@ -530,6 +580,9 @@ async def _record_proposal(thread_id: str, values: dict, emit) -> None:
 
 
 async def _finish(thread_id: str, emit, status: str) -> None:
+    # Every terminal path goes through here, including the timeout and error branches that
+    # return before the state read - which is why the outcome is noted here and not there.
+    corpus.observe(outcome=status)
     await dao.set_thread_status(thread_id, status if status == "awaiting_input" else "idle")
     await emit({"type": "done", "status": status})
 

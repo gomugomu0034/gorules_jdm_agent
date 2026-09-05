@@ -16,6 +16,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = Path(__file__).resolve().parent
 
+_DEFAULT_CORPUS_DB = str(REPO_ROOT / "data" / "corpus.db")
+
 # Used when SESSION_SECRET is unset. Sessions then last only until restart.
 _EPHEMERAL_SECRET = secrets.token_urlsafe(32)
 
@@ -49,6 +51,15 @@ class Settings(BaseSettings):
     agent_run_timeout: int = 900  # hard wall-clock budget for one agent run
     llm_timeout: int = 120
 
+    # Training corpus.
+    # Its own database file, not `db_path`: `chat_events` cascades away with the thread it
+    # belongs to, and a corpus accumulated over months must not be deleted by a user
+    # tidying up their chat list. See backend/corpus/schema.sql for the rest of the why.
+    corpus_db_path: str = _DEFAULT_CORPUS_DB
+    # On by default. An empty corpus is the failure mode here, not a full one, and
+    # everything it records is already on this machine.
+    corpus_capture: str = "on"
+
     # Rate limits (slowapi syntax)
     rate_limit_default: str = "120/minute"
     rate_limit_llm: str = "10/minute"
@@ -71,6 +82,22 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def corpus_enabled(self) -> bool:
+        return self.corpus_capture.strip().lower() not in {"off", "0", "false", "no", ""}
+
+    @property
+    def corpus_db_file(self) -> Path:
+        """Where the corpus is written, with an empty override treated as unset.
+
+        `CORPUS_DB_PATH=` left blank is what copying .env.example produces, and pydantic
+        reads it as "". `Path("")` is `.` - a directory - which SQLite cannot open, so
+        every write raises, `store._never_fails` swallows it, and after three strikes
+        capture turns itself off for the process. Nothing is recorded and nothing says so
+        beyond a warning in the log.
+        """
+        return Path(self.corpus_db_path.strip() or _DEFAULT_CORPUS_DB)
 
     @property
     def db_file(self) -> Path:

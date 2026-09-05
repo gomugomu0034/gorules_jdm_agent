@@ -34,6 +34,7 @@ from backend.prompts.test_node_prompt import PROMPT_TEST, PROMPT_TEST_USER, PROM
 from backend.prompts.intent_router_prompt import PROMPT_INTENT
 from backend.prompts.patch_node_prompt import PROMPT_PATCH, PROMPT_PATCH_USER
 
+from backend import corpus
 from backend.tools.markdown_dsl_parser import DslError, parse_markdown_dsl
 from backend.tools.diagnostics import (
     KIND_HEADINGS,
@@ -334,10 +335,7 @@ def _provider_message(response) -> str:
     return ""
 
 
-def call_llm(sys_prompt: str, messages: list) -> str:
-    """Routes the request to the active LLM provider and returns the string response."""
-    if LLM_INIT_ERROR:
-        raise RuntimeError(LLM_INIT_ERROR)
+def _dispatch(sys_prompt: str, messages: list):
     if ACTIVE_PROVIDER == "gemini":
         return _call_gemini(sys_prompt, messages)
     elif ACTIVE_PROVIDER == "litellm":
@@ -347,6 +345,94 @@ def call_llm(sys_prompt: str, messages: list) -> str:
     elif ACTIVE_PROVIDER == "openrouter":
         return _call_openrouter(sys_prompt, messages)
     raise ValueError(f"Unsupported LLM_PROVIDER: {ACTIVE_PROVIDER}")
+
+
+def _active_model() -> str:
+    """The model this provider was asked for.
+
+    Only ever a *request*: OpenRouter may route to something else, and recording what
+    actually served the call is Phase 2's job.
+    """
+    return {
+        "gemini": GOOGLE_MODEL,
+        "litellm": LITELLM_MODEL_NAME,
+        "huggingface": HUGGINGFACE_MODEL_NAME,
+        "openrouter": OPENROUTER_MODEL_NAME,
+    }.get(ACTIVE_PROVIDER) or ""
+
+
+def _messages_for_corpus(messages: list) -> list[dict]:
+    """The request in canonical role/content form, system prompt excluded.
+
+    Not `_format_chat_messages`: that renders per provider and inlines the system prompt,
+    which the corpus stores once by hash rather than on every row. The `internal` flag is
+    kept because it marks the builder's own retry context - the difference between a first
+    attempt and a repair is exactly what makes these samples worth having.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            out.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            entry = {"role": "assistant", "content": msg.content}
+            extra = getattr(msg, "additional_kwargs", None) or {}
+            if extra.get("internal"):
+                entry["internal"] = True
+            if extra.get("reasoning_details") is not None:
+                entry["reasoning_details"] = extra["reasoning_details"]
+            out.append(entry)
+    return out
+
+
+def call_llm(sys_prompt: str, messages: list, *, node: str = "unknown",
+             attempt: int = 1, purpose: str = "") -> str:
+    """Routes the request to the active LLM provider and returns the string response.
+
+    Also the one place every model call in the codebase is recorded for fine-tuning.
+    `node` is the attribution that made that possible: without it the planner, builder,
+    triage and patch calls are indistinguishable at the point of the call, and a corpus
+    you cannot split by task is one you cannot train a planner on.
+
+    Capture never affects the result. `backend.corpus` swallows its own failures, and the
+    provider's return value is passed back untouched - `_call_openrouter` returns an
+    `LLMResponse` carrying reasoning, and stringifying it here would silently drop the
+    model's thinking from every downstream turn.
+    """
+    if LLM_INIT_ERROR:
+        raise RuntimeError(LLM_INIT_ERROR)
+
+    started = time.monotonic()
+    common = {
+        "node": node,
+        "attempt": attempt,
+        "purpose": purpose,
+        "system_prompt": sys_prompt,
+        "messages": _messages_for_corpus(messages),
+        "provider": ACTIVE_PROVIDER,
+        "model_requested": _active_model(),
+        "temperature": LLM_TEMPERATURE,
+        "reasoning_enabled": ACTIVE_PROVIDER == "openrouter" and OPENROUTER_REASONING_ENABLED,
+    }
+
+    try:
+        response = _dispatch(sys_prompt, messages)
+    except Exception as exc:
+        # A refusal is a sample too: a rate limit, a timeout and a malformed request are
+        # all things worth being able to count later.
+        corpus.record_llm_call(
+            **common,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+
+    corpus.record_llm_call(
+        **common,
+        completion=str(response),
+        reasoning=getattr(response, "reasoning_details", None),
+        latency_ms=int((time.monotonic() - started) * 1000),
+    )
+    return response
 
 
 # ==========================================
@@ -635,7 +721,7 @@ def _classify_intent(text: str, has_graph: bool) -> tuple[str, float]:
         return "MODIFY", 0.85
 
     try:
-        raw = call_llm(PROMPT_INTENT, [HumanMessage(content=text)])
+        raw = call_llm(PROMPT_INTENT, [HumanMessage(content=text)], node="intent_router_node")
         parsed = json.loads(_extract_single_json(raw))
         intent = str(parsed.get("intent", "")).upper()
         if intent in ("CREATE", "MODIFY", "TEST", "EXPLAIN", "LINT"):
@@ -684,7 +770,7 @@ def explain_node(state: AgentState):
     user_prompt = _inject_jdm(PROMPT_EXPLAIN_USER, existing_jdm)
 
     messages = [HumanMessage(content=user_prompt)]
-    explanation = call_llm(PROMPT_EXPLAIN, messages)
+    explanation = call_llm(PROMPT_EXPLAIN, messages, node="explain_node")
 
     # 4. Format the final UI Message
     # Notice the mandatory empty lines inside the <details> tags to ensure Streamlit parses the markdown correctly!
@@ -717,7 +803,7 @@ def modify_triage_node(state: AgentState):
     prompt = _inject_jdm(PROMPT_MODIFY_TRIAGE, existing_jdm)
     # Call the LLM with the custom modification prompt + the conversation history
     # Note: Replace call_llm with however your function is named
-    response_text = call_llm(prompt, state["messages"])
+    response_text = call_llm(prompt, state["messages"], node="modify_triage_node")
     clean_json = _extract_single_json(response_text)
     try:
         parsed = json.loads(clean_json)
@@ -765,7 +851,8 @@ def test_node(state: AgentState):
         _emit({"type": "progress", "node": "test_node", "attempt": 1, "max_attempts": 1,
                "phase": "llm", "message": "Writing test cases for this policy"})
         user_prompt = _inject_jdm(PROMPT_TEST_USER, existing_jdm)
-        content = call_llm(PROMPT_TEST, [HumanMessage(content=user_prompt)])
+        content = call_llm(PROMPT_TEST, [HumanMessage(content=user_prompt)],
+                           node="test_node", purpose="generate_suite")
         test_suite_json = _extract_bounded_text(
             content, "---TESTS STARTS---", "---TESTS ENDS---", strip_lang="json"
         ) or "[]"
@@ -911,7 +998,7 @@ def lint_node(state: AgentState):
 def triage_node(state: AgentState):
     print(f"\n[Step 1: Triage]: Evaluating requirements using {ACTIVE_PROVIDER.upper()}...")
 
-    response_text = call_llm(PROMPT_TRIAGE, state["messages"])
+    response_text = call_llm(PROMPT_TRIAGE, state["messages"], node="triage_node")
     clean_json = _extract_single_json(response_text)
 
     try:
@@ -1063,7 +1150,8 @@ def planner_node(state: AgentState):
         messages_for_planner.append(HumanMessage(content=_REPLAN_INSTRUCTION))
 
     # Call your LLM using messages_for_planner instead of state["messages"]
-    content = call_llm(PROMPT_PLANNER, messages_for_planner)
+    content = call_llm(PROMPT_PLANNER, messages_for_planner, node="planner_node",
+                       attempt=spent + 1, purpose="replan" if retrying else "plan")
     print(f"planner node content: {content}")
 
     # Use the robust extraction
@@ -1189,7 +1277,9 @@ def patch_node(state: AgentState):
                "message": "Working out the smallest change" if attempt == 0
                           else f"Revising the edit after attempt {attempt}"})
 
-        content = call_llm(PROMPT_PATCH, context)
+        content = call_llm(PROMPT_PATCH, context, node="patch_node",
+                           attempt=attempt + 1,
+                           purpose="patch" if attempt == 0 else "repair")
         new_messages.append(_assistant_message_from_llm(content, internal=True))
         context.append(_assistant_message_from_llm(content))
 
@@ -1335,7 +1425,10 @@ def builder_node(state: AgentState):
             print(f"  --> [Attempt {attempt}]: Calling LLM to fix errors...")
             progress("llm", f"Revising the graph after attempt {attempt}")
 
-            content = call_llm(PROMPT_BUILDER, context)
+            # `attempt + 1` matches the number the progress event shows the user, so a
+            # corpus row can be lined up against what they actually saw happen.
+            content = call_llm(PROMPT_BUILDER, context, node="builder_node",
+                               attempt=attempt + 1, purpose="repair")
             new_messages.append(_assistant_message_from_llm(content, internal=True))
             context.append(_assistant_message_from_llm(content))
 
