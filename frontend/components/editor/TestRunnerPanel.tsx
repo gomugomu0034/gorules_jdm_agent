@@ -1,20 +1,13 @@
 'use client';
 
-import {
-  AlertTriangle,
-  ChevronRight,
-  CircleSlash,
-  Play,
-  Sparkles,
-  XCircle,
-  CheckCircle2,
-} from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronRight, CircleSlash, Play, Plus, Sparkles, XCircle } from 'lucide-react';
 import { useState } from 'react';
 
 import type { TestResult } from '../../lib/types';
 import { useChatStore } from '../../stores/useChatStore';
 import { useGraphStore } from '../../stores/useGraphStore';
 import { Badge, Button, EmptyState, cx } from '../ui';
+import { ManualTestForm } from './ManualTestForm';
 
 const ICONS = {
   passed: <CheckCircle2 size={14} className="text-success" />,
@@ -25,7 +18,7 @@ const ICONS = {
 
 export function TestRunnerPanel() {
   const {
-    graph, tests, testReport, revision, testReportRevision,
+    graph, tests, content, testReport, revision, testReportRevision, saveTests,
     generatingTests, runTests, generateTests,
   } = useGraphStore();
   // Generating a suite is a model call, and so is a turn of the conversation. One API key
@@ -36,6 +29,7 @@ export function TestRunnerPanel() {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [writing, setWriting] = useState(false);
 
   const run = async () => {
     setRunning(true);
@@ -70,6 +64,13 @@ export function TestRunnerPanel() {
         </Button>
         <Button
           size="sm"
+          icon={<Plus size={12} />}
+          onClick={() => setWriting((open) => !open)}
+        >
+          New
+        </Button>
+        <Button
+          size="sm"
           icon={<Sparkles size={12} />}
           onClick={generate}
           loading={generatingTests}
@@ -96,6 +97,20 @@ export function TestRunnerPanel() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto">
+        {writing ? (
+          <ManualTestForm
+            content={content}
+            onCancel={() => setWriting(false)}
+            onSave={(test) => {
+              // Appended to the suite the panel already holds, and saved through the same
+              // path a generated suite takes - a draft keeps them in memory until it is
+              // named, a saved policy writes them straight through.
+              void saveTests([...tests, { ...test, order: tests.length }]);
+              setWriting(false);
+            }}
+          />
+        ) : null}
+
         {error ? (
           <div className="m-3 rounded border border-border bg-danger-subtle p-3 text-xs text-danger">
             {error}

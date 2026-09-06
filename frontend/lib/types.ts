@@ -168,6 +168,7 @@ export type ChatEvent =
       test_report: TestRunReport | null;
     }
   | { seq: number; type: 'test_report'; report: TestRunReport; generated?: boolean }
+  | { seq: number; type: 'lint_report'; findings: LintFinding[] }
   | { seq: number; type: 'error'; code: string; message: string; node?: string; recoverable: boolean }
   | {
       seq: number;
@@ -194,4 +195,19 @@ export type AcceptProposalResult = {
   name?: string;
   content?: DecisionGraphType;
   tests?: TestCase[];
+};
+
+
+/** What `POST /api/tests/check` makes of one draft case. Three answers, because a case
+ *  can be wrong three ways: the graph would not run it, it asserts a field the graph
+ *  cannot produce, or it ran and disagreed. */
+export type CheckTestResult = {
+  ran: boolean;
+  actual: unknown;
+  matches: boolean;
+  mismatches: Mismatch[];
+  unknown_fields: string[];
+  produces: string[];
+  accepts: string[];
+  error: string | null;
 };

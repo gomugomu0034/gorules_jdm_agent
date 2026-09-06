@@ -5,6 +5,8 @@ import { create } from 'zustand';
 
 import { api, AppError } from '../lib/api';
 import { createEventStream } from '../lib/sse';
+import { useGraphStore } from './useGraphStore';
+import { useUiStore } from './useUiStore';
 import type {
   ChatEvent,
   ChatMessage,
@@ -280,8 +282,21 @@ function apply(set: Setter, get: () => ChatState, event: ChatEvent) {
       });
       break;
 
-    case 'test_report':
+    case 'test_report': {
       set({ testReport: event.report });
+      // Also into the graph store, which is where the Tests tab reads from - until now an
+      // agent-run suite was recorded in the conversation and the panel beside it stayed
+      // empty. Then put the reader in front of it: they asked for a test run, and a table
+      // in the chat is a description of the answer rather than the answer.
+      const graph = useGraphStore.getState();
+      graph.setTestReport(event.report);
+      useUiStore.getState().setAssistantTab('tests');
+      break;
+    }
+
+    case 'lint_report':
+      useGraphStore.getState().setLint(event.findings);
+      useUiStore.getState().setAssistantTab('problems');
       break;
 
     case 'error':

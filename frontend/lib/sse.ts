@@ -1,6 +1,31 @@
 import { apiUrl } from './api';
 import type { ChatEvent } from './types';
 
+/**
+ * Every frame type the agent emits.
+ *
+ * `_frame` names each frame with its own type, and `EventSource` routes a named frame only
+ * to a listener registered for that name - `onmessage` never sees it. So a type missing
+ * from this list is not degraded, it is silently dropped: `lint_report` was added to the
+ * backend, arrived on the wire, and simply never reached the store.
+ *
+ * `test_lint_findings_reach_the_panel` in the backend suite reads this array and fails if
+ * the agent learns to emit something the browser is not listening for.
+ */
+export const STREAM_EVENT_TYPES = [
+  'run_started',
+  'node_start',
+  'node_end',
+  'progress',
+  'message',
+  'interrupt',
+  'graph_proposed',
+  'test_report',
+  'lint_report',
+  'error',
+  'done',
+] as const;
+
 type Options = {
   threadId: string;
   fromSeq: number;
@@ -70,19 +95,7 @@ export function createEventStream({ threadId, fromSeq, onEvent, onError, onGone 
     };
 
     source.onmessage = handle;
-    // The server names each frame, so listen for the union's members explicitly.
-    for (const type of [
-      'run_started',
-      'node_start',
-      'node_end',
-      'progress',
-      'message',
-      'interrupt',
-      'graph_proposed',
-      'test_report',
-      'error',
-      'done',
-    ]) {
+    for (const type of STREAM_EVENT_TYPES) {
       source.addEventListener(type, handle as EventListener);
     }
 

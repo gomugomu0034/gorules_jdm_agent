@@ -4,7 +4,13 @@ import type { DecisionGraphType } from '@gorules/jdm-editor';
 import { create } from 'zustand';
 
 import { api, AppError } from '../lib/api';
-import type { GraphDetail, TestCase, TestRunReport, VersionSummary } from '../lib/types';
+import type {
+  GraphDetail,
+  LintFinding,
+  TestCase,
+  TestRunReport,
+  VersionSummary,
+} from '../lib/types';
 
 const AUTOSAVE_DELAY = 3000;
 
@@ -47,6 +53,14 @@ type GraphState = {
    */
   revision: number;
   testReportRevision: number | null;
+  /** Lint findings and the canvas revision they describe. Held here rather than inside
+   *  `ProblemsPanel` because the agent produces them too: a LINT turn puts its findings
+   *  straight into the panel, and a panel that owned them privately could not be told. */
+  lintFindings: LintFinding[] | null;
+  lintRevision: number | null;
+  setLint: (findings: LintFinding[], revision?: number) => void;
+  /** A report the agent produced, stamped with the canvas it describes. */
+  setTestReport: (report: TestRunReport) => void;
   /** A model call outside the agent; the chat composer waits on it. */
   generatingTests: boolean;
   dirty: boolean;
@@ -103,6 +117,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   testReport: null,
   revision: 0,
   testReportRevision: null,
+  lintFindings: null,
+  lintRevision: null,
   generatingTests: false,
   dirty: false,
   saving: false,
@@ -114,6 +130,12 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   lastSavedAt: null,
 
   clearError: () => set({ error: null }),
+
+  setLint: (findings, revision) =>
+    set((s) => ({ lintFindings: findings, lintRevision: revision ?? s.revision })),
+
+  setTestReport: (report) =>
+    set((s) => ({ testReport: report, testReportRevision: s.revision })),
 
   load: async (id) => {
     set({ loading: true, error: null });
@@ -127,6 +149,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         loading: false,
         testReport: null,
         testReportRevision: null,
+        lintFindings: null,
+        lintRevision: null,
         revision: get().revision + 1,
         isDraft: false,
         draftName: null,
@@ -301,6 +325,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       versions: [],
       testReport: null,
       testReportRevision: null,
+      lintFindings: null,
+      lintRevision: null,
       revision: get().revision + 1,
       dirty: true,
       error: null,
@@ -347,6 +373,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       tests: [],
       testReport: null,
       testReportRevision: null,
+      lintFindings: null,
+      lintRevision: null,
       revision: get().revision + 1,
       dirty: false,
       isDraft: true,

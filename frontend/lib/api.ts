@@ -2,6 +2,7 @@ import type { DecisionGraphType } from '@gorules/jdm-editor';
 
 import type {
   AcceptProposalResult,
+  CheckTestResult,
   GraphDetail,
   GraphSummary,
   Proposal,
@@ -214,6 +215,13 @@ export const api = {
   // A draft has no graph row yet, so it is linted by content alone.
   lintContent: (content: DecisionGraphType) =>
     request<LintReport>('/api/lint', { method: 'POST', ...json({ content }) }),
+
+  /** Put one draft case to the live canvas without saving it. See `POST /api/tests/check`. */
+  checkTest: (content: DecisionGraphType, input: unknown, expectedOutput: unknown) =>
+    request<CheckTestResult>('/api/tests/check', {
+      method: 'POST',
+      body: JSON.stringify({ content, input, expectedOutput }),
+    }),
 
   runAdhocTests: (content: DecisionGraphType, tests: TestCase[]) =>
     request<TestRunReport>('/api/tests/run', { method: 'POST', ...json({ content, tests }) }),

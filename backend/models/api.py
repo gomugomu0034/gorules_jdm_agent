@@ -221,6 +221,34 @@ class TestRunResponse(BaseModel):
     results: list[dict[str, Any]]
 
 
+class CheckTestRequest(BaseModel):
+    """One draft case, put to the live canvas before anyone commits to it."""
+
+    content: dict[str, Any]
+    input: Any = Field(default_factory=dict)
+    expectedOutput: Any = Field(default_factory=dict)
+
+
+class CheckTestResponse(BaseModel):
+    """Three separate answers, because a case can be wrong in three separate ways.
+
+    `error` means the graph would not run the input at all - a missing required field, a
+    schema that rejects it - and neither of the other two answers means anything then.
+    `unknown_fields` names expectations the graph has no way to satisfy, which is almost
+    always a typo and would otherwise read as a policy bug. `mismatches` is the ordinary
+    case: it ran, and disagreed.
+    """
+
+    ran: bool
+    actual: Any = None
+    matches: bool = False
+    mismatches: list[dict[str, Any]] = Field(default_factory=list)
+    unknown_fields: list[str] = Field(default_factory=list)
+    produces: list[str] = Field(default_factory=list)
+    accepts: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
 # --------------------------------------------------------------------------
 # Chat
 # --------------------------------------------------------------------------

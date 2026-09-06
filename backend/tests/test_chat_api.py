@@ -452,3 +452,32 @@ def test_an_exhausted_quota_is_reported_as_a_quota_problem(client, tmp_path, mon
     assert body["code"] == "LLM_RATE_LIMITED"
     assert "free-models-per-day" in body["message"], "the provider's own words say which limit"
     assert "resets at" in body["message"]
+
+
+def test_every_event_the_agent_emits_is_one_the_browser_listens_for():
+    """`_frame` names each SSE frame with its own type, and `EventSource` routes a named
+    frame only to a listener registered for that exact name - `onmessage` never sees it.
+
+    So an event type the frontend does not know about is not degraded, it is silently
+    dropped. `lint_report` was added to `lint_node`, reached the wire, and never arrived:
+    the tab it was meant to fill stayed empty and nothing anywhere reported a problem.
+
+    Reads the frontend's own list rather than duplicating it, so the two cannot drift.
+    """
+    import re
+    from pathlib import Path
+
+    sse = Path("frontend/lib/sse.ts").read_text(encoding="utf-8")
+    block = sse.split("export const STREAM_EVENT_TYPES = [", 1)[1].split("]", 1)[0]
+    listening = set(re.findall(r"'([a-z_]+)'", block))
+    assert listening, "could not read STREAM_EVENT_TYPES"
+
+    emitted = set()
+    for source in ("backend/lang_graph_agent.py", "backend/services/chat_runner.py"):
+        emitted |= set(re.findall(r'"type":\s*"([a-z_]+)"', Path(source).read_text()))
+
+    missing = emitted - listening
+    assert not missing, (
+        f"the agent emits {sorted(missing)}, which the browser never registers a listener "
+        "for - those frames are dropped without a trace"
+    )

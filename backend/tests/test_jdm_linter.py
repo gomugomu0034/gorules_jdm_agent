@@ -557,3 +557,27 @@ def test_the_new_schema_rule_does_block_a_build():
     blockers = blocking(lint(graph))
 
     assert [b.code for b in blockers] == ["SCHEMA_REQUIRES_UNUSED_FIELD"]
+
+
+def test_the_lint_node_announces_its_findings_as_data():
+    """Prose in the chat is a description of the answer. The Problems tab needs the answer,
+    or asking the agent to check a policy leaves the panel beside it empty and the user
+    pressing Check to compute the same thing again.
+    """
+    from backend import lang_graph_agent as agent
+
+    emitted: list[dict] = []
+    original = agent._emit
+    agent._emit = emitted.append
+    try:
+        with open("backend/jdm_graphs/LoanApprovalPolicy_jdm.json") as handle:
+            graph = json.dumps(unquote_outputs(json.load(handle)))
+        agent.lint_node({"existing_jdm_json": graph, "selected_file": "Loan Approval"})
+    finally:
+        agent._emit = original
+
+    reports = [e for e in emitted if e.get("type") == "lint_report"]
+    assert len(reports) == 1
+    findings = reports[0]["findings"]
+    assert findings, "the same findings the message describes"
+    assert {"code", "severity", "message"} <= set(findings[0])

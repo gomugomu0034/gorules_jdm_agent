@@ -1228,6 +1228,10 @@ def lint_node(state: AgentState):
         run.diagnostics = [d.as_dict() for d in findings]
         run.output = {f"{s}s": sum(1 for d in findings if d.severity == s)
                       for s in ("error", "warning", "hint")}
+
+    # Sent as data as well as prose, so the Problems tab can show the findings the user
+    # just asked for instead of making them press Check to get the same answer again.
+    _emit({"type": "lint_report", "findings": [d.as_dict() for d in findings]})
     name = state.get("selected_file") or state.get("canvas_graph_name") or "this policy"
 
     if not findings:
