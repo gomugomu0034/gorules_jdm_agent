@@ -2209,6 +2209,11 @@ workflow.add_conditional_edges(
         "modify_triage_node": "modify_triage_node",  # MODIFY
         "test_node": "test_node",                  # TEST
         "explain_node": "explain_node",            # EXPLAIN
+        # Omitted until now, while `route_after_intent` happily returned it: asking the
+        # agent to lint anything raised KeyError('lint_node') and took the turn with it.
+        # The map and the router have to agree, which is what
+        # `test_every_intent_the_router_can_return_has_an_edge` now holds them to.
+        "lint_node": "lint_node",                  # LINT
     }
 )
 

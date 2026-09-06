@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import logging
 import uuid
 from typing import Any
 
 from backend.corpus import store
+from backend.tools.jdm_linter import interface_of
 
 logger = logging.getLogger(__name__)
 
@@ -32,72 +32,6 @@ logger = logging.getLogger(__name__)
 def _content(node: dict) -> dict:
     content = node.get("content")
     return content if isinstance(content, dict) else {}
-
-
-# ZEN keywords, literals and builtins, so a function call is not mistaken for a field.
-_NOT_A_FIELD = {
-    "and", "or", "not", "in", "true", "false", "null", "if", "then", "else",
-    "len", "sum", "avg", "min", "max", "abs", "round", "floor", "ceil", "count",
-    "contains", "startsWith", "endsWith", "matches", "upper", "lower", "trim",
-    "string", "number", "bool", "date", "time", "duration", "keys", "values",
-    "some", "all", "one", "none", "filter", "map", "flatMap", "type", "isNumeric",
-    "split", "extract", "fuzzyMatch", "d", "date_string", "$", "$root",
-}
-_IDENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(\()?")
-# Quoted values first: `condition == 'Digital'` names one field, not two, and a table full
-# of string cells otherwise yields a field list made mostly of its own answers.
-_LITERAL = re.compile(r"'[^']*'|\"[^\"]*\"")
-
-
-def _referenced(text: str) -> set[str]:
-    """Bare identifiers in an expression, excluding string literals, anything called like
-    a function, and the language's own vocabulary."""
-    found = set()
-    for name, called in _IDENT.findall(_LITERAL.sub(" ", text or "")):
-        if not called and name not in _NOT_A_FIELD:
-            found.add(name)
-    return found
-
-
-def interface_of(graph: dict) -> tuple[list[str], list[str]]:
-    """The field names a graph reads and writes, without any of its logic.
-
-    Decision tables declare their columns, so those come straight off `inputs`/`outputs`.
-    Expression nodes declare only what they *write*, and this codebase builds those far
-    more often than tables - so what an expression reads has to be recovered from the
-    expression text, or an expression-only graph offers the test author no input names at
-    all and it is left inventing them, which is the failure this whole module exists to
-    avoid. `schema` on the input and output nodes is usually an empty string and cannot be
-    relied on.
-    """
-    reads: set[str] = set()
-    writes: set[str] = set()
-    for node in graph.get("nodes") or []:
-        content = _content(node)
-        for column in content.get("inputs") or []:
-            field = (column.get("field") or "").strip()
-            if field:
-                reads.add(field.split(".")[0])
-        for column in content.get("outputs") or []:
-            field = (column.get("field") or "").strip()
-            if field:
-                writes.add(field.split(".")[0])
-        for expression in content.get("expressions") or []:
-            key = (expression.get("key") or "").strip()
-            if key:
-                writes.add(key.split(".")[0])
-            reads |= _referenced(str(expression.get("value") or ""))
-        for rule in content.get("rules") or []:
-            for key, value in (rule or {}).items():
-                # `_id` holds a UUID, and splitting one on its hyphens yields half a dozen
-                # things that look exactly like field names.
-                if key.startswith("_") or not isinstance(value, str):
-                    continue
-                reads |= _referenced(value)
-    # A field the graph writes and then reads back is an intermediate, not an input the
-    # caller supplies; offering it would invite tests that set it directly and bypass the
-    # policy on the way through.
-    return sorted(reads - writes), sorted(writes)
 
 
 def suite_id(requirement: str, reads: list[str], writes: list[str]) -> str:
