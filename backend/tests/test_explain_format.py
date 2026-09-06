@@ -111,6 +111,38 @@ def test_the_user_template_still_carries_the_graph():
 
 # ------------------------------------------------------------------- the plumbing
 
+def test_the_node_does_not_paste_the_file_back_around_the_answer(monkeypatch):
+    """The prompt was only half of it.
+
+    `explain_node` wrapped every reply in a Streamlit-era shell: a `<details>` block
+    holding the whole JDM file, a "Logic Explanation:" label, and the lot indented four
+    spaces - which markdown reads as a code block, so the explanation rendered as
+    preformatted text and the prose escaped only by accident. Fixing the prompt while that
+    stood would have changed nothing anyone could see.
+    """
+    from backend import lang_graph_agent as agent
+
+    monkeypatch.setattr(agent, "_dispatch",
+                        lambda *_a, **_k: "📋 What this policy decides\nIt decides refunds.")
+    graph = json.dumps({"contentType": "application/vnd.gorules.decision",
+                        "nodes": [{"id": "i", "name": "Request", "type": "inputNode",
+                                   "content": {"schema": ""}}],
+                        "edges": []})
+
+    body = agent.explain_node(
+        {"existing_jdm_json": graph, "selected_file": "Refund Policy"}
+    )["messages"][0].content
+
+    assert "```json" not in body, "the file is not pasted back"
+    assert "<details>" not in body and "Raw JDM" not in body
+    assert "Logic Explanation" not in body
+    assert not any(line.startswith("    ") for line in body.splitlines()), (
+        "four-space indentation turns the whole reply into a code block"
+    )
+    assert body.startswith("### Refund Policy"), "named, then answered"
+    assert "It decides refunds." in body
+
+
 def test_the_node_still_runs_and_returns_a_message(monkeypatch):
     """Format aside, `explain_node` has to keep working - it injects the graph into the
     user template and wraps the reply as a chat message."""

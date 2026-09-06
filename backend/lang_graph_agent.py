@@ -1000,36 +1000,21 @@ def explain_node(state: AgentState):
 
     print(f"\n[Explain Node]: Generating compulsory explanation for {filename}...")
 
-    # 1. Compact the JSON
-    try:
-        jdm_compact = json.dumps(json.loads(existing_jdm))
-    except Exception:
-        jdm_compact = existing_jdm.replace('\n', '').replace('\r', '')
-
-    # 2. Ask LLM for the explanation
     user_prompt = _inject_jdm(PROMPT_EXPLAIN_USER, existing_jdm)
+    explanation = call_llm(PROMPT_EXPLAIN, [HumanMessage(content=user_prompt)],
+                           node="explain_node")
 
-    messages = [HumanMessage(content=user_prompt)]
-    explanation = call_llm(PROMPT_EXPLAIN, messages, node="explain_node")
-
-    # 4. Format the final UI Message
-    # Notice the mandatory empty lines inside the <details> tags to ensure Streamlit parses the markdown correctly!
-    ui_message = f"""### 📖 Policy Analysis: `{filename}`
-    <details>
-    <summary><b>📜 Click to view Raw JDM Logic</b></summary>
-    
-    ```json
-    {jdm_compact}
-    ```
-    </details>
-    
-    Logic Explanation:
-    {explanation}
-    """
-    # Save the explanation to the chat history so the user can read it
-    # right before the action chips appear.
+    # The reply goes out as it was written, under a heading naming the policy.
+    #
+    # What used to be here was a Streamlit-era wrapper: a `<details>` block holding the
+    # whole JDM file, a "Logic Explanation:" label, and the entire thing indented four
+    # spaces - which markdown reads as a code block, so the explanation rendered as
+    # preformatted text with the prose escaping only by accident. Someone asking what their
+    # policy does was handed the file they already have, and the answer underneath it.
     return {
-        "messages": [_assistant_message_from_llm(ui_message)]
+        "messages": [_assistant_message_from_llm(
+            f"### {filename}\n\n{str(explanation).strip()}"
+        )]
     }
 
 

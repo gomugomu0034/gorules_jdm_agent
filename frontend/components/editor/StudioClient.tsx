@@ -13,7 +13,7 @@ import { api } from '../../lib/api';
 import { useChatStore } from '../../stores/useChatStore';
 import { useGraphStore } from '../../stores/useGraphStore';
 import { useUiStore } from '../../stores/useUiStore';
-import { ChatPane } from '../chat/ChatPane';
+import { AssistantPane } from '../chat/AssistantPane';
 import { Sidebar } from '../shell/Sidebar';
 import { TopBar } from '../shell/TopBar';
 import { SaveGraphDialog } from '../shell/SaveGraphDialog';
@@ -328,8 +328,11 @@ export function StudioClient({ graphId }: { graphId: string | null }) {
         {chatOpen ? (
           <>
             <ResizeHandle />
-            <Panel id="chat" defaultSize="26%" minSize="320px" maxSize="45%">
-              <ChatPane
+            {/* Wider than it was: it now carries the test runner and the linter as well
+                as the conversation, and a test result with its expected and actual columns
+                needs more room than a chat bubble. */}
+            <Panel id="chat" defaultSize="30%" minSize="360px" maxSize="50%">
+              <AssistantPane
                 canvas={content}
                 graphId={graphId}
                 graphName={graph?.name ?? draftName ?? null}
