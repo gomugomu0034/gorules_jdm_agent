@@ -1281,6 +1281,15 @@ def human_triage_review_node(state: AgentState):
         }
 
 # Step 2: Planner (Expert Analyst)
+def _has_cases(test_suite_json: str) -> bool:
+    """Is there an actual suite here, as opposed to nothing or an empty array?"""
+    try:
+        parsed = json.loads(test_suite_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, list) and len(parsed) > 0
+
+
 def _is_a_plan(dsl: str) -> bool:
     """Does this reply contain a design at all, as opposed to prose or nothing?
 
@@ -1691,11 +1700,29 @@ def builder_node(state: AgentState):
                 continue
             dsl_content = new_dsl
 
+            # The exam may be filled in while it is blank, and never rewritten once it is
+            # set. A repair that emits new tests used to *replace* the suite it was being
+            # judged against, so a model that could not fix the graph could pass by
+            # weakening the assertions instead - and the run was then recorded as a
+            # success, becoming the accepted half of a preference pair that teaches
+            # precisely the wrong lesson. Fixing the graph is the task; editing the exam
+            # is not.
             if not new_tests or new_tests == "[]":
-                # Fallback to the history if the LLM was lazy
                 print("  --> [Info]: Retained test suite from history.")
-            else:
+            elif not _has_cases(test_suite_json):
+                print("  --> [Info]: Adopted a test suite; there was none before.")
                 test_suite_json = new_tests
+            elif new_tests.strip() != test_suite_json.strip():
+                print("  --> [Builder]: ignoring the revised test suite; the graph is "
+                      "what is under repair.")
+                # Worth counting rather than only refusing: a model that keeps reaching for
+                # the exam is showing a specific failure mode, and that is a thing a corpus
+                # should be able to measure.
+                corpus.record_tool_result(
+                    tool="rewrite_tests", node="builder_node", attempt=attempt + 1,
+                    ok=False, error="the attempt tried to replace the suite it is judged by",
+                    output={"proposed_chars": len(new_tests)},
+                )
 
             # A missing name is cosmetic - `usecase_name` already defaults, and the save
             # path handles it - so it must never cost an attempt or discard a working DSL.

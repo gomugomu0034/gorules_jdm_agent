@@ -116,7 +116,20 @@ def _answer(prompt: str, options: list[str], scripted: list[str]) -> str:
     return options[0] if options else "Approve"
 
 
-async def _run_one(graph, requirement: Requirement, *, max_turns: int = 8) -> Outcome:
+def _verify(jdm_json: str, requirement: str) -> dict | None:
+    """Score the built graph against an independently authored suite. Never fatal."""
+    from backend.corpus import verify as verifier
+
+    try:
+        return verifier.verify(json.loads(jdm_json), requirement)
+    except Exception:  # noqa: BLE001
+        logger.warning("Independent verification failed for %.40s", requirement,
+                       exc_info=True)
+        return None
+
+
+async def _run_one(graph, requirement: Requirement, *, max_turns: int = 8,
+                   verify_graph: bool = True) -> Outcome:
     from langchain_core.messages import HumanMessage
     from langgraph.types import Command
 
@@ -155,6 +168,17 @@ async def _run_one(graph, requirement: Requirement, *, max_turns: int = 8) -> Ou
                     corpus.observe(outcome="completed" if built else "error",
                                    intent=values.get("intent"),
                                    final_jdm=values.get("jdm_json"))
+                    if built and verify_graph:
+                        # The graph passed the exam it wrote for itself. Whether it passes
+                        # one derived from the requirement is a different question, and
+                        # the only one worth training on.
+                        checked = _verify(values["jdm_json"], requirement.text)
+                        if checked is not None:
+                            status = "built" if checked.get("failed", 1) == 0 \
+                                     and checked.get("errored", 1) == 0 else "wrong"
+                            detail = "" if status == "built" else (
+                                f"{checked.get('passed')}/{checked.get('total')} "
+                                "independent cases passed")
                     break
 
                 reply = _answer(pending.get("prompt", ""),
@@ -211,39 +235,58 @@ def _count(run_id: str, sql: str) -> Any:
         return 0
 
 
-async def replay(requirements: list[Requirement], budget: Budget) -> list[Outcome]:
+async def replay(requirements: list[Requirement], budget: Budget, *,
+                 concurrency: int = 1, verify_graphs: bool = True) -> list[Outcome]:
+    """Run the list, up to `concurrency` at a time.
+
+    Sequentially, 1,500 requirements at roughly thirty seconds each is twelve and a half
+    hours; at eight in flight it is under two, and OpenRouter will take the concurrency.
+    A single compiled graph is shared because LangGraph keys its state by `thread_id` and
+    every run mints its own, and `corpus.run_scope` rides a context variable, which
+    `asyncio` copies per task - so the samples still land under the right run.
+    """
     from backend import lang_graph_agent as agent
 
     graph = agent.build_graph()
-    results: list[Outcome] = []
+    gate = asyncio.Semaphore(max(1, concurrency))
+    halt = asyncio.Event()
+    lock = asyncio.Lock()
 
-    for requirement in requirements:
-        stop = budget.exhausted()
-        if stop:
-            budget.stopped = stop
-            results.append(Outcome(requirement.id, "", "skipped", detail=stop))
-            continue
+    async def attempt(requirement: Requirement) -> Outcome:
+        async with gate:
+            if halt.is_set():
+                return Outcome(requirement.id, "", "skipped", detail=budget.stopped)
+            spent = budget.exhausted()
+            if spent:
+                budget.stopped = spent
+                halt.set()
+                return Outcome(requirement.id, "", "skipped", detail=spent)
 
-        print(f"  {requirement.id:22} ", end="", flush=True)
-        try:
-            outcome = await _run_one(graph, requirement)
-        except agent.RateLimited as exc:
-            # The single most likely failure on a free tier, and the one where carrying on
-            # would only burn the rest of the list against a closed door.
-            budget.stopped = f"the provider is rate limiting: {exc}"
-            print("rate limited - stopping")
-            results.append(Outcome(requirement.id, "", "skipped", detail=str(exc)[:120]))
-            break
+            try:
+                outcome = await _run_one(graph, requirement, verify_graph=verify_graphs)
+            except agent.RateLimited as exc:
+                # The most likely failure on a metered account, and the one where carrying
+                # on only spends the rest of the list against a closed door.
+                budget.stopped = f"the provider is rate limiting: {exc}"
+                halt.set()
+                return Outcome(requirement.id, "", "skipped", detail=str(exc)[:120])
 
-        budget.used += 1
-        budget.spent += outcome.cost
-        results.append(outcome)
-        print(f"{outcome.status:8} {outcome.samples:>2} samples  {outcome.seconds:>5.1f}s"
-              f"  {('$%.5f' % outcome.cost) if outcome.cost else ''}")
-        if outcome.detail and outcome.status != "built":
-            print(f"  {'':22} {outcome.detail[:70]}")
+            async with lock:
+                budget.used += 1
+                budget.spent += outcome.cost
+            _report(outcome)
+            return outcome
 
-    return results
+    return list(await asyncio.gather(*(attempt(r) for r in requirements)))
+
+
+def _report(outcome: Outcome) -> None:
+    """One line per finished run. Printed on completion rather than on start, because with
+    several in flight a half-written line is not attributable to anything."""
+    print(f"  {outcome.requirement_id:22} {outcome.status:8} {outcome.samples:>2} samples"
+          f"  {outcome.seconds:>5.1f}s  {('$%.5f' % outcome.cost) if outcome.cost else ''}")
+    if outcome.detail and outcome.status != "built":
+        print(f"  {'':22} {outcome.detail[:70]}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -263,6 +306,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--difficulty", choices=["simple", "moderate", "hard"])
     parser.add_argument("--max-runs", type=int, help="stop after this many")
     parser.add_argument("--max-cost", type=float, help="stop once this much has been spent")
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="requirements in flight at once (default 4). --max-runs can "
+                             "overshoot by up to this many, since the budget is checked "
+                             "as each one starts")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="skip scoring each graph against an independently authored "
+                             "suite (that check is the point; this is for debugging)")
     parser.add_argument("--dry-run", action="store_true", help="list what would run")
     args = parser.parse_args(argv)
 
@@ -292,13 +342,20 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     budget = Budget(max_runs=args.max_runs, max_cost=args.max_cost)
-    print(f"Replaying {len(requirements)} requirement(s). Each one spends model quota.\n")
-    results = asyncio.run(replay(requirements, budget))
+    print(f"Replaying {len(requirements)} requirement(s), {args.concurrency} at a time. "
+          f"Each one spends model quota.\n")
+    results = asyncio.run(replay(requirements, budget, concurrency=args.concurrency,
+                                 verify_graphs=not args.no_verify))
 
     built = sum(1 for r in results if r.status == "built")
+    wrong = sum(1 for r in results if r.status == "wrong")
     samples = sum(r.samples for r in results)
     print(f"\n{built}/{len(results)} built, {samples} samples, "
           f"${budget.spent:.5f} spent")
+    if wrong:
+        # Worth its own line: these compiled, linted and passed the exam they wrote for
+        # themselves, and still did not do what was asked.
+        print(f"{wrong} graph(s) passed their own tests but failed an independent suite.")
     if budget.stopped:
         print(f"Stopped early: {budget.stopped}")
     print("Marked source='replay'. Export real use only with --source live.")

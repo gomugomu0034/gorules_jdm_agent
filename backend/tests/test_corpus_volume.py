@@ -180,10 +180,16 @@ def test_a_rate_limit_stops_rather_than_burning_the_rest(monkeypatch, tmp_path):
     monkeypatch.setattr(agent, "_dispatch", refuse)
     budget = replay.Budget()
 
-    outcomes = asyncio.run(replay.replay([one(id="a"), one(id="b"), one(id="c")], budget))
+    outcomes = asyncio.run(
+        replay.replay([one(id="a"), one(id="b"), one(id="c")], budget, concurrency=1)
+    )
 
-    assert len(outcomes) == 1, "it stopped rather than trying the other two"
+    # Every requirement is accounted for, but only the one that hit the wall was attempted;
+    # the rest are skipped rather than spent.
+    assert len(outcomes) == 3
+    assert all(o.status == "skipped" for o in outcomes)
     assert "rate limiting" in budget.stopped
+    assert budget.used == 0, "nothing was billed after the refusal"
 
 
 def test_dry_run_spends_nothing(monkeypatch, capsys):
