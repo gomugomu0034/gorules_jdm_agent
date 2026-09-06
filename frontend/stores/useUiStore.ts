@@ -4,15 +4,20 @@ import { create } from 'zustand';
 
 import { resolveInitialTheme, THEME_STORAGE_KEY, type ThemeMode } from '../lib/theme';
 
+/** Which surface the assistant pane is showing. */
+export type AssistantTab = 'chat' | 'tests' | 'problems';
+
 type UiState = {
   theme: ThemeMode;
   sidebarOpen: boolean;
   chatOpen: boolean;
+  assistantTab: AssistantTab;
   hydrated: boolean;
   setTheme: (mode: ThemeMode) => void;
   toggleTheme: () => void;
   toggleSidebar: () => void;
   toggleChat: () => void;
+  setAssistantTab: (tab: AssistantTab) => void;
   hydrate: () => void;
 };
 
@@ -30,6 +35,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   theme: 'light',
   sidebarOpen: true,
   chatOpen: true,
+  assistantTab: 'chat',
   hydrated: false,
 
   setTheme: (mode) => {
@@ -38,6 +44,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   },
   toggleTheme: () => get().setTheme(get().theme === 'dark' ? 'light' : 'dark'),
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
+  setAssistantTab: (assistantTab) => set({ assistantTab }),
   toggleChat: () => set((s) => ({ chatOpen: !s.chatOpen })),
 
   // Runs on the client only, so the server render stays deterministic.

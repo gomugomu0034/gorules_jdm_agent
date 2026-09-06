@@ -15,6 +15,10 @@ type Props = {
   canvas: DecisionGraphType;
   graphId: string | null;
   graphName: string | null;
+  /** False while another assistant tab is in front. The pane stays mounted either way -
+   *  it holds the run's event stream - but a hidden element has no scroll height, so the
+   *  view has to be taken back to the newest message when it returns. */
+  visible?: boolean;
 };
 
 // An empty canvas can only be built on; the rest need a graph to act against.
@@ -24,14 +28,18 @@ const NEW_POLICY_SUGGESTIONS = [
   'Draft a refund policy based on order age and customer tier',
 ];
 
+// Worded to match the intent router's own patterns, so each one lands on the node it
+// names without a model call to work out what was meant. The linter was missing here
+// entirely: reachable in conversation since it was built, and never once offered.
 const EXISTING_POLICY_SUGGESTIONS = [
   'Explain what this policy does',
   'Run the test suite',
+  'Check this policy for problems',
   'Add a rule for VIP customers',
 ];
 
-export function ChatPane({ canvas, graphId, graphName }: Props) {
-  const { messages, steps, pending, proposal, running, error, send, respond, cancel } =
+export function ChatPane({ canvas, graphId, graphName, visible = true }: Props) {
+  const { messages, steps, pending, proposal, running, error, suggestions, send, respond, cancel } =
     useChatStore();
   // Generating a test suite is the one model call outside this conversation, and there is
   // one API key behind both. Waiting for it costs a few seconds; racing it costs a request
@@ -55,8 +63,14 @@ export function ChatPane({ canvas, graphId, graphName }: Props) {
   );
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages, steps, pending]);
+    if (!visible) return;
+    // `auto` rather than `smooth` on the way back in: the reader has already missed
+    // whatever arrived, and watching it scroll there is slower than being there.
+    scrollRef.current?.scrollTo({
+      top: scrollRef.current.scrollHeight,
+      behavior: visible && messages.length ? 'smooth' : 'auto',
+    });
+  }, [messages, steps, pending, visible]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -76,14 +90,9 @@ export function ChatPane({ canvas, graphId, graphName }: Props) {
   const composerDisabled = running || generatingTests || pending?.kind === 'choice';
 
   return (
-    <div className="flex h-full flex-col border-l border-border bg-bg">
-      <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-border px-3">
-        <Sparkles size={13} className="text-accent" />
-        <span className="text-xs font-semibold uppercase tracking-wide text-fg-subtle">
-          Assistant
-        </span>
-      </div>
-
+    // The border and the header belong to `AssistantPane` now: this is one tab of three,
+    // not the whole pane.
+    <div className="flex h-full flex-col">
       <div ref={scrollRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3">
         {messages.length === 0 && !running ? (
           <EmptyState
@@ -151,6 +160,36 @@ export function ChatPane({ canvas, graphId, graphName }: Props) {
             ) : (
               <p className="mt-2 text-xs text-fg-subtle">Type your answer below.</p>
             )}
+          </div>
+        ) : null}
+
+        {/* What to do next. Held back while the agent is working, while it is waiting on
+            an answer of its own, and while a proposal is still under review - in all three
+            the next move is already decided and a second set of choices only competes
+            with it. */}
+        {suggestions.length > 0 && !running && !pending && !proposal ? (
+          <div className="flex flex-wrap gap-1.5 pt-0.5">
+            {suggestions.map((suggestion) => (
+              <button
+                key={suggestion.label}
+                onClick={() => {
+                  if (suggestion.send) {
+                    void send(suggestion.prompt, canvasPayload);
+                    return;
+                  }
+                  // Not a complete request on its own: put it in the composer and let the
+                  // user finish the sentence.
+                  setDraft(suggestion.prompt);
+                  textareaRef.current?.focus();
+                }}
+                className={cx(
+                  'rounded-full border border-border px-2.5 py-1 text-2xs text-fg-muted',
+                  'transition-colors hover:border-accent hover:bg-accent-subtle hover:text-accent',
+                )}
+              >
+                {suggestion.label}
+              </button>
+            ))}
           </div>
         ) : null}
 

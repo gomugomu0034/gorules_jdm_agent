@@ -20,6 +20,8 @@ probing the evaluator rather than with `zen.validate_unary_expression`, which re
 
 from __future__ import annotations
 
+import json
+
 import re
 from collections import Counter, defaultdict
 
@@ -58,6 +60,72 @@ def _label(node: dict) -> str:
 
 # --------------------------------------------------------------------------- errors
 
+# ZEN keywords, literals and builtins, so a function call is not mistaken for a field.
+_NOT_A_FIELD = {
+    "and", "or", "not", "in", "true", "false", "null", "if", "then", "else",
+    "len", "sum", "avg", "min", "max", "abs", "round", "floor", "ceil", "count",
+    "contains", "startsWith", "endsWith", "matches", "upper", "lower", "trim",
+    "string", "number", "bool", "date", "time", "duration", "keys", "values",
+    "some", "all", "one", "none", "filter", "map", "flatMap", "type", "isNumeric",
+    "split", "extract", "fuzzyMatch", "d", "date_string", "$", "$root",
+}
+_IDENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(\()?")
+# Quoted values first: `condition == 'Digital'` names one field, not two, and a table full
+# of string cells otherwise yields a field list made mostly of its own answers.
+_LITERAL = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def _referenced(text: str) -> set[str]:
+    """Bare identifiers in an expression, excluding string literals, anything called like
+    a function, and the language's own vocabulary."""
+    found = set()
+    for name, called in _IDENT.findall(_LITERAL.sub(" ", text or "")):
+        if not called and name not in _NOT_A_FIELD:
+            found.add(name)
+    return found
+
+
+def interface_of(graph: dict) -> tuple[list[str], list[str]]:
+    """The field names a graph reads and writes, without any of its logic.
+
+    Decision tables declare their columns, so those come straight off `inputs`/`outputs`.
+    Expression nodes declare only what they *write*, and this codebase builds those far
+    more often than tables - so what an expression reads has to be recovered from the
+    expression text, or an expression-only graph offers the test author no input names at
+    all and it is left inventing them, which is the failure this whole module exists to
+    avoid. `schema` on the input and output nodes is usually an empty string and cannot be
+    relied on.
+    """
+    reads: set[str] = set()
+    writes: set[str] = set()
+    for node in graph.get("nodes") or []:
+        content = _content(node)
+        for column in content.get("inputs") or []:
+            field = (column.get("field") or "").strip()
+            if field:
+                reads.add(field.split(".")[0])
+        for column in content.get("outputs") or []:
+            field = (column.get("field") or "").strip()
+            if field:
+                writes.add(field.split(".")[0])
+        for expression in content.get("expressions") or []:
+            key = (expression.get("key") or "").strip()
+            if key:
+                writes.add(key.split(".")[0])
+            reads |= _referenced(str(expression.get("value") or ""))
+        for rule in content.get("rules") or []:
+            for key, value in (rule or {}).items():
+                # `_id` holds a UUID, and splitting one on its hyphens yields half a dozen
+                # things that look exactly like field names.
+                if key.startswith("_") or not isinstance(value, str):
+                    continue
+                reads |= _referenced(value)
+    # A field the graph writes and then reads back is an intermediate, not an input the
+    # caller supplies; offering it would invite tests that set it directly and bypass the
+    # policy on the way through.
+    return sorted(reads - writes), sorted(writes)
+
+
 def _structural_errors(graph: dict) -> list[Diagnostic]:
     found: list[Diagnostic] = []
     nodes = graph.get("nodes", [])
@@ -71,6 +139,35 @@ def _structural_errors(graph: dict) -> list[Diagnostic]:
                 node_id=node_id,
                 fix_hint="Every node needs its own id; edges address nodes by it.",
             ))
+
+    # A schema is optional, but once written it is *enforced*, and a `required` field the
+    # graph never reads rejects every call that sensibly omits it:
+    #   NodeError: ": \"customerId\" is a required property"
+    # Absence of a schema is a hint; a schema that turns the policy away at the door is not.
+    reads = set(interface_of(graph)[0])
+    for node in nodes:
+        if node.get("type") != "inputNode":
+            continue
+        schema = (_content(node).get("schema") or "").strip()
+        if not schema:
+            continue
+        try:
+            parsed = json.loads(schema)
+        except (json.JSONDecodeError, TypeError):
+            # Zen ignores a schema it cannot parse, so this breaks nothing at runtime.
+            continue
+        required = parsed.get("required") if isinstance(parsed, dict) else None
+        for field in required or []:
+            if isinstance(field, str) and field and field not in reads:
+                found.append(Diagnostic(
+                    kind="lint", severity="error", code="SCHEMA_REQUIRES_UNUSED_FIELD",
+                    message=f'The input schema requires "{field}", which no node reads, '
+                            "so every call that omits it is rejected before the policy runs.",
+                    node_id=node.get("id"), node_name=node.get("name"),
+                    path=f"content.schema.required[{field}]",
+                    fix_hint=f'Drop "{field}" from `required`, or use it somewhere in the '
+                             "policy.",
+                ))
 
     if not any(n.get("type") == "inputNode" for n in nodes):
         found.append(Diagnostic(
@@ -147,7 +244,11 @@ def _warnings(graph: dict) -> list[Diagnostic]:
 
     if not any(n.get("type") == "outputNode" for n in nodes):
         found.append(Diagnostic(
-            kind="lint", severity="warning", code="MISSING_OUTPUT_NODE",
+            # A hint, not a warning: the engine evaluates a graph with no output node
+            # perfectly happily and returns whatever the last nodes produced. Declaring
+            # one is good practice, not a requirement, and grading it as a defect trains
+            # attention away from the things that actually break.
+            kind="lint", severity="hint", code="MISSING_OUTPUT_NODE",
             message="The graph has no output node.",
             fix_hint="Results come from whichever nodes end a path; an explicit output "
                      "node makes the contract obvious.",
@@ -158,7 +259,9 @@ def _warnings(graph: dict) -> list[Diagnostic]:
 
         if node.get("type") == "inputNode" and not (content.get("schema") or "").strip():
             found.append(Diagnostic(
-                kind="lint", severity="warning", code="MISSING_INPUT_SCHEMA",
+                # Likewise a hint. An input node with no schema runs; the schema is a
+                # convenience for whoever calls the policy, not something Zen needs.
+                kind="lint", severity="hint", code="MISSING_INPUT_SCHEMA",
                 message=f'"{_label(node)}" declares no schema, so nothing downstream can '
                         "be type-checked.",
                 node_id=node.get("id"), node_name=node.get("name"),

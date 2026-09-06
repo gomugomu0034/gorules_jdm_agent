@@ -10,6 +10,8 @@ from backend.api.errors import ApiError
 from backend.api.graphs import require_graph
 from backend.db import dao
 from backend.models.api import (
+    CheckTestRequest,
+    CheckTestResponse,
     PatchTestRequest,
     ReplaceTestsRequest,
     RunTestsRequest,
@@ -104,6 +106,52 @@ async def run_adhoc_tests(body: RunTestsRequest) -> TestRunResponse:
         raise ApiError("VALIDATION_ERROR", "Both 'content' and 'tests' are required.", 422)
     report = await _execute(body.content, [t.model_dump() for t in body.tests], body.strict)
     return TestRunResponse(**report)
+
+
+@router.post("/api/tests/check", response_model=CheckTestResponse)
+async def check_test(body: CheckTestRequest) -> CheckTestResponse:
+    """Put one draft case to the live canvas and report what happened.
+
+    Written for someone typing a test by hand, where the useful question is not "did it
+    pass" but "which of us is wrong - the policy or my expectation". So it answers three
+    things separately: whether the graph would run the input at all, whether the fields
+    being asserted are ones the graph can even produce, and where the values differ.
+
+    Stateless and unsaved, like `POST /api/tests/run` beside it. Nothing here writes.
+    """
+    from backend.tools.jdm_linter import interface_of
+
+    accepts, produces = interface_of(body.content)
+
+    # A field the graph never writes cannot be asserted about. Caught before the run,
+    # because "expected 5, got null" for a misspelt name reads as a policy defect rather
+    # than a typo - and that is the mistake a person typing JSON by hand actually makes.
+    expected = body.expectedOutput if isinstance(body.expectedOutput, dict) else {}
+    unknown = [field for field in expected if field.split(".")[0] not in produces]
+
+    case = {"name": "draft", "input": body.input, "expectedOutput": body.expectedOutput}
+    report = await _execute(body.content, [case], strict=False)
+    result = report["results"][0]
+
+    if result["status"] == "errored" or report["summary"].get("compile_error"):
+        return CheckTestResponse(
+            ran=False,
+            error=report["summary"].get("compile_error") or result.get("error")
+                  or "The graph could not run this input.",
+            unknown_fields=unknown, produces=produces, accepts=accepts,
+        )
+
+    return CheckTestResponse(
+        ran=True,
+        actual=result.get("actual"),
+        # A case with nothing asserted is reported as skipped rather than passed, and
+        # calling that a match would let an empty expectation look like a green tick.
+        matches=result["status"] == "passed",
+        mismatches=result.get("mismatches") or [],
+        unknown_fields=unknown,
+        produces=produces,
+        accepts=accepts,
+    )
 
 
 @router.post("/api/graphs/{graph_id}/tests/generate", response_model=TestListResponse)

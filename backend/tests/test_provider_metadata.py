@@ -67,8 +67,26 @@ class FakeOpenAIClient:
 # ----------------------------------------------------------------- openrouter
 
 class FakeHTTPResponse:
+    """Stands in for a streamed `requests` response.
+
+    Streamed, because the real call reads its body under a wall-clock deadline: OpenRouter
+    pads a non-streaming response with keepalive whitespace, so `requests`' own timeout -
+    which bounds the gap between reads, not the call - could never fire on this provider.
+    The padding is reproduced here because the parse has to keep tolerating it.
+    """
+
     def __init__(self, body: dict, status: int = 200):
         self._body, self.status_code, self.text = body, status, json.dumps(body)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_content(self, chunk_size: int = 8192):
+        yield b"\n         \n"
+        yield json.dumps(self._body).encode()
 
     def json(self):
         return self._body

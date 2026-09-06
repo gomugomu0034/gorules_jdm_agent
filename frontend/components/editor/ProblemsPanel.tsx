@@ -23,9 +23,11 @@ const LABELS: Record<LintSeverity, string> = {
 const ORDER: LintSeverity[] = ['error', 'warning', 'hint'];
 
 export function ProblemsPanel() {
-  const { graph, content, revision } = useGraphStore();
-  const [findings, setFindings] = useState<LintFinding[] | null>(null);
-  const [checkedRevision, setCheckedRevision] = useState<number | null>(null);
+  // Findings live in the store rather than here, because the agent produces them too: a
+  // LINT turn puts its findings straight into this panel, which a privately owned piece of
+  // state could not be told about.
+  const { graph, content, revision, lintFindings: findings, lintRevision: checkedRevision,
+          setLint } = useGraphStore();
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -37,24 +39,25 @@ export function ProblemsPanel() {
       const report = graph
         ? await api.lintGraph(graph.id, content)
         : await api.lintContent(content);
-      setFindings(report.findings);
       // Stamped with the graph it describes: findings name specific nodes, and pointing at
       // a node the user has since deleted is worse than saying nothing.
-      setCheckedRevision(revision);
+      setLint(report.findings, revision);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not check this policy.');
     } finally {
       setRunning(false);
     }
-  }, [graph, content, revision]);
+  }, [graph, content, revision, setLint]);
 
   const stale = findings !== null && checkedRevision !== revision;
 
-  // Check once when the panel is opened. It is not re-run on every keystroke:
-  // linting compiles the graph, and a half-typed expression is not a finding
-  // worth interrupting someone with.
+  // Check once when the panel is first opened, and only if nothing has already checked
+  // this version of the graph - the agent puts its own findings here on a LINT turn, and
+  // re-running would throw away the answer the user just asked for to compute it again.
+  // Not re-run on every keystroke either: linting compiles the graph, and a half-typed
+  // expression is not a finding worth interrupting anyone with.
   useEffect(() => {
-    void check();
+    if (findings === null || checkedRevision !== revision) void check();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

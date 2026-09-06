@@ -9,14 +9,12 @@ import {
   type Simulation,
 } from '@gorules/jdm-editor';
 import '@gorules/jdm-editor/dist/style.css';
-import { FlaskConical, Play, ShieldCheck } from 'lucide-react';
+import { Play } from 'lucide-react';
 import { useMemo } from 'react';
 
 import { antdTheme } from '../../lib/theme';
 import { useUiStore } from '../../stores/useUiStore';
 import { SimulatorPanel } from './SimulatorPanel';
-import { ProblemsPanel } from './ProblemsPanel';
-import { TestRunnerPanel } from './TestRunnerPanel';
 
 type Props = {
   value: DecisionGraphType;
@@ -64,10 +62,14 @@ export default function JdmEditorClient({
   // Keyed on the theme so antd recomputes its palette when the toggle flips.
   const config = useMemo(() => antdTheme(theme), [theme]);
 
-  // The simulator and test runner belong in the editor's own panel rail: they
-  // are per-graph inspectors. The chat pane deliberately does not, because the
-  // rail unmounts whichever panel is not selected and that would kill its
-  // event stream mid-run.
+  // The simulator alone. It is the one inspector that genuinely belongs to the
+  // canvas - you hand it inputs and watch the graph light up, which only means
+  // anything beside the thing lighting up.
+  //
+  // The test runner and the linter moved to the assistant pane, where the
+  // question they answer ("is this right?") is the one being discussed. That also
+  // takes them out of this rail, which unmounts whichever panel is not selected -
+  // the reason the chat was never allowed in here in the first place.
   const panels = useMemo(
     () => [
       {
@@ -81,18 +83,6 @@ export default function JdmEditorClient({
             onClear={onClearSimulation}
           />
         ),
-      },
-      {
-        id: 'tests',
-        title: 'Tests',
-        icon: <FlaskConical size={14} />,
-        renderPanel: () => <TestRunnerPanel />,
-      },
-      {
-        id: 'problems',
-        title: 'Problems',
-        icon: <ShieldCheck size={14} />,
-        renderPanel: () => <ProblemsPanel />,
       },
     ],
     [onSimulate, simulating, onClearSimulation],

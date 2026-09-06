@@ -25,7 +25,7 @@ from backend.models.api import (
     ThreadStateResponse,
     ThreadSummary,
 )
-from backend.services import chat_runner, event_bus
+from backend.services import chat_runner, event_bus, lifecycle, suggestions
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -194,25 +194,49 @@ async def stream(
     queue = event_bus.subscribe(thread_id)
 
     async def generator():
+        # Two things this waits on, and both have to be able to end it. The queue is the
+        # conversation; `closing` is the process going down, and without it this loop is
+        # what holds a graceful shutdown open forever - the server waits for in-flight
+        # responses before it ever sends the lifespan shutdown event, so nothing later
+        # could have stopped it. See `services/lifecycle`.
+        stopping = asyncio.ensure_future(lifecycle.closing().wait())
+        waiting: asyncio.Future | None = None
         try:
             for event in await dao.list_events(thread_id, from_seq=from_seq):
                 yield _frame(event)
 
-            while True:
+            while not stopping.done():
                 if await request.is_disconnected():
                     break
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_SECONDS)
-                except asyncio.TimeoutError:
+
+                # Kept across iterations rather than remade each time: a `get` cancelled
+                # after it has taken an item drops that item on the floor.
+                if waiting is None:
+                    waiting = asyncio.ensure_future(queue.get())
+                done, _ = await asyncio.wait(
+                    {waiting, stopping},
+                    timeout=KEEPALIVE_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if waiting in done:
+                    event, waiting = waiting.result(), None
+                    yield _frame(event)
+                elif stopping in done:
+                    break
+                else:
                     yield ": keepalive\n\n"
-                    continue
-                yield _frame(event)
         finally:
+            stopping.cancel()
+            if waiting is not None:
+                waiting.cancel()
             event_bus.unsubscribe(thread_id, queue)
             # Nobody is watching this run any more. That may mean the tab was closed, or
             # only that it was reloaded, so this starts a grace period rather than
-            # stopping anything: see `watch_disconnect`.
-            chat_runner.watch_disconnect(thread_id)
+            # stopping anything: see `watch_disconnect`. Not on the way down, though:
+            # `stop_all` is about to take every run anyway, and a timer armed here would
+            # be one more task the loop has to be talked out of.
+            if not lifecycle.is_closing():
+                chat_runner.watch_disconnect(thread_id)
 
     return StreamingResponse(
         generator(),
@@ -283,6 +307,7 @@ async def accept_proposal(
             "name": name,
             "content": proposal["jdm"],
             "tests": proposal["tests"],
+            "suggestions": _next_moves(proposal),
         }
 
     if proposal["tests"]:
@@ -293,7 +318,23 @@ async def accept_proposal(
         response="accepted", detail={"version": version, "name": name, "draft": False},
     )
     await dao.clear_proposal(thread_id)
-    return {"graph_id": graph_id, "version": version, "draft": False}
+    return {"graph_id": graph_id, "version": version, "draft": False,
+            "suggestions": _next_moves(proposal)}
+
+
+def _next_moves(proposal: dict) -> list[dict]:
+    """What to offer after a proposal is taken on the canvas.
+
+    Taking it there is a REST call, not an answer to the agent - the run stays parked at
+    its approval interrupt and never reaches the end of a turn, so the follow-ups the
+    runner emits for a finished turn never fire on this path. Same catalogue either way,
+    which is the point of asking the server for them rather than keeping a second copy of
+    the wording in the browser.
+    """
+    return suggestions.follow_ups({
+        "intent": "CREATE",
+        "jdm_json": json.dumps(proposal.get("jdm") or {}),
+    })
 
 
 @router.post("/threads/{thread_id}/proposal/reject")

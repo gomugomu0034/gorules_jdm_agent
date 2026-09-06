@@ -44,6 +44,7 @@ class Filters:
     min_quality: float | None = None
     limit: int | None = None
     source: str | None = None
+    system: str | None = None
 
     def where(self) -> tuple[str, list]:
         """SQL for the sample-level filters, as a clause and its arguments."""
@@ -79,13 +80,24 @@ def _json(text: str | None, fallback: Any = None) -> Any:
         return fallback
 
 
-def _conversation(conn: sqlite3.Connection, sample: sqlite3.Row) -> list[dict]:
-    """The request as it was actually sent: the system prompt, then the turns."""
-    row = conn.execute("SELECT text FROM prompts WHERE hash = ?",
-                       (sample["prompt_hash"],)).fetchone()
+def _conversation(conn: sqlite3.Connection, sample: sqlite3.Row,
+                  system: str | None = None) -> list[dict]:
+    """The request as it was sent, or as you intend to send it after training.
+
+    `system` swaps the recorded prompt for another. That is the point of the short prompt:
+    collect with the full 11,093-token instruction, because the teacher needs it to
+    perform, and train with a 234-token one. The target output is unchanged; only the
+    input shrinks, and the model learns the format from the examples rather than from
+    being told it every single call.
+    """
     messages = []
-    if row is not None:
-        messages.append({"role": "system", "content": row["text"]})
+    if system is not None:
+        messages.append({"role": "system", "content": system})
+    else:
+        row = conn.execute("SELECT text FROM prompts WHERE hash = ?",
+                           (sample["prompt_hash"],)).fetchone()
+        if row is not None:
+            messages.append({"role": "system", "content": row["text"]})
     for message in _json(sample["messages_json"], []):
         # `internal` marks the builder's own retry scaffolding. It belongs in the context
         # a repair was produced under, and nowhere near a supervised example of one turn.
@@ -132,7 +144,7 @@ def export_sft(conn: sqlite3.Connection, filters: Filters) -> Iterator[dict]:
             if graded is None or graded < filters.min_quality:
                 continue
         yield {
-            "messages": _conversation(conn, sample) + [
+            "messages": _conversation(conn, sample, filters.system) + [
                 {"role": "assistant", "content": sample["completion"] or ""}
             ],
             "metadata": _meta(sample, quality=graded),
@@ -204,7 +216,7 @@ def export_preference(conn: sqlite3.Connection, filters: Filters) -> Iterator[di
             if filters.limit is not None and emitted >= filters.limit:
                 return
             yield {
-                "prompt": _conversation(conn, sample),
+                "prompt": _conversation(conn, sample, filters.system),
                 "chosen": chosen["completion"] or "",
                 "rejected": sample["completion"] or "",
                 "reason": _failure_reason(sample_verdicts),
@@ -249,7 +261,7 @@ def export_rejection_sampling(conn: sqlite3.Connection, filters: Filters) -> Ite
             return
         attempts = sum(1 for s in samples if verdicts.get(s["sample_id"]))
         yield {
-            "messages": _conversation(conn, opening) + [
+            "messages": _conversation(conn, opening, filters.system) + [
                 {"role": "assistant", "content": final["completion"] or ""}
             ],
             "metadata": _meta(opening, took_attempts=attempts,
@@ -283,6 +295,62 @@ def write(rows: Iterator[dict], destination: str, *, scrub: bool, bare: bool) ->
         if handle is not sys.stdout:
             handle.close()
     return written
+
+
+def print_compare(node: str | None = None) -> None:
+    """Two prompt generations, side by side.
+
+    The pass rate says whether an edit helped. The failure breakdown underneath says what
+    it traded for what, which is the half you actually steer on - an edit that removes
+    three monolithic graphs and introduces one parse error is a different decision from
+    one that removes three and introduces nothing.
+    """
+    conn = store._connect()
+    where, args = ("WHERE s.node = ?", [node]) if node else ("", [])
+
+    rows = list(conn.execute(f"""
+        SELECT substr(p.hash, 1, 10) h, p.kind, p.chars,
+               COUNT(DISTINCT s.sample_id) samples,
+               ROUND(AVG(CASE WHEN t.ok THEN 1.0 ELSE 0.0 END) * 100, 1) pass_pct
+          FROM prompts p
+          JOIN samples s      ON s.prompt_hash = p.hash
+          JOIN tool_results t ON t.sample_id   = s.sample_id
+          {where}
+         GROUP BY p.hash
+         HAVING samples > 0
+         ORDER BY pass_pct DESC""", args))
+
+    if not rows:
+        print("No prompt has samples with verdicts yet. Run something first.")
+        return
+
+    print(f"corpus: {store.settings.corpus_db_file}"
+          f"{'  ·  node=' + node if node else ''}\n")
+    print(f"  {'prompt':12} {'kind':10} {'chars':>7} {'samples':>8} {'pass':>7}")
+    for r in rows:
+        print(f"  {r['h']:12} {r['kind'][:10]:10} {r['chars']:>7,} "
+              f"{r['samples']:>8} {r['pass_pct']:>6}%")
+
+    if len(rows) < 2:
+        print("\n  Only one generation here - edit the prompt and run the same "
+              "requirements again to get a comparison.")
+        return
+
+    print(f"\n  what each generation gets wrong")
+    print(f"  {'prompt':12} {'code':24} {'count':>6}")
+    seen = list(conn.execute(f"""
+        SELECT substr(s.prompt_hash, 1, 10) h,
+               json_extract(d.value, '$.code') code, COUNT(*) n
+          FROM samples s
+          JOIN tool_results t ON t.sample_id = s.sample_id
+          JOIN json_each(t.diagnostics_json) d
+         WHERE t.ok = 0 {('AND s.node = ?' if node else '')}
+         GROUP BY h, code
+         ORDER BY h, n DESC""", args))
+    if not seen:
+        print("    (nothing failed)")
+    for r in seen:
+        print(f"  {r['h']:12} {str(r['code'])[:24]:24} {r['n']:>6}")
 
 
 def print_stats() -> None:
@@ -333,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--format", choices=[*FORMATS, "stats"], default="stats")
+    parser.add_argument("--format", choices=[*FORMATS, "stats", "compare"],
+                        default="stats")
     parser.add_argument("--out", default="-", help="output file, or - for stdout")
     parser.add_argument("--node", help="only calls made by this node, e.g. planner_node")
     parser.add_argument("--prompt-hash", help="only calls made under this system prompt "
@@ -349,6 +418,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="omit the metadata key, for trainers that reject extra fields")
     parser.add_argument("--no-redact", action="store_true",
                         help="skip the scrubbing pass (see corpus/redact.py for its limits)")
+    parser.add_argument("--system-prompt", metavar="FILE",
+                        help="replace the recorded system prompt with this file's text "
+                             "(use backend/prompts/planner_short_prompt.py's text to "
+                             "train against the short prompt)")
     parser.add_argument("--no-score", action="store_true",
                         help="do not refresh the labels before exporting")
     args = parser.parse_args(argv)
@@ -366,12 +439,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "stats":
         print_stats()
         return 0
+    if args.format == "compare":
+        print_compare(args.node)
+        return 0
+
+    system = None
+    if args.system_prompt:
+        try:
+            system = Path(args.system_prompt).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"Could not read {args.system_prompt}: {exc}", file=sys.stderr)
+            return 1
 
     rows = FORMATS[args.format](
         store._connect(),
         Filters(node=args.node, prompt_hash=args.prompt_hash, model=args.model,
                 since=args.since, min_quality=args.min_quality, limit=args.limit,
-                source=args.source),
+                source=args.source, system=system),
     )
     written = write(rows, args.out, scrub=not args.no_redact, bare=args.bare)
 

@@ -410,7 +410,11 @@ def test_a_planner_that_produces_no_design_never_starts_a_build(
     assert values["build_failed"] is True
     # No build ran, so there is no build status to report - which is the point. The turn
     # must not end up on the approval gate offering a graph that was never made.
-    assert "build_status" not in values
+    #
+    # Asserted on the value rather than the key's absence: the router now clears the
+    # previous turn's verdict on entry, so the key is always present. Absence was only ever
+    # a proxy for "nothing wrote one", and an empty string says that outright.
+    assert not values.get("build_status")
     assert not values.get("jdm_json")
     assert pending_interrupt(graph, config) is None
 

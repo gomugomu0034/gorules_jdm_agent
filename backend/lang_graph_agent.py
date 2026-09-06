@@ -410,17 +410,26 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
     if OPENROUTER_APP_NAME:
         headers["X-Title"] = OPENROUTER_APP_NAME
 
-    response = requests.post(
+    deadline = time.monotonic() + LLM_TIMEOUT_SECONDS
+    with requests.post(
         url=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
         headers=headers,
         data=json.dumps(payload),
-        timeout=LLM_TIMEOUT_SECONDS,
-    )
-    if response.status_code == 429:
-        raise RateLimited(_provider_message(response) or "The model provider is rate limiting us.")
-    response.raise_for_status()
+        # Connect fast or not at all; the read timeout is the gap between bytes, which is
+        # only half the guarantee - see `_read_within` for the other half.
+        timeout=(10, LLM_TIMEOUT_SECONDS),
+        stream=True,
+    ) as response:
+        if response.status_code == 429:
+            raise RateLimited(
+                _provider_message(response) or "The model provider is rate limiting us."
+            )
+        response.raise_for_status()
+        body = _read_within(response, deadline)
 
-    response_json = response.json()
+    # The body arrives padded with the keepalive whitespace described in `_read_within`;
+    # `json.loads` skips it.
+    response_json = json.loads(body)
     message = response_json["choices"][0]["message"]
     usage = response_json.get("usage") or {}
     details = usage.get("completion_tokens_details") or {}
@@ -444,6 +453,36 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
             cost=_float(usage.get("cost")),
         ),
     )
+
+
+def _read_within(response, deadline: float) -> bytes:
+    """Read a response body under a real wall-clock deadline.
+
+    `requests`' own timeout is not a total: it bounds the gap *between* reads. OpenRouter
+    pads a non-streaming response with whitespace while the upstream is thinking - confirmed
+    on the wire, a body that begins with hundreds of blank lines - so bytes keep arriving
+    and the read timeout can never fire. `LLM_TIMEOUT` was therefore unenforceable on this
+    provider: a stalled call ran on until the agent's whole-run budget, which is how a
+    single explain request spent ten minutes saying "Reading the graph" and produced
+    nothing. The builder's attempt arithmetic assumes each call costs at most
+    `LLM_TIMEOUT_SECONDS`, and that assumption is only true with this in place.
+    """
+    chunks: list[bytes] = []
+    for chunk in response.iter_content(chunk_size=8192):
+        chunks.append(chunk)
+        if time.monotonic() > deadline:
+            raise LLMTimeout(
+                f"The model timed out: no complete answer within {LLM_TIMEOUT_SECONDS}s. "
+                "Ask again, or raise LLM_TIMEOUT if this model is simply slow."
+            )
+    return b"".join(chunks)
+
+
+class LLMTimeout(RuntimeError):
+    """The provider was still going when the call's budget ran out.
+
+    Distinct from `requests.Timeout`, which only ever means "the socket went quiet".
+    """
 
 
 class RateLimited(RuntimeError):
@@ -934,6 +973,43 @@ def _classify_intent(text: str, has_graph: bool) -> tuple[str, float]:
     return ("MODIFY" if has_graph else "CREATE"), 0.3
 
 
+# What a finished turn leaves behind in the checkpoint, and what the next one must not
+# inherit. Every one of these is a *verdict* on work that is already over.
+#
+# The router is the only safe place to clear them. It runs exactly once per turn - the
+# approval loop re-enters the planner directly, without passing back through here - so
+# resetting on entry cannot wipe state a turn is still using.
+#
+# Deliberately absent: `test_suite_json`, which `chat_runner` pre-loads into the payload
+# for a TEST turn, and clearing it here would overwrite the suite before `test_node` ever
+# sees it. The canvas fields, `messages` and `thread_id` are context rather than verdict
+# and travel with every turn by design.
+_PER_TURN_RESET: dict = {
+    # `output_node` defaults a missing status to SUCCESS, so a stale one is the difference
+    # between "your policy is ready" and the truth.
+    "build_status": "",
+    "build_failed": False,
+    "evaluation_feedback": "",
+    # The reporter reads this to describe what was built. Left over, a turn that produces
+    # nothing announces the *previous* turn's policy as though it had just made it.
+    "jdm_json": "",
+    # `planner_node` reads EMPTY as "you are being asked again" and appends the re-plan
+    # instruction. Carried over, the first call of a fresh turn thinks it is a retry.
+    "plan_status": "",
+    "plan_attempts_used": 0,
+    # Nothing reset this between turns, so every subsequent build started a repair down.
+    "build_attempts_used": 0,
+    "triage_status": "",
+    "final_approval_status": "",
+    # Findings and edits describe a graph this turn has not looked at yet.
+    "lint_findings": [],
+    "patch_log": [],
+    "test_regressions": [],
+    # Both paths that produce a proposal set this; a stale one names the wrong policy.
+    "usecase_name": "",
+}
+
+
 def intent_router_node(state: AgentState):
     """Entry node. Never interrupts, so every run starts with real work."""
     canvas = state.get("canvas_jdm_json", "") or ""
@@ -946,6 +1022,7 @@ def intent_router_node(state: AgentState):
     # Downstream nodes and every prompt read `existing_jdm_json`; keeping it
     # populated from the canvas is what lets them stay unchanged.
     return {
+        **_PER_TURN_RESET,
         "intent": intent,
         "intent_confidence": confidence,
         "mode": "EXISTING" if intent in ("MODIFY", "TEST", "EXPLAIN") else "NEW",
@@ -962,36 +1039,27 @@ def explain_node(state: AgentState):
 
     print(f"\n[Explain Node]: Generating compulsory explanation for {filename}...")
 
-    # 1. Compact the JSON
-    try:
-        jdm_compact = json.dumps(json.loads(existing_jdm))
-    except Exception:
-        jdm_compact = existing_jdm.replace('\n', '').replace('\r', '')
+    # The one long wait in this node is the call below, and until now it said nothing while
+    # it happened - the rail showed "Reading the graph" and then, for as long as the model
+    # took, nothing at all. Every other leaf node reports its phase; this one did not.
+    _emit({"type": "progress", "node": "explain_node", "attempt": 1, "max_attempts": 1,
+           "phase": "llm", "message": f"Reading {filename} and writing the explanation"})
 
-    # 2. Ask LLM for the explanation
     user_prompt = _inject_jdm(PROMPT_EXPLAIN_USER, existing_jdm)
+    explanation = call_llm(PROMPT_EXPLAIN, [HumanMessage(content=user_prompt)],
+                           node="explain_node")
 
-    messages = [HumanMessage(content=user_prompt)]
-    explanation = call_llm(PROMPT_EXPLAIN, messages, node="explain_node")
-
-    # 4. Format the final UI Message
-    # Notice the mandatory empty lines inside the <details> tags to ensure Streamlit parses the markdown correctly!
-    ui_message = f"""### 📖 Policy Analysis: `{filename}`
-    <details>
-    <summary><b>📜 Click to view Raw JDM Logic</b></summary>
-    
-    ```json
-    {jdm_compact}
-    ```
-    </details>
-    
-    Logic Explanation:
-    {explanation}
-    """
-    # Save the explanation to the chat history so the user can read it
-    # right before the action chips appear.
+    # The reply goes out as it was written, under a heading naming the policy.
+    #
+    # What used to be here was a Streamlit-era wrapper: a `<details>` block holding the
+    # whole JDM file, a "Logic Explanation:" label, and the entire thing indented four
+    # spaces - which markdown reads as a code block, so the explanation rendered as
+    # preformatted text with the prose escaping only by accident. Someone asking what their
+    # policy does was handed the file they already have, and the answer underneath it.
     return {
-        "messages": [_assistant_message_from_llm(ui_message)]
+        "messages": [_assistant_message_from_llm(
+            f"### {filename}\n\n{str(explanation).strip()}"
+        )]
     }
 
 
@@ -1100,7 +1168,17 @@ def test_node(state: AgentState):
 
 
 def _format_test_report_markdown(report: dict) -> str:
-    """Deterministic pass/fail table. The verdict comes from the engine, not an LLM."""
+    """Deterministic pass/fail report. The verdict comes from the engine, not an LLM.
+
+    Passing cases stay one line each, because the only thing worth saying about them is
+    that they passed. Each failure gets its own block with the input that produced it, what
+    was expected, what came back, and which field disagreed - the four things somebody
+    needs to decide whether the policy is wrong or the test is.
+
+    Deliberately not one wide table. JSON in a markdown cell wraps at about forty
+    characters and the columns stop lining up, which is what the previous version did to
+    anything with more than one field.
+    """
     summary = report["summary"]
     icon = "✅" if not (summary["failed"] or summary["errored"]) else "❌"
     lines = [
@@ -1115,25 +1193,47 @@ def _format_test_report_markdown(report: dict) -> str:
         lines.append(f"The graph does not compile: `{summary['compile_error']}`")
         return "\n".join(lines)
 
-    lines += ["| | Test | Details |", "|---|---|---|"]
-    marks = {"passed": "✅", "failed": "❌", "errored": "⚠️", "skipped": "➖"}
-    for r in report["results"]:
-        if r["status"] == "passed":
-            detail = "—"
-        elif r["status"] == "skipped":
-            detail = "no expected output"
-        elif r["error"]:
-            detail = f"`{r['error'][:120]}`"
-        else:
-            detail = "; ".join(
-                f"`{m['path']}`: expected `{json.dumps(m['expected'])}`, got `{json.dumps(m['actual'])}`"
-                for m in r["mismatches"][:3]
-            )
-            if len(r["mismatches"]) > 3:
-                detail += f" (+{len(r['mismatches']) - 3} more)"
-        lines.append(f"| {marks[r['status']]} | {r['name']} | {detail} |")
+    def code(value) -> str:
+        rendered = json.dumps(value, ensure_ascii=False, default=str)
+        return f"`{rendered}`" if len(rendered) <= 300 else f"`{rendered[:300]}…`"
 
-    return "\n".join(lines)
+    good = [r for r in report["results"] if r["status"] == "passed"]
+    if good:
+        lines += ["**Passed**", ""]
+        lines += [f"- ✅ {r['name']}" for r in good]
+        lines.append("")
+
+    skipped = [r for r in report["results"] if r["status"] == "skipped"]
+    if skipped:
+        lines += ["**Not checked** — these cases declare no expected output, so nothing "
+                  "about them was proven.", ""]
+        lines += [f"- ➖ {r['name']}" for r in skipped]
+        lines.append("")
+
+    for result in report["results"]:
+        if result["status"] not in ("failed", "errored"):
+            continue
+        mark = "❌" if result["status"] == "failed" else "⚠️"
+        lines += [f"**{mark} {result['name']}**", "", "| | |", "|---|---|"]
+        lines.append(f"| Input | {code(result.get('input'))} |")
+
+        if result["status"] == "errored":
+            # Nothing came back, so expected-versus-actual has nothing to compare.
+            lines.append(f"| Error | `{str(result.get('error') or '')[:300]}` |")
+        else:
+            lines.append(f"| Expected | {code(result.get('expected'))} |")
+            lines.append(f"| Actual | {code(result.get('actual'))} |")
+            why = "; ".join(
+                f"`{m['path']}` should be {code(m['expected'])[1:-1]} "
+                f"but was {code(m['actual'])[1:-1]}"
+                for m in result["mismatches"][:4]
+            )
+            if len(result["mismatches"]) > 4:
+                why += f" (+{len(result['mismatches']) - 4} more)"
+            lines.append(f"| Why it failed | {why or 'the output did not match'} |")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 
@@ -1173,10 +1273,15 @@ def lint_node(state: AgentState):
         run.diagnostics = [d.as_dict() for d in findings]
         run.output = {f"{s}s": sum(1 for d in findings if d.severity == s)
                       for s in ("error", "warning", "hint")}
+
+    # Sent as data as well as prose, so the Problems tab can show the findings the user
+    # just asked for instead of making them press Check to get the same answer again.
+    reported = [d.as_dict() for d in findings]
+    _emit({"type": "lint_report", "findings": reported})
     name = state.get("selected_file") or state.get("canvas_graph_name") or "this policy"
 
     if not findings:
-        return {"messages": [_assistant_message_from_llm(
+        return {"lint_findings": [], "messages": [_assistant_message_from_llm(
             f"**{name}** passes every check - structure, expressions, and quality."
         )]}
 
@@ -1200,7 +1305,10 @@ def lint_node(state: AgentState):
     if counts["error"]:
         body.append("Ask me to fix any of these and I will update the policy.")
 
-    return {"messages": [_assistant_message_from_llm("\n".join(body).strip())]}
+    # Left on state as well as sent to the panel, so what the turn offers next can depend
+    # on whether it actually found anything.
+    return {"lint_findings": reported,
+            "messages": [_assistant_message_from_llm("\n".join(body).strip())]}
 
 
 def triage_node(state: AgentState):
@@ -1281,6 +1389,15 @@ def human_triage_review_node(state: AgentState):
         }
 
 # Step 2: Planner (Expert Analyst)
+def _has_cases(test_suite_json: str) -> bool:
+    """Is there an actual suite here, as opposed to nothing or an empty array?"""
+    try:
+        parsed = json.loads(test_suite_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, list) and len(parsed) > 0
+
+
 def _is_a_plan(dsl: str) -> bool:
     """Does this reply contain a design at all, as opposed to prose or nothing?
 
@@ -1691,11 +1808,29 @@ def builder_node(state: AgentState):
                 continue
             dsl_content = new_dsl
 
+            # The exam may be filled in while it is blank, and never rewritten once it is
+            # set. A repair that emits new tests used to *replace* the suite it was being
+            # judged against, so a model that could not fix the graph could pass by
+            # weakening the assertions instead - and the run was then recorded as a
+            # success, becoming the accepted half of a preference pair that teaches
+            # precisely the wrong lesson. Fixing the graph is the task; editing the exam
+            # is not.
             if not new_tests or new_tests == "[]":
-                # Fallback to the history if the LLM was lazy
                 print("  --> [Info]: Retained test suite from history.")
-            else:
+            elif not _has_cases(test_suite_json):
+                print("  --> [Info]: Adopted a test suite; there was none before.")
                 test_suite_json = new_tests
+            elif new_tests.strip() != test_suite_json.strip():
+                print("  --> [Builder]: ignoring the revised test suite; the graph is "
+                      "what is under repair.")
+                # Worth counting rather than only refusing: a model that keeps reaching for
+                # the exam is showing a specific failure mode, and that is a thing a corpus
+                # should be able to measure.
+                corpus.record_tool_result(
+                    tool="rewrite_tests", node="builder_node", attempt=attempt + 1,
+                    ok=False, error="the attempt tried to replace the suite it is judged by",
+                    output={"proposed_chars": len(new_tests)},
+                )
 
             # A missing name is cosmetic - `usecase_name` already defaults, and the save
             # path handles it - so it must never cost an attempt or discard a working DSL.
@@ -2182,6 +2317,11 @@ workflow.add_conditional_edges(
         "modify_triage_node": "modify_triage_node",  # MODIFY
         "test_node": "test_node",                  # TEST
         "explain_node": "explain_node",            # EXPLAIN
+        # Omitted until now, while `route_after_intent` happily returned it: asking the
+        # agent to lint anything raised KeyError('lint_node') and took the turn with it.
+        # The map and the router have to agree, which is what
+        # `test_every_intent_the_router_can_return_has_an_edge` now holds them to.
+        "lint_node": "lint_node",                  # LINT
     }
 )
 

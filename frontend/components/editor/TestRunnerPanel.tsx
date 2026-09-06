@@ -1,20 +1,13 @@
 'use client';
 
-import {
-  AlertTriangle,
-  ChevronRight,
-  CircleSlash,
-  Play,
-  Sparkles,
-  XCircle,
-  CheckCircle2,
-} from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronRight, CircleSlash, Play, Plus, Sparkles, XCircle } from 'lucide-react';
 import { useState } from 'react';
 
 import type { TestResult } from '../../lib/types';
 import { useChatStore } from '../../stores/useChatStore';
 import { useGraphStore } from '../../stores/useGraphStore';
 import { Badge, Button, EmptyState, cx } from '../ui';
+import { ManualTestForm } from './ManualTestForm';
 
 const ICONS = {
   passed: <CheckCircle2 size={14} className="text-success" />,
@@ -25,7 +18,7 @@ const ICONS = {
 
 export function TestRunnerPanel() {
   const {
-    graph, tests, testReport, revision, testReportRevision,
+    graph, tests, content, testReport, revision, testReportRevision, saveTests,
     generatingTests, runTests, generateTests,
   } = useGraphStore();
   // Generating a suite is a model call, and so is a turn of the conversation. One API key
@@ -36,6 +29,7 @@ export function TestRunnerPanel() {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [writing, setWriting] = useState(false);
 
   const run = async () => {
     setRunning(true);
@@ -70,6 +64,13 @@ export function TestRunnerPanel() {
         </Button>
         <Button
           size="sm"
+          icon={<Plus size={12} />}
+          onClick={() => setWriting((open) => !open)}
+        >
+          New
+        </Button>
+        <Button
+          size="sm"
           icon={<Sparkles size={12} />}
           onClick={generate}
           loading={generatingTests}
@@ -96,6 +97,20 @@ export function TestRunnerPanel() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto">
+        {writing ? (
+          <ManualTestForm
+            content={content}
+            onCancel={() => setWriting(false)}
+            onSave={(test) => {
+              // Appended to the suite the panel already holds, and saved through the same
+              // path a generated suite takes - a draft keeps them in memory until it is
+              // named, a saved policy writes them straight through.
+              void saveTests([...tests, { ...test, order: tests.length }]);
+              setWriting(false);
+            }}
+          />
+        ) : null}
+
         {error ? (
           <div className="m-3 rounded border border-border bg-danger-subtle p-3 text-xs text-danger">
             {error}
@@ -115,7 +130,12 @@ export function TestRunnerPanel() {
           </div>
         ) : null}
 
-        {tests.length === 0 ? (
+        {/* A report wins over an empty suite. The agent can run a suite the panel does not
+            hold - it writes one itself when a policy has none, and the results arrive here
+            while `tests` is still empty - and asking for the report first was showing
+            "No test cases yet" beside a "3/3 passed" badge for the run that had just
+            finished. */}
+        {testReport === null && tests.length === 0 ? (
           <EmptyState
             title="No test cases yet"
             description="Generate a suite from the current graph, or ask the assistant to write one."
@@ -185,14 +205,14 @@ function ResultRow({
 
           {result.mismatches.length > 0 ? (
             <div>
-              <p className="mb-1 font-semibold text-fg-muted">Mismatches</p>
+              <p className="mb-1 font-semibold text-fg-muted">Why it failed</p>
               <ul className="space-y-1">
                 {result.mismatches.map((m) => (
                   <li key={m.path} className="font-mono text-2xs leading-relaxed">
                     <span className="text-fg">{m.path}</span>
-                    {': expected '}
+                    {' should be '}
                     <span className="text-success">{JSON.stringify(m.expected)}</span>
-                    {', got '}
+                    {' but was '}
                     <span className="text-danger">{JSON.stringify(m.actual)}</span>
                   </li>
                 ))}
@@ -201,7 +221,28 @@ function ResultRow({
           ) : null}
 
           <Field label="Input" value={JSON.stringify(result.input, null, 2)} />
-          <Field label="Actual output" value={JSON.stringify(result.actual, null, 2)} />
+
+          {/* Side by side, because the question being asked of this panel is always
+              "how does what I got differ from what I asked for?" - and answering it by
+              reading two stacked blocks and holding one in your head is the reason the
+              mismatch list above had to exist at all. Stacks below `sm` rather than
+              shrinking to two unreadable columns in a narrow pane. */}
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <Field
+              label="Expected"
+              value={
+                result.expected === undefined || result.expected === null
+                  ? 'no expected output — nothing was checked'
+                  : JSON.stringify(result.expected, null, 2)
+              }
+              tone={result.status === 'failed' ? 'expected' : undefined}
+            />
+            <Field
+              label="Actual"
+              value={JSON.stringify(result.actual, null, 2)}
+              tone={result.status === 'failed' ? 'actual' : undefined}
+            />
+          </div>
 
           {Object.keys(result.trace ?? {}).length > 0 ? (
             <details>
@@ -219,13 +260,29 @@ function ResultRow({
   );
 }
 
-function Field({ label, value, tone }: { label: string; value: string; tone?: 'danger' }) {
+type FieldTone = 'danger' | 'expected' | 'actual';
+
+const LABEL_TONE: Record<FieldTone, string> = {
+  danger: 'text-danger',
+  expected: 'text-success',
+  actual: 'text-danger',
+};
+
+function Field({ label, value, tone }: { label: string; value: string; tone?: FieldTone }) {
   return (
-    <div>
-      <p className={cx('mb-1 font-semibold', tone === 'danger' ? 'text-danger' : 'text-fg-muted')}>
+    <div className="min-w-0">
+      <p className={cx('mb-1 font-semibold', tone ? LABEL_TONE[tone] : 'text-fg-muted')}>
         {label}
       </p>
-      <pre className="max-h-40 overflow-auto rounded bg-bg p-2 font-mono text-2xs leading-relaxed">
+      <pre
+        className={cx(
+          'max-h-40 overflow-auto rounded bg-bg p-2 font-mono text-2xs leading-relaxed',
+          // Only on a failure. Colouring a passing pair green-and-red would say the two
+          // sides disagree when the whole point is that they match.
+          tone === 'expected' && 'border-l-2 border-success',
+          tone === 'actual' && 'border-l-2 border-danger',
+        )}
+      >
         {value}
       </pre>
     </div>

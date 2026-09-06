@@ -189,3 +189,18 @@ CREATE TABLE IF NOT EXISTS labels (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_labels_unique
   ON labels(COALESCE(sample_id, ''), COALESCE(run_id, ''), name, scorer_version);
 CREATE INDEX IF NOT EXISTS idx_labels_name ON labels(name, value);
+
+-- Acceptance suites written from the requirement, by a model that never saw the graph.
+--
+-- Cached because the suite depends on the requirement and the graph's interface, not on
+-- which model produced the graph or how many attempts it took - so one suite is reused
+-- across every model in a bake-off, which is also what makes their scores comparable.
+CREATE TABLE IF NOT EXISTS suites (
+  suite_id        TEXT PRIMARY KEY,     -- hash(requirement + interface)
+  requirement     TEXT NOT NULL,
+  inputs_json     TEXT NOT NULL,        -- field names shared with the author
+  outputs_json    TEXT NOT NULL,
+  cases_json      TEXT NOT NULL,
+  authored_by     TEXT NOT NULL DEFAULT '',
+  created_at      TEXT NOT NULL
+);
