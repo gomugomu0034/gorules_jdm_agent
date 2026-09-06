@@ -20,6 +20,7 @@ from backend.config import settings
 from backend import agent_runtime
 from backend import corpus
 from backend.db import bootstrap, connection
+from backend.services import lifecycle
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,10 +46,19 @@ async def lifespan(app: FastAPI):
     # or an unwritable directory is reported here instead of silently costing the first
     # few samples of the session.
     corpus.open_at_boot()
+    # After the server has installed its own signal handlers, so there is something to
+    # chain in front of. A stop has to be noticed here rather than below, because the
+    # server waits for in-flight responses - the chat stream among them - before it ever
+    # sends the shutdown this `finally` is attached to.
+    release_signals = lifecycle.startup()
     logger.info("%s %s ready (db=%s)", settings.app_name, settings.version, settings.db_path)
     try:
         yield
     finally:
+        # Belt and braces: a shutdown that arrives some other way - a test harness, a
+        # reload hook, an embedding process - still ends the streams.
+        lifecycle.begin()
+        release_signals()
         await agent_runtime.shutdown()
         corpus.store.close()
         await connection.disconnect()
