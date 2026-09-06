@@ -410,17 +410,26 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
     if OPENROUTER_APP_NAME:
         headers["X-Title"] = OPENROUTER_APP_NAME
 
-    response = requests.post(
+    deadline = time.monotonic() + LLM_TIMEOUT_SECONDS
+    with requests.post(
         url=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
         headers=headers,
         data=json.dumps(payload),
-        timeout=LLM_TIMEOUT_SECONDS,
-    )
-    if response.status_code == 429:
-        raise RateLimited(_provider_message(response) or "The model provider is rate limiting us.")
-    response.raise_for_status()
+        # Connect fast or not at all; the read timeout is the gap between bytes, which is
+        # only half the guarantee - see `_read_within` for the other half.
+        timeout=(10, LLM_TIMEOUT_SECONDS),
+        stream=True,
+    ) as response:
+        if response.status_code == 429:
+            raise RateLimited(
+                _provider_message(response) or "The model provider is rate limiting us."
+            )
+        response.raise_for_status()
+        body = _read_within(response, deadline)
 
-    response_json = response.json()
+    # The body arrives padded with the keepalive whitespace described in `_read_within`;
+    # `json.loads` skips it.
+    response_json = json.loads(body)
     message = response_json["choices"][0]["message"]
     usage = response_json.get("usage") or {}
     details = usage.get("completion_tokens_details") or {}
@@ -444,6 +453,36 @@ def _call_openrouter(sys_prompt: str, messages: list) -> LLMResponse:
             cost=_float(usage.get("cost")),
         ),
     )
+
+
+def _read_within(response, deadline: float) -> bytes:
+    """Read a response body under a real wall-clock deadline.
+
+    `requests`' own timeout is not a total: it bounds the gap *between* reads. OpenRouter
+    pads a non-streaming response with whitespace while the upstream is thinking - confirmed
+    on the wire, a body that begins with hundreds of blank lines - so bytes keep arriving
+    and the read timeout can never fire. `LLM_TIMEOUT` was therefore unenforceable on this
+    provider: a stalled call ran on until the agent's whole-run budget, which is how a
+    single explain request spent ten minutes saying "Reading the graph" and produced
+    nothing. The builder's attempt arithmetic assumes each call costs at most
+    `LLM_TIMEOUT_SECONDS`, and that assumption is only true with this in place.
+    """
+    chunks: list[bytes] = []
+    for chunk in response.iter_content(chunk_size=8192):
+        chunks.append(chunk)
+        if time.monotonic() > deadline:
+            raise LLMTimeout(
+                f"The model timed out: no complete answer within {LLM_TIMEOUT_SECONDS}s. "
+                "Ask again, or raise LLM_TIMEOUT if this model is simply slow."
+            )
+    return b"".join(chunks)
+
+
+class LLMTimeout(RuntimeError):
+    """The provider was still going when the call's budget ran out.
+
+    Distinct from `requests.Timeout`, which only ever means "the socket went quiet".
+    """
 
 
 class RateLimited(RuntimeError):
@@ -1000,6 +1039,12 @@ def explain_node(state: AgentState):
 
     print(f"\n[Explain Node]: Generating compulsory explanation for {filename}...")
 
+    # The one long wait in this node is the call below, and until now it said nothing while
+    # it happened - the rail showed "Reading the graph" and then, for as long as the model
+    # took, nothing at all. Every other leaf node reports its phase; this one did not.
+    _emit({"type": "progress", "node": "explain_node", "attempt": 1, "max_attempts": 1,
+           "phase": "llm", "message": f"Reading {filename} and writing the explanation"})
+
     user_prompt = _inject_jdm(PROMPT_EXPLAIN_USER, existing_jdm)
     explanation = call_llm(PROMPT_EXPLAIN, [HumanMessage(content=user_prompt)],
                            node="explain_node")
@@ -1231,11 +1276,12 @@ def lint_node(state: AgentState):
 
     # Sent as data as well as prose, so the Problems tab can show the findings the user
     # just asked for instead of making them press Check to get the same answer again.
-    _emit({"type": "lint_report", "findings": [d.as_dict() for d in findings]})
+    reported = [d.as_dict() for d in findings]
+    _emit({"type": "lint_report", "findings": reported})
     name = state.get("selected_file") or state.get("canvas_graph_name") or "this policy"
 
     if not findings:
-        return {"messages": [_assistant_message_from_llm(
+        return {"lint_findings": [], "messages": [_assistant_message_from_llm(
             f"**{name}** passes every check - structure, expressions, and quality."
         )]}
 
@@ -1259,7 +1305,10 @@ def lint_node(state: AgentState):
     if counts["error"]:
         body.append("Ask me to fix any of these and I will update the policy.")
 
-    return {"messages": [_assistant_message_from_llm("\n".join(body).strip())]}
+    # Left on state as well as sent to the panel, so what the turn offers next can depend
+    # on whether it actually found anything.
+    return {"lint_findings": reported,
+            "messages": [_assistant_message_from_llm("\n".join(body).strip())]}
 
 
 def triage_node(state: AgentState):

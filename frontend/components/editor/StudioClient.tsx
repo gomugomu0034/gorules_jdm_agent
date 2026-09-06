@@ -233,12 +233,16 @@ export function StudioClient({ graphId }: { graphId: string | null }) {
       const result = await api.acceptProposal(chat.threadId, null, proposal.usecase_name);
       beginDraft(result.content ?? jdm, result.name ?? proposal.usecase_name, result.tests ?? []);
       chat.clearProposal();
+      chat.suggest(result.suggestions ?? []);
       return;
     }
 
-    await api.acceptProposal(chat.threadId, graphId, proposal.usecase_name, true);
+    const result = await api.acceptProposal(chat.threadId, graphId, proposal.usecase_name, true);
     applyProposed(jdm);
     chat.clearProposal();
+    // Taking the proposal ends the exchange, and until now it ended in silence: the graph
+    // appeared and the conversation had nothing more to say about what to do with it.
+    chat.suggest(result.suggestions ?? []);
     await load(graphId);
     setSidebarToken((t) => t + 1);
   };

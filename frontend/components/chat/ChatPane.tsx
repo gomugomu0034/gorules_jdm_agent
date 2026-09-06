@@ -28,14 +28,18 @@ const NEW_POLICY_SUGGESTIONS = [
   'Draft a refund policy based on order age and customer tier',
 ];
 
+// Worded to match the intent router's own patterns, so each one lands on the node it
+// names without a model call to work out what was meant. The linter was missing here
+// entirely: reachable in conversation since it was built, and never once offered.
 const EXISTING_POLICY_SUGGESTIONS = [
   'Explain what this policy does',
   'Run the test suite',
+  'Check this policy for problems',
   'Add a rule for VIP customers',
 ];
 
 export function ChatPane({ canvas, graphId, graphName, visible = true }: Props) {
-  const { messages, steps, pending, proposal, running, error, send, respond, cancel } =
+  const { messages, steps, pending, proposal, running, error, suggestions, send, respond, cancel } =
     useChatStore();
   // Generating a test suite is the one model call outside this conversation, and there is
   // one API key behind both. Waiting for it costs a few seconds; racing it costs a request
@@ -156,6 +160,36 @@ export function ChatPane({ canvas, graphId, graphName, visible = true }: Props) 
             ) : (
               <p className="mt-2 text-xs text-fg-subtle">Type your answer below.</p>
             )}
+          </div>
+        ) : null}
+
+        {/* What to do next. Held back while the agent is working, while it is waiting on
+            an answer of its own, and while a proposal is still under review - in all three
+            the next move is already decided and a second set of choices only competes
+            with it. */}
+        {suggestions.length > 0 && !running && !pending && !proposal ? (
+          <div className="flex flex-wrap gap-1.5 pt-0.5">
+            {suggestions.map((suggestion) => (
+              <button
+                key={suggestion.label}
+                onClick={() => {
+                  if (suggestion.send) {
+                    void send(suggestion.prompt, canvasPayload);
+                    return;
+                  }
+                  // Not a complete request on its own: put it in the composer and let the
+                  // user finish the sentence.
+                  setDraft(suggestion.prompt);
+                  textareaRef.current?.focus();
+                }}
+                className={cx(
+                  'rounded-full border border-border px-2.5 py-1 text-2xs text-fg-muted',
+                  'transition-colors hover:border-accent hover:bg-accent-subtle hover:text-accent',
+                )}
+              >
+                {suggestion.label}
+              </button>
+            ))}
           </div>
         ) : null}
 

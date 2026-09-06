@@ -21,7 +21,7 @@ from langgraph.types import Command
 from backend.config import settings
 from backend import corpus
 from backend.db import dao
-from backend.services import event_bus
+from backend.services import event_bus, suggestions
 
 logger = logging.getLogger(__name__)
 
@@ -438,6 +438,14 @@ async def _execute_turn(thread_id: str, run_id: str, payload) -> None:
     # A run that stopped itself on request ended by agreement, not by finishing. Reporting
     # it as "completed" would leave the user's own Stop looking like it did nothing.
     stopped = state.values.get("build_status") == "CANCELLED"
+
+    # What to do next, offered only where it is actually next: a turn that paused for an
+    # answer returned above, and one that was stopped has nothing to build on.
+    if not stopped:
+        items = suggestions.follow_ups(state.values)
+        if items:
+            await emit({"type": "suggestions", "items": items})
+
     await _finish(thread_id, emit, "cancelled" if stopped else "completed")
 
 

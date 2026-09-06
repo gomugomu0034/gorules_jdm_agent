@@ -25,7 +25,7 @@ from backend.models.api import (
     ThreadStateResponse,
     ThreadSummary,
 )
-from backend.services import chat_runner, event_bus
+from backend.services import chat_runner, event_bus, suggestions
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -283,6 +283,7 @@ async def accept_proposal(
             "name": name,
             "content": proposal["jdm"],
             "tests": proposal["tests"],
+            "suggestions": _next_moves(proposal),
         }
 
     if proposal["tests"]:
@@ -293,7 +294,23 @@ async def accept_proposal(
         response="accepted", detail={"version": version, "name": name, "draft": False},
     )
     await dao.clear_proposal(thread_id)
-    return {"graph_id": graph_id, "version": version, "draft": False}
+    return {"graph_id": graph_id, "version": version, "draft": False,
+            "suggestions": _next_moves(proposal)}
+
+
+def _next_moves(proposal: dict) -> list[dict]:
+    """What to offer after a proposal is taken on the canvas.
+
+    Taking it there is a REST call, not an answer to the agent - the run stays parked at
+    its approval interrupt and never reaches the end of a turn, so the follow-ups the
+    runner emits for a finished turn never fire on this path. Same catalogue either way,
+    which is the point of asking the server for them rather than keeping a second copy of
+    the wording in the browser.
+    """
+    return suggestions.follow_ups({
+        "intent": "CREATE",
+        "jdm_json": json.dumps(proposal.get("jdm") or {}),
+    })
 
 
 @router.post("/threads/{thread_id}/proposal/reject")

@@ -13,6 +13,7 @@ import type {
   PendingInterrupt,
   ProgressEvent,
   Proposal,
+  Suggestion,
   TestRunReport,
 } from '../lib/types';
 
@@ -34,6 +35,8 @@ type ChatState = {
   pending: PendingInterrupt | null;
   proposal: Proposal | null;
   testReport: TestRunReport | null;
+  /** What to offer next. Belongs to the turn that produced it and nothing after. */
+  suggestions: Suggestion[];
   running: boolean;
   error: string | null;
   connected: boolean;
@@ -44,6 +47,9 @@ type ChatState = {
   send: (text: string, canvas: Canvas) => Promise<void>;
   respond: (value: string, canvas: Canvas) => Promise<void>;
   cancel: () => Promise<void>;
+  /** Settle from the thread's own status, when the stream has not said how a turn ended. */
+  reconcile: () => Promise<void>;
+  suggest: (items: Suggestion[]) => void;
   clearProposal: () => void;
   reset: () => void;
 };
@@ -57,6 +63,10 @@ let stream: ReturnType<typeof createEventStream> | null = null;
 const MAX_RESTARTS = 2;
 let restarts = 0;
 
+// Long enough to clear the server's cancel grace period, after which a run that has not
+// reported itself finished is assumed to have finished without saying so.
+const CANCEL_SETTLE_MS = 5000;
+
 const initial = {
   threadId: null,
   graphId: null,
@@ -65,6 +75,7 @@ const initial = {
   pending: null,
   proposal: null,
   testReport: null,
+  suggestions: [] as Suggestion[],
   running: false,
   error: null,
   connected: false,
@@ -147,6 +158,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       steps: [],
       error: null,
       pending: null,
+      suggestions: [],
     }));
 
     try {
@@ -167,6 +179,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       running: true,
       steps: [],
       error: null,
+      suggestions: [],
     }));
 
     try {
@@ -191,11 +204,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
           running: false,
           steps: s.steps.map((step) => ({ ...step, status: 'done' as const })),
         }));
+        return;
       }
     } catch {
-      // The done event settles the real state either way.
+      // The done event settles the real state either way - and if it does not, so does
+      // the reconcile below.
+    }
+    // The stream normally reports the stop within a second. When it does not, the
+    // composer stays disabled behind a Stop that appears to have done nothing, and the
+    // only way out is a page reload - which is exactly what happened before the `error`
+    // frame stopped tearing the stream down. The thread's own status is the authority,
+    // so ask it rather than waiting on an event that may never arrive.
+    setTimeout(() => void get().reconcile(), CANCEL_SETTLE_MS);
+  },
+
+  reconcile: async () => {
+    const { threadId, running } = get();
+    if (!threadId || !running) return;
+    try {
+      const state = await api.getThread(threadId);
+      if (state.status === 'running') return;
+      set((s) => ({
+        running: false,
+        pending: state.pending_interrupt,
+        steps: s.steps.map((step) => ({ ...step, status: 'done' as const })),
+      }));
+    } catch {
+      // Unreachable server: leaving `running` alone is right, because the turn may well
+      // still be going.
     }
   },
+
+  suggest: (items) => set({ suggestions: items }),
 
   /**
    * Resolve the proposal, and with it the approval gate that offered it.
@@ -297,6 +337,10 @@ function apply(set: Setter, get: () => ChatState, event: ChatEvent) {
     case 'lint_report':
       useGraphStore.getState().setLint(event.findings);
       useUiStore.getState().setAssistantTab('problems');
+      break;
+
+    case 'suggestions':
+      set({ suggestions: event.items });
       break;
 
     case 'error':

@@ -454,6 +454,88 @@ def test_an_exhausted_quota_is_reported_as_a_quota_problem(client, tmp_path, mon
     assert "resets at" in body["message"]
 
 
+def test_a_finished_turn_offers_what_to_do_next(client):
+    """A turn that ends in an answer used to end in silence.
+
+    The reader was left to guess what else could be asked for - which is how the linter,
+    reachable in conversation since it was built, went undiscovered.
+    """
+    from backend.tests.test_turn_isolation import OPEN_POLICY
+
+    thread_id = client.post("/api/chat/threads", json={}).json()["id"]
+    client.post(
+        f"/api/chat/threads/{thread_id}/messages",
+        json={"text": "Explain what this policy does",
+              "canvas": {"content": json.loads(OPEN_POLICY)}},
+    )
+
+    events = read_events(client, thread_id)
+    kinds = [e["type"] for e in events]
+    assert "suggestions" in kinds, "the turn ended without offering anything next"
+
+    offered = next(e for e in events if e["type"] == "suggestions")["items"]
+    assert [c["prompt"] for c in offered] == [
+        "Run the test suite",
+        "Check this policy for problems",
+        "Change this policy so that ",
+    ]
+    # The chips arrive before the turn is declared over, so they are on screen the moment
+    # the composer comes back rather than a frame later.
+    assert kinds.index("suggestions") < kinds.index("done")
+
+
+def test_taking_a_proposal_on_the_canvas_offers_the_same_next_moves(client):
+    """Accepting on the canvas is a REST call, not an answer to the agent: the run stays
+    parked at its approval interrupt and never reaches the end of a turn, so the runner's
+    own follow-ups never fire on this path. They come back with the accept instead - from
+    the same catalogue, so the two cannot drift into offering different things."""
+    thread_id = client.post("/api/chat/threads", json={}).json()["id"]
+    client.post(
+        f"/api/chat/threads/{thread_id}/messages",
+        json={"text": "Create a shipping policy: free over $50, otherwise $6.",
+              "canvas": {"content": {"nodes": [], "edges": []}}},
+    )
+    read_events(client, thread_id)
+    client.post(f"/api/chat/threads/{thread_id}/resume",
+                json={"value": "Approve with above understanding & assumptions"})
+    read_events(client, thread_id)
+
+    accepted = client.post(f"/api/chat/threads/{thread_id}/proposal/accept", json={}).json()
+    assert [c["prompt"] for c in accepted["suggestions"]] == [
+        "Run the test suite",
+        "Check this policy for problems",
+        "Change this policy so that ",
+    ]
+
+
+def test_a_server_error_frame_does_not_tear_down_the_stream():
+    """`error` is both a frame the agent sends and the event a broken connection fires.
+
+    `EventSource` dispatches a frame named `error` as an event of type `error`, so the
+    handler meant for transport failures sees it too - verified in a browser against a
+    stand-in stream: `onerror` fired with `readyState === 1` (OPEN) and the event carrying
+    `data`. The stream was then closed as though the connection had failed, and the `done`
+    frame published moments later - the only thing that tells the client a turn is over -
+    was never delivered. Every cancelled, timed-out and failed run ended that way: a
+    composer disabled behind a Stop that looked like it had done nothing, until the page
+    was reloaded.
+
+    Only a transport failure carries no data, and `handle` has already applied the frame by
+    the time this runs, so the discriminator has to come before anything else in there.
+    """
+    from pathlib import Path
+
+    sse = Path("frontend/lib/sse.ts").read_text(encoding="utf-8")
+    body = sse.split("source.onerror = (event) => {", 1)[1].split("};", 1)[0]
+
+    guard = body.find(".data === 'string'")
+    teardown = body.find("close()")
+    assert guard != -1, "onerror does not tell a server `error` frame from a dead connection"
+    assert teardown != -1 and guard < teardown, (
+        "the stream is closed before the frame is ruled out, which drops the run's `done`"
+    )
+
+
 def test_every_event_the_agent_emits_is_one_the_browser_listens_for():
     """`_frame` names each SSE frame with its own type, and `EventSource` routes a named
     frame only to a listener registered for that exact name - `onmessage` never sees it.

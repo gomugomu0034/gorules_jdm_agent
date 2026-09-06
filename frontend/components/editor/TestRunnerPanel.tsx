@@ -130,7 +130,12 @@ export function TestRunnerPanel() {
           </div>
         ) : null}
 
-        {tests.length === 0 ? (
+        {/* A report wins over an empty suite. The agent can run a suite the panel does not
+            hold - it writes one itself when a policy has none, and the results arrive here
+            while `tests` is still empty - and asking for the report first was showing
+            "No test cases yet" beside a "3/3 passed" badge for the run that had just
+            finished. */}
+        {testReport === null && tests.length === 0 ? (
           <EmptyState
             title="No test cases yet"
             description="Generate a suite from the current graph, or ask the assistant to write one."

@@ -22,6 +22,7 @@ export const STREAM_EVENT_TYPES = [
   'graph_proposed',
   'test_report',
   'lint_report',
+  'suggestions',
   'error',
   'done',
 ] as const;
@@ -100,6 +101,15 @@ export function createEventStream({ threadId, fromSeq, onEvent, onError, onGone 
     }
 
     source.onerror = (event) => {
+      // A frame the *server* named `error` is dispatched as an event of type `error`,
+      // which is the same type a broken connection fires - so this handler sees both, and
+      // treating the first as the second tore down a perfectly healthy stream. The turn's
+      // `done` frame was published moments later and never arrived: the composer stayed
+      // disabled behind a Stop that looked like it had done nothing, until the page was
+      // reloaded. Only a transport failure carries no data; the `error` frame was already
+      // applied by `handle`, which is registered for that name too.
+      if (typeof (event as MessageEvent).data === 'string') return;
+
       onError?.(event);
       source?.close();
       source = null;
