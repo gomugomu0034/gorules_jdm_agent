@@ -1100,7 +1100,17 @@ def test_node(state: AgentState):
 
 
 def _format_test_report_markdown(report: dict) -> str:
-    """Deterministic pass/fail table. The verdict comes from the engine, not an LLM."""
+    """Deterministic pass/fail report. The verdict comes from the engine, not an LLM.
+
+    Passing cases stay one line each, because the only thing worth saying about them is
+    that they passed. Each failure gets its own block with the input that produced it, what
+    was expected, what came back, and which field disagreed - the four things somebody
+    needs to decide whether the policy is wrong or the test is.
+
+    Deliberately not one wide table. JSON in a markdown cell wraps at about forty
+    characters and the columns stop lining up, which is what the previous version did to
+    anything with more than one field.
+    """
     summary = report["summary"]
     icon = "✅" if not (summary["failed"] or summary["errored"]) else "❌"
     lines = [
@@ -1115,25 +1125,47 @@ def _format_test_report_markdown(report: dict) -> str:
         lines.append(f"The graph does not compile: `{summary['compile_error']}`")
         return "\n".join(lines)
 
-    lines += ["| | Test | Details |", "|---|---|---|"]
-    marks = {"passed": "✅", "failed": "❌", "errored": "⚠️", "skipped": "➖"}
-    for r in report["results"]:
-        if r["status"] == "passed":
-            detail = "—"
-        elif r["status"] == "skipped":
-            detail = "no expected output"
-        elif r["error"]:
-            detail = f"`{r['error'][:120]}`"
-        else:
-            detail = "; ".join(
-                f"`{m['path']}`: expected `{json.dumps(m['expected'])}`, got `{json.dumps(m['actual'])}`"
-                for m in r["mismatches"][:3]
-            )
-            if len(r["mismatches"]) > 3:
-                detail += f" (+{len(r['mismatches']) - 3} more)"
-        lines.append(f"| {marks[r['status']]} | {r['name']} | {detail} |")
+    def code(value) -> str:
+        rendered = json.dumps(value, ensure_ascii=False, default=str)
+        return f"`{rendered}`" if len(rendered) <= 300 else f"`{rendered[:300]}…`"
 
-    return "\n".join(lines)
+    good = [r for r in report["results"] if r["status"] == "passed"]
+    if good:
+        lines += ["**Passed**", ""]
+        lines += [f"- ✅ {r['name']}" for r in good]
+        lines.append("")
+
+    skipped = [r for r in report["results"] if r["status"] == "skipped"]
+    if skipped:
+        lines += ["**Not checked** — these cases declare no expected output, so nothing "
+                  "about them was proven.", ""]
+        lines += [f"- ➖ {r['name']}" for r in skipped]
+        lines.append("")
+
+    for result in report["results"]:
+        if result["status"] not in ("failed", "errored"):
+            continue
+        mark = "❌" if result["status"] == "failed" else "⚠️"
+        lines += [f"**{mark} {result['name']}**", "", "| | |", "|---|---|"]
+        lines.append(f"| Input | {code(result.get('input'))} |")
+
+        if result["status"] == "errored":
+            # Nothing came back, so expected-versus-actual has nothing to compare.
+            lines.append(f"| Error | `{str(result.get('error') or '')[:300]}` |")
+        else:
+            lines.append(f"| Expected | {code(result.get('expected'))} |")
+            lines.append(f"| Actual | {code(result.get('actual'))} |")
+            why = "; ".join(
+                f"`{m['path']}` should be {code(m['expected'])[1:-1]} "
+                f"but was {code(m['actual'])[1:-1]}"
+                for m in result["mismatches"][:4]
+            )
+            if len(result["mismatches"]) > 4:
+                why += f" (+{len(result['mismatches']) - 4} more)"
+            lines.append(f"| Why it failed | {why or 'the output did not match'} |")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 
