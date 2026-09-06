@@ -934,6 +934,43 @@ def _classify_intent(text: str, has_graph: bool) -> tuple[str, float]:
     return ("MODIFY" if has_graph else "CREATE"), 0.3
 
 
+# What a finished turn leaves behind in the checkpoint, and what the next one must not
+# inherit. Every one of these is a *verdict* on work that is already over.
+#
+# The router is the only safe place to clear them. It runs exactly once per turn - the
+# approval loop re-enters the planner directly, without passing back through here - so
+# resetting on entry cannot wipe state a turn is still using.
+#
+# Deliberately absent: `test_suite_json`, which `chat_runner` pre-loads into the payload
+# for a TEST turn, and clearing it here would overwrite the suite before `test_node` ever
+# sees it. The canvas fields, `messages` and `thread_id` are context rather than verdict
+# and travel with every turn by design.
+_PER_TURN_RESET: dict = {
+    # `output_node` defaults a missing status to SUCCESS, so a stale one is the difference
+    # between "your policy is ready" and the truth.
+    "build_status": "",
+    "build_failed": False,
+    "evaluation_feedback": "",
+    # The reporter reads this to describe what was built. Left over, a turn that produces
+    # nothing announces the *previous* turn's policy as though it had just made it.
+    "jdm_json": "",
+    # `planner_node` reads EMPTY as "you are being asked again" and appends the re-plan
+    # instruction. Carried over, the first call of a fresh turn thinks it is a retry.
+    "plan_status": "",
+    "plan_attempts_used": 0,
+    # Nothing reset this between turns, so every subsequent build started a repair down.
+    "build_attempts_used": 0,
+    "triage_status": "",
+    "final_approval_status": "",
+    # Findings and edits describe a graph this turn has not looked at yet.
+    "lint_findings": [],
+    "patch_log": [],
+    "test_regressions": [],
+    # Both paths that produce a proposal set this; a stale one names the wrong policy.
+    "usecase_name": "",
+}
+
+
 def intent_router_node(state: AgentState):
     """Entry node. Never interrupts, so every run starts with real work."""
     canvas = state.get("canvas_jdm_json", "") or ""
@@ -946,6 +983,7 @@ def intent_router_node(state: AgentState):
     # Downstream nodes and every prompt read `existing_jdm_json`; keeping it
     # populated from the canvas is what lets them stay unchanged.
     return {
+        **_PER_TURN_RESET,
         "intent": intent,
         "intent_confidence": confidence,
         "mode": "EXISTING" if intent in ("MODIFY", "TEST", "EXPLAIN") else "NEW",
